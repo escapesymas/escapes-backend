@@ -1,5 +1,4 @@
 FROM node:22-alpine
-RUN apk add --no-cache wget curl
 WORKDIR /app/server
 ENV NODE_ENV=production PORT=3001
 ARG DATABASE_URL=postgresql://escapes:EscapesCoolify2026!@hk6mt4abfh8ijg2vak6utvz2:5432/escapes_db
@@ -67,6 +66,4 @@ COPY --chown=backend:nodejs moto_catalog.json ./
 RUN npm install --legacy-peer-deps --include=dev
 USER backend
 EXPOSE 3001
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s \
-    CMD wget -qO- http://127.0.0.1:3001/api/health || exit 1
 CMD ["npx", "tsx", "index.ts"]
