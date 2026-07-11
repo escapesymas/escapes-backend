@@ -1,6 +1,14 @@
 FROM node:22-alpine
 WORKDIR /app/server
 ENV NODE_ENV=production PORT=3001
+ENV DATABASE_URL=postgresql://escapes:EscapesCoolify2026!@hk6mt4abfh8ijg2vak6utvz2:5432/escapes_db
+ENV JWT_SECRET=production-jwt-secret-change-me
+ENV STRIPE_SECRET_KEY=sk_test_placeholder
+ENV STRIPE_WEBHOOK_SECRET=whsec_placeholder
+ENV REDIS_URL=redis://coolify-redis:6379
+ENV API_URL=https://api.escapesymas.com
+ENV FRONTEND_URL=https://escapesymas.com
+ENV ADMIN_URL=https://admin.escapesymas.com
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 backend
 RUN mkdir -p /app/server/uploads /app/server/invoices && chown backend:nodejs /app/server/uploads /app/server/invoices
