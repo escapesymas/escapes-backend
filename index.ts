@@ -101,12 +101,33 @@ const WP_URL = process.env.WP_URL || 'https://backendescapes.com';
 const WOO_KEY = process.env.WOO_KEY;
 const WOO_SECRET = process.env.WOO_SECRET;
 
-// Startup validation: warn if production credentials are missing
-if (!process.env.DATABASE_URL) console.warn('[WARNING] DATABASE_URL not set');
-if (!process.env.STRIPE_SECRET_KEY) console.warn('[WARNING] STRIPE_SECRET_KEY not set');
-if (!process.env.SMTP_PASSWORD) console.warn('[WARNING] SMTP_PASSWORD not set');
-if (!process.env.JWT_SECRET) console.warn('[WARNING] JWT_SECRET not set — using insecure default');
-if (!process.env.BIHR_MACKEY) console.warn('[WARNING] BIHR_MACKEY not set — Bihr sync will fail');
+// Startup validation: fail fast in production if critical vars are missing
+const isProduction = process.env.NODE_ENV === 'production';
+const requiredVars = [
+  'DATABASE_URL',
+  'JWT_SECRET',
+  'REDIS_URL',
+];
+const missingRequired = requiredVars.filter(v => !process.env[v]);
+if (missingRequired.length > 0) {
+  const msg = `[FATAL] Missing required env vars: ${missingRequired.join(', ')}`;
+  if (isProduction) {
+    console.error(msg);
+    process.exit(1);
+  } else {
+    console.warn(msg);
+  }
+}
+
+// Warn on placeholder values in production
+const placeholders = ['placeholder', 'change-me', '__', 'sk_test_placeholder', 'whsec_placeholder'];
+const allVars = Object.entries(process.env);
+for (const [key, value] of allVars) {
+  if (!value) continue;
+  if (isProduction && placeholders.some(p => value.includes(p))) {
+    console.warn(`[WARNING] ${key} looks like a placeholder: ${value.slice(0, 20)}...`);
+  }
+}
 
 // ================================================================
 // BASE DE DATOS (PostgreSQL localhost en VPS)
