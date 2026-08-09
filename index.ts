@@ -1227,6 +1227,77 @@ app.get('/api/bihr/sync-images-v2/status', async (req: any, res: any) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Image downloader v3 (download-images-from-catalog.ts)
+// Reads image URLs from the Bihr catalog JSON (DefaultPicture field) instead
+// of calling the non-existent /Products/Image endpoint.
+// ---------------------------------------------------------------------------
+const CATALOG_PATH_DEFAULT = '/app/server/uploads/bihr-catalog.json';
+
+app.post('/api/bihr/sync-images-v3/start', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  if (isImageDownloaderRunning()) {
+    return res.status(409).json({ error: 'El descargador ya está en ejecución', running: true });
+  }
+
+  const batch = Number(req.body?.batch) || 50;
+  const concurrency = Number(req.body?.concurrency) || 8;
+  const fetchCatalog = req.body?.fetchCatalog === true;
+  const catalogPath = String(req.body?.catalogPath || CATALOG_PATH_DEFAULT);
+
+  const scriptPath = path.join(process.cwd(), 'scripts', 'download-images-from-catalog.ts');
+  if (!fs.existsSync(scriptPath)) {
+    return res.status(500).json({ error: `Script no encontrado: ${scriptPath}` });
+  }
+
+  const args = [scriptPath, `--batch=${batch}`, `--concurrency=${concurrency}`];
+  if (fetchCatalog) {
+    args.push('--fetch-catalog');
+  } else if (fs.existsSync(catalogPath)) {
+    args.push(`--catalog=${catalogPath}`);
+  } else {
+    return res.status(400).json({
+      error: `No se encontró el catálogo en ${catalogPath}. Sube el archivo o usa fetchCatalog:true`,
+    });
+  }
+
+  console.log(`[IMAGE DOWNLOADER V3] spawn: npx tsx ${args.join(' ')}`);
+  const child = spawn('npx', ['tsx', ...args], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  imageDownloaderChild = child;
+  imageDownloaderPid = child.pid ?? null;
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    process.stdout.write(`[IMAGE-DL] ${chunk}`);
+  });
+  child.stderr.on('data', (chunk: Buffer) => {
+    process.stderr.write(`[IMAGE-DL] ${chunk}`);
+  });
+
+  child.on('exit', (code, signal) => {
+    console.log(`[IMAGE DOWNLOADER V3] exited code=${code} signal=${signal}`);
+    if (imageDownloaderChild === child) {
+      imageDownloaderChild = null;
+      imageDownloaderPid = null;
+    }
+    if (code !== 0 && code !== null) {
+      pool.query(
+        `UPDATE image_regen_state SET status='failed', updated_at=NOW() WHERE id=1`,
+      ).catch((err) => console.error('[IMAGE DOWNLOADER V3] failed state update', err));
+    }
+  });
+
+  res.json({
+    success: true,
+    message: 'Descargador de imágenes v3 iniciado (desde catálogo Bihr)',
+    pid: imageDownloaderPid,
+    script: scriptPath,
+  });
+});
+
 let categoryMap: Record<number, { name: string; slug: string }> = {};
 let categoryMapLoading = false;
 
