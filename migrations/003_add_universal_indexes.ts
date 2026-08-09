@@ -50,11 +50,11 @@ const indexes: IndexSpec[] = [
   },
   {
     name: 'idx_products_universal_instock',
-    description: 'Composite (in_stock, id) for in-stock-filtered universal queries.',
+    description: 'Composite (stock, id) for in-stock-filtered universal queries.',
     statement: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_universal_instock
-      ON products (in_stock, id)
+      ON products (stock, id)
       WHERE (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')
-        AND in_stock = true`,
+        AND stock > 0`,
   },
   {
     name: 'idx_products_universal_search',
