@@ -3,7 +3,7 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import fs from 'fs';
 import os from 'os';
-import { execSync, exec } from 'child_process';
+import { execSync, exec, spawn } from 'child_process';
 import util from 'util';
 const execPromise = util.promisify(exec);
 import path from 'path';
@@ -980,6 +980,15 @@ app.post('/api/bihr/sync-catalog', async (req: any, res: any) => {
   }
 });
 
+// Image downloader v2 child process state (declared early so it can be
+// referenced by /api/bihr/sync-status above and by the v2 endpoints below).
+let imageDownloaderChild: ReturnType<typeof spawn> | null = null;
+let imageDownloaderPid: number | null = null;
+
+function isImageDownloaderRunning(): boolean {
+  return imageDownloaderChild !== null && imageDownloaderChild.exitCode === null;
+}
+
 app.get('/api/bihr/sync-status', async (req: any, res: any) => {
   if (!requireAdminKey(req, res)) return;
   try {
@@ -1009,27 +1018,19 @@ app.get('/api/bihr/sync-status', async (req: any, res: any) => {
       } catch (e) {}
     }
 
-    // 3. Comprobar si PM2 tiene el proceso image_downloader activo
-    let imageDownloaderRunning = false;
-    let pm2Status = 'stopped';
-    try {
-      const { stdout } = await execPromise('pm2 jlist');
-      const pm2List = JSON.parse(stdout);
-      const proc = pm2List.find((p: any) => p.name === 'image_downloader');
-      if (proc) {
-        pm2Status = proc.pm2_env?.status || 'stopped';
-        imageDownloaderRunning = pm2Status === 'online';
-      }
-    } catch (e) {
-      console.error('[BIHR SYNC STATUS ERROR]: Error checking PM2 status:', e);
-    }
+    // 3. Comprobar si el child process del image_downloader v2 está activo.
+    //    (PM2 no se usa en el contenedor de producción; el script se lanza
+    //    como child process desde /api/bihr/sync-images-v2/start.)
+    const imageDownloaderRunning = isImageDownloaderRunning();
+    const pm2Status = imageDownloaderRunning ? 'online' : 'stopped';
 
     res.json({
       success: true,
       images: {
         ...(imageStats || { status: 'idle' }),
         pm2Status,
-        running: imageDownloaderRunning
+        running: imageDownloaderRunning,
+        pid: imageDownloaderPid,
       },
       catalog: catalogStats || { status: 'idle' }
     });
@@ -1141,6 +1142,89 @@ app.post('/api/andreani/sync-images/control', async (req: any, res: any) => {
   } catch (error: any) {
     res.status(500).json({ error: `Fallo al ejecutar acción ${action} de imágenes Andreani`, details: error.message });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Image downloader v2 (download-missing-images.ts)
+// Spawns the script as a child process. The script writes progress to the
+// `image_regen_state` table, which is read by `/api/bihr/sync-status`.
+// (State declarations are above the /api/bihr/sync-status endpoint so it can
+// reference them.)
+// ---------------------------------------------------------------------------
+app.post('/api/bihr/sync-images-v2/start', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  if (isImageDownloaderRunning()) {
+    return res.status(409).json({ error: 'El descargador ya está en ejecución', running: true });
+  }
+
+  const batch = Number(req.body?.batch) || 50;
+  const concurrency = Number(req.body?.concurrency) || 8;
+  const dryRun = req.body?.dryRun === true;
+
+  const scriptPath = path.join(process.cwd(), 'scripts', 'download-missing-images.ts');
+  if (!fs.existsSync(scriptPath)) {
+    return res.status(500).json({ error: `Script no encontrado: ${scriptPath}` });
+  }
+
+  const args = [scriptPath, `--batch=${batch}`, `--concurrency=${concurrency}`];
+  if (dryRun) args.push('--dry-run');
+
+  console.log(`[IMAGE DOWNLOADER V2] spawn: npx tsx ${args.join(' ')}`);
+  const child = spawn('npx', ['tsx', ...args], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  imageDownloaderChild = child;
+  imageDownloaderPid = child.pid ?? null;
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    process.stdout.write(`[IMAGE-DL] ${chunk}`);
+  });
+  child.stderr.on('data', (chunk: Buffer) => {
+    process.stderr.write(`[IMAGE-DL] ${chunk}`);
+  });
+
+  child.on('exit', (code, signal) => {
+    console.log(`[IMAGE DOWNLOADER V2] exited code=${code} signal=${signal}`);
+    if (imageDownloaderChild === child) {
+      imageDownloaderChild = null;
+      imageDownloaderPid = null;
+    }
+    if (code !== 0 && code !== null) {
+      pool.query(
+        `UPDATE image_regen_state SET status='failed', updated_at=NOW() WHERE id=1`,
+      ).catch((err) => console.error('[IMAGE DOWNLOADER V2] failed state update', err));
+    }
+  });
+
+  res.json({
+    success: true,
+    message: 'Descargador de imágenes iniciado',
+    pid: imageDownloaderPid,
+    script: scriptPath,
+  });
+});
+
+app.post('/api/bihr/sync-images-v2/stop', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  if (!isImageDownloaderRunning()) {
+    return res.status(404).json({ error: 'El descargador no está en ejecución', running: false });
+  }
+  try {
+    imageDownloaderChild?.kill('SIGTERM');
+    res.json({ success: true, message: 'Señal SIGTERM enviada al descargador' });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Error al detener el descargador', details: error.message });
+  }
+});
+
+app.get('/api/bihr/sync-images-v2/status', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  res.json({
+    running: isImageDownloaderRunning(),
+    pid: imageDownloaderPid,
+  });
 });
 
 let categoryMap: Record<number, { name: string; slug: string }> = {};
