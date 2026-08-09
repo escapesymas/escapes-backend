@@ -1255,12 +1255,15 @@ app.get('/api/vehicles', async (req, res) => {
 
   try {
     const cacheKey = `/api/vehicles?action=${action || ''}&brand=${brand || ''}&model=${model || ''}&year=${year || ''}`;
-    const redisKey = `cache:vehicles:${JSON.stringify({
+    const redisQuery = JSON.stringify({
       action: action || '',
       brand: brand || '',
       model: model || '',
       year: year || '',
-    })}`;
+    });
+    const redisKey = redisQuery.length > 200
+      ? `cache:vehicles:${crypto.createHash('sha256').update(redisQuery).digest('hex')}`
+      : `cache:vehicles:${redisQuery}`;
     const cached = await cacheGet<any[]>(redisKey);
     if (cached) {
       return res.json(cached);
@@ -1724,11 +1727,14 @@ app.get('/api/catalog/filters', async (req, res) => {
     const { category_id, search, universal } = req.query as any;
 
     const cacheKey = `/api/catalog/filters?category_id=${category_id || ''}&search=${search || ''}&universal=${universal || ''}`;
-    const redisKey = `cache:filters:${JSON.stringify({
+    const redisQuery = JSON.stringify({
       category_id: category_id || '',
       search: search || '',
       universal: universal || '',
-    })}`;
+    });
+    const redisKey = redisQuery.length > 200
+      ? `cache:filters:${crypto.createHash('sha256').update(redisQuery).digest('hex')}`
+      : `cache:filters:${redisQuery}`;
     const cached = await cacheGet<{
       brands: string[];
       price_min: number;
