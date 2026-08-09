@@ -26,6 +26,7 @@ import {
   getLiveStockLevel, getLiveStockValue, checkProductsInfo, createBihrOrder, syncBihrCatalog
 } from './bihrService.js';
 import { checkRateLimit } from './redis.js';
+import { cacheGet, cacheSet } from './lib/cache.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
 
@@ -1158,7 +1159,12 @@ async function initCategoryMap() {
   }
 }
 
-let compatIndex: Map<string, Map<number, Array<{ sku: string, model: string }>>> | null = null;
+// Compat index uses a double-buffer pattern:
+//   - `currentCompatIndex` is the immutable snapshot that in-flight requests read from.
+//   - `initCompatIndex` builds a NEW index off to the side; once complete, it is atomically
+//     swapped in. This way no request ever sees a half-built index, and we avoid the
+//     request-time spikes the previous `setInterval` refresh caused every 15 minutes.
+let currentCompatIndex: Map<string, Map<number, Array<{ sku: string, model: string }>>> | null = null;
 let isIndexLoading = false;
 
 async function initCompatIndex() {
@@ -1170,7 +1176,7 @@ async function initCompatIndex() {
     const res = await pool.query(
       `SELECT sku, compatibility FROM products WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'`
     );
-    const newIndex = new Map<string, Map<number, Array<{ sku: string, model: string }>>>();
+    const newCompatIndex = new Map<string, Map<number, Array<{ sku: string, model: string }>>>();
     for (const row of res.rows) {
       if (!row.compatibility) continue;
       for (const item of row.compatibility) {
@@ -1178,24 +1184,27 @@ async function initCompatIndex() {
         const bKey = item.brand.toLowerCase();
         const yKey = Number(item.year);
         if (isNaN(yKey)) continue;
-        
-        let yearMap = newIndex.get(bKey);
+
+        let yearMap = newCompatIndex.get(bKey);
         if (!yearMap) {
           yearMap = new Map();
-          newIndex.set(bKey, yearMap);
+          newCompatIndex.set(bKey, yearMap);
         }
-        
+
         let list = yearMap.get(yKey);
         if (!list) {
           list = [];
           yearMap.set(yKey, list);
         }
-        
+
         list.push({ sku: row.sku, model: item.model });
       }
     }
-    compatIndex = newIndex;
-    console.log(`✅ Compatibility index ready! Loaded ${newIndex.size} brands in ${Date.now() - start}ms`);
+    // Atomic swap: in-flight requests keep reading from the old map until the new one
+    // is fully built. The reference assignment is atomic in JS, so no request can ever
+    // observe a partially populated `currentCompatIndex`.
+    currentCompatIndex = newCompatIndex;
+    console.log(`✅ Compatibility index ready! Loaded ${newCompatIndex.size} brands in ${Date.now() - start}ms`);
   } catch (err) {
     console.error('❌ Failed to build compatibility index:', err);
   } finally {
@@ -1203,10 +1212,10 @@ async function initCompatIndex() {
   }
 }
 
-// Recargar el índice cada 15 minutos para capturar importaciones externas
-setInterval(() => {
-  initCompatIndex().catch(e => console.error('[COMPAT INDEX AUTO REFRESH ERROR]:', e));
-}, 15 * 60 * 1000);
+// NOTE: The previous `setInterval(15min)` auto-refresh of the compat index was removed.
+// It produced request-time spikes every 15 minutes and risked races where in-flight
+// requests observed a half-built map. The index is now built ONCE at startup; redeploys
+// or a manual call to `initCompatIndex()` are the supported ways to refresh it.
 
 // ================================================================
 // VEHICLE DISCOVERY & COMPATIBILITY
@@ -1267,8 +1276,8 @@ app.get('/api/vehicles', async (req, res) => {
             const mKey = model ? model.toLowerCase() : '';
             const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
 
-            if (compatIndex) {
-              const yearMap = compatIndex.get(bKey);
+            if (currentCompatIndex) {
+              const yearMap = currentCompatIndex.get(bKey);
               if (yearMap) {
                 if (yNum) {
                   const list = yearMap.get(yNum);
@@ -1552,6 +1561,21 @@ app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
     const perPage = Math.min(parseInt(per_page) || 20, 50);
     const offset = (pageNum - 1) * perPage;
 
+    // Redis-backed cache layer: short TTL (60s) shared across all server instances,
+    // on top of the per-process SWR cache. On hit we short-circuit and return
+    // immediately without touching Postgres or Drizzle.
+    const queryStr = JSON.stringify(req.query);
+    const redisKey = queryStr.length > 200
+      ? `cache:products:${crypto.createHash('sha256').update(queryStr).digest('hex')}`
+      : `cache:products:${queryStr}`;
+    const cached = await cacheGet<{ products: any[]; total: number; totalPages: number }>(redisKey);
+    if (cached) {
+      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages');
+      res.setHeader('X-WP-Total', cached.total.toString());
+      res.setHeader('X-WP-TotalPages', cached.totalPages.toString());
+      return res.json(cached.products);
+    }
+
     const cacheKey = `/api/catalog/products?search=${search || ''}&category_id=${category_id || ''}&page=${page}&per_page=${per_page}&universal=${universal || ''}&brand=${brand || ''}&min_price=${min_price || ''}&max_price=${max_price || ''}&in_stock=${in_stock || ''}&attrs=${attrs || ''}`;
 
     const result = await executeSWR(cacheKey, async () => {
@@ -1655,6 +1679,11 @@ app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
     res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages');
     res.setHeader('X-WP-Total', result.total.toString());
     res.setHeader('X-WP-TotalPages', result.totalPages.toString());
+
+    // Populate the shared Redis cache (60s TTL) so subsequent requests — including
+    // those landing on other server replicas — can skip Postgres entirely.
+    await cacheSet(redisKey, result, 60);
+
     res.json(result.products);
   } catch (err: any) {
     console.error('[CATALOG ERROR]:', err);
@@ -5915,6 +5944,15 @@ function mapProductToFrontend(row: any) {
 // ================================================================
 app.get('/api/catalog/categories', async (req, res) => {
   try {
+    // Redis-backed cache (300s TTL): the category tree barely changes and is read
+    // on every catalog page, so a long-ish TTL is safe and removes a Postgres hit
+    // from the hot path.
+    const redisKey = `cache:categories:${JSON.stringify(req.query)}`;
+    const cached = await cacheGet<any[]>(redisKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
     const result = await pool.query(
       `SELECT id, name, slug, parent_id
        FROM categories
@@ -5934,6 +5972,7 @@ app.get('/api/catalog/categories', async (req, res) => {
       };
     });
 
+    await cacheSet(redisKey, categories, 300);
     res.json(categories);
   } catch (err) {
     console.error('[CATEGORIES API ERROR]:', err);
