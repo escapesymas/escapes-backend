@@ -1243,6 +1243,7 @@ app.post('/api/bihr/sync-images-v3/start', async (req: any, res: any) => {
   const batch = Number(req.body?.batch) || 50;
   const concurrency = Number(req.body?.concurrency) || 8;
   const fetchCatalog = req.body?.fetchCatalog === true;
+  const loopAll = req.body?.loopAll === true;
   const catalogPath = String(req.body?.catalogPath || CATALOG_PATH_DEFAULT);
 
   const scriptPath = path.join(process.cwd(), 'scripts', 'download-images-from-catalog.ts');
@@ -1260,6 +1261,7 @@ app.post('/api/bihr/sync-images-v3/start', async (req: any, res: any) => {
       error: `No se encontró el catálogo en ${catalogPath}. Sube el archivo o usa fetchCatalog:true`,
     });
   }
+  if (loopAll) args.push('--all');
 
   console.log(`[IMAGE DOWNLOADER V3] spawn: npx tsx ${args.join(' ')}`);
   const child = spawn('npx', ['tsx', ...args], {
