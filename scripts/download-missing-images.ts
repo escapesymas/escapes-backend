@@ -208,12 +208,73 @@ async function processProduct(
   return 'downloaded';
 }
 
+async function updateImageRegenState(fields: {
+  status?: 'idle' | 'running' | 'completed' | 'failed';
+  processed?: number;
+  success?: number;
+  failed?: number;
+  skipped?: number;
+  total?: number;
+  current_sku?: string;
+}): Promise<void> {
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  let idx = 1;
+  for (const [key, value] of Object.entries(fields)) {
+    sets.push(`${key} = $${idx++}`);
+    values.push(value);
+  }
+  if (sets.length === 0) return;
+  sets.push(`updated_at = NOW()`);
+  values.push(1);
+  await pool.query(
+    `UPDATE image_regen_state SET ${sets.join(', ')} WHERE id = $${idx}`,
+    values,
+  );
+}
+
+async function countCandidates(): Promise<number> {
+  const result = await pool.query(`
+    SELECT COUNT(*)::int AS total
+    FROM products
+    WHERE (
+      images IS NULL
+      OR images = '[]'::jsonb
+      OR images::text = '[]'
+    )
+      AND sku IS NOT NULL
+      AND sku <> ''
+      AND supplier_code IS NOT NULL
+      AND supplier_code <> ''
+  `);
+  return result.rows[0]?.total ?? 0;
+}
+
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   console.log(
     `[INFO] batch=${options.batch} concurrency=${options.concurrency} dryRun=${options.dryRun}`,
   );
   if (!options.dryRun) console.log(`[INFO] output=${OPTIMIZED_DIR}`);
+
+  const totalCandidates = await countCandidates();
+  const effectiveBatch = Math.min(options.batch, totalCandidates);
+
+  await updateImageRegenState({
+    status: 'running',
+    processed: 0,
+    success: 0,
+    failed: 0,
+    skipped: 0,
+    total: totalCandidates,
+    current_sku: '',
+  });
+
+  if (effectiveBatch === 0) {
+    console.log('[DONE] No products with missing images found.');
+    await updateImageRegenState({ status: 'completed' });
+    return;
+  }
 
   const result = await db.execute(sql`
     SELECT id, sku, supplier_code, images, name
@@ -228,16 +289,12 @@ async function main(): Promise<void> {
       AND supplier_code IS NOT NULL
       AND supplier_code <> ''
     ORDER BY id
-    LIMIT ${options.batch}
+    LIMIT ${effectiveBatch}
   `);
   const products = result.rows as unknown as ProductRow[];
 
-  if (products.length === 0) {
-    console.log('[DONE] No products with missing images found.');
-    return;
-  }
-
   let nextIndex = 0;
+  let processed = 0;
   let downloaded = 0;
   let errors = 0;
   let tokenPromise: Promise<string> | null = null;
@@ -268,6 +325,18 @@ async function main(): Promise<void> {
         errors++;
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[${index + 1}/${products.length}] Product ${product.id}: failed - ${message}`);
+      } finally {
+        processed++;
+        if (processed % 1 === 0) {
+          await updateImageRegenState({
+            processed,
+            success: downloaded,
+            failed: errors,
+            current_sku: product.sku ?? '',
+          }).catch((err) => {
+            console.error('[STATE UPDATE ERROR]', err);
+          });
+        }
       }
     }
   }
@@ -275,8 +344,16 @@ async function main(): Promise<void> {
   const workerCount = Math.min(options.concurrency, products.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
+  await updateImageRegenState({
+    status: 'completed',
+    processed,
+    success: downloaded,
+    failed: errors,
+    current_sku: '',
+  });
+
   console.log(
-    `[DONE] selected=${products.length} downloaded=${downloaded} errors=${errors} dryRun=${options.dryRun}`,
+    `[DONE] totalCandidates=${totalCandidates} selected=${products.length} downloaded=${downloaded} errors=${errors} processed=${processed} dryRun=${options.dryRun}`,
   );
 }
 
