@@ -18,6 +18,7 @@ COPY --chown=backend:nodejs templates/ ./templates/
 COPY --chown=backend:nodejs lib/ ./lib/
 COPY --chown=backend:nodejs schemas/ ./schemas/
 COPY --chown=backend:nodejs migrations/ ./migrations/
+COPY --chown=backend:nodejs scripts/ ./scripts/
 COPY --chown=backend:nodejs moto_catalog.json ./
 RUN npm install --legacy-peer-deps --include=dev
 USER backend
