@@ -17,6 +17,7 @@ interface CliOptions {
   concurrency: number;
   catalogPath?: string;
   autoFetchCatalog: boolean;
+  loopAll: boolean;
 }
 
 interface ProductRow {
@@ -54,6 +55,7 @@ function parseArgs(args: string[]): CliOptions {
   let concurrency = DEFAULT_CONCURRENCY;
   let catalogPath: string | undefined;
   let autoFetchCatalog = false;
+  let loopAll = false;
 
   for (const arg of args) {
     if (arg.startsWith('--batch=')) {
@@ -64,12 +66,14 @@ function parseArgs(args: string[]): CliOptions {
       catalogPath = arg.slice('--catalog='.length);
     } else if (arg === '--fetch-catalog') {
       autoFetchCatalog = true;
+    } else if (arg === '--all') {
+      loopAll = true;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
   }
 
-  return { batch, concurrency, catalogPath, autoFetchCatalog };
+  return { batch, concurrency, catalogPath, autoFetchCatalog, loopAll };
 }
 
 function sanitizeSku(sku: string | null | undefined): string {
@@ -274,7 +278,7 @@ async function countCandidates(): Promise<number> {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  console.log(`[INFO] batch=${options.batch} concurrency=${options.concurrency}`);
+  console.log(`[INFO] batch=${options.batch} concurrency=${options.concurrency} loopAll=${options.loopAll}`);
 
   let catalogPath = options.catalogPath;
   if (!catalogPath && options.autoFetchCatalog) {
@@ -288,7 +292,7 @@ async function main(): Promise<void> {
   console.log(`[INFO] Catalog loaded. output=${OPTIMIZED_DIR}`);
 
   const totalCandidates = await countCandidates();
-  const effectiveBatch = Math.min(options.batch, totalCandidates);
+  let effectiveBatch = Math.min(options.batch, totalCandidates);
 
   await updateImageRegenState({
     status: 'running',
@@ -304,6 +308,10 @@ async function main(): Promise<void> {
     console.log('[DONE] No products with missing images found.');
     await updateImageRegenState({ status: 'completed' });
     return;
+  }
+
+  if (options.loopAll) {
+    console.log(`[LOOP] Will keep processing batches of ${effectiveBatch} until all candidates done.`);
   }
 
   const result = await db.execute(sql`
@@ -366,8 +374,97 @@ async function main(): Promise<void> {
   });
 
   console.log(
-    `[DONE] totalCandidates=${totalCandidates} selected=${products.length} downloaded=${downloaded} skipped=${skipped} errors=${errors} processed=${processed}`,
+    `[BATCH DONE] totalCandidates=${totalCandidates} selected=${products.length} downloaded=${downloaded} skipped=${skipped} errors=${errors} processed=${processed}`,
   );
+
+  if (options.loopAll) {
+    // Loop until all candidates are processed
+    let totalProcessed = processed;
+    let totalDownloaded = downloaded;
+    let totalErrors = errors;
+    let totalSkipped = skipped;
+    let batchNum = 1;
+
+    while (true) {
+      const remaining = await countCandidates();
+      console.log(`[LOOP] batch=${batchNum} remaining=${remaining}`);
+      if (remaining === 0) break;
+
+      effectiveBatch = Math.min(options.batch, remaining);
+      await updateImageRegenState({ status: 'running', total: remaining });
+
+      const loopResult = await db.execute(sql`
+        SELECT id, sku, supplier_code, images, name
+        FROM products
+        WHERE (
+          images IS NULL
+          OR images = '[]'::jsonb
+          OR images::text = '[]'
+        )
+          AND sku IS NOT NULL AND sku <> ''
+        ORDER BY id
+        LIMIT ${effectiveBatch}
+      `);
+      const loopProducts = loopResult.rows as unknown as ProductRow[];
+      if (loopProducts.length === 0) break;
+
+      // Reset counters for this batch
+      nextIndex = 0;
+      processed = 0;
+      downloaded = 0;
+      skipped = 0;
+      errors = 0;
+
+      async function loopWorker(): Promise<void> {
+        while (true) {
+          const index = nextIndex++;
+          if (index >= loopProducts.length) return;
+          const product = loopProducts[index];
+          let resultStatus: 'downloaded' | 'no-image' | 'failed' = 'failed';
+          try {
+            const status = await processProduct(product, index + 1, loopProducts.length, catalogMap);
+            resultStatus = status;
+            if (status === 'downloaded') downloaded++;
+            else skipped++;
+          } catch (error) {
+            errors++;
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`[${index + 1}/${loopProducts.length}] Product ${product.id}: failed - ${message}`);
+          } finally {
+            processed++;
+            totalProcessed++;
+            if (resultStatus === 'downloaded') totalDownloaded++;
+            else totalSkipped++;
+            if (resultStatus === 'failed') totalErrors++;
+            await updateImageRegenState({
+              processed: totalProcessed,
+              success: totalDownloaded,
+              failed: totalErrors,
+              skipped: totalSkipped,
+              current_sku: product.sku ?? '',
+            }).catch((err) => console.error('[STATE UPDATE ERROR]', err));
+          }
+        }
+      }
+
+      const loopWorkerCount = Math.min(options.concurrency, loopProducts.length);
+      await Promise.all(Array.from({ length: loopWorkerCount }, () => loopWorker()));
+
+      batchNum++;
+    }
+
+    await updateImageRegenState({
+      status: 'completed',
+      processed: totalProcessed,
+      success: totalDownloaded,
+      failed: totalErrors,
+      skipped: totalSkipped,
+      current_sku: '',
+    });
+    console.log(
+      `[ALL DONE] batches=${batchNum} totalProcessed=${totalProcessed} downloaded=${totalDownloaded} skipped=${totalSkipped} errors=${totalErrors}`,
+    );
+  }
 }
 
 main()
