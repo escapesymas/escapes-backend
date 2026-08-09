@@ -26,7 +26,7 @@ import {
   getLiveStockLevel, getLiveStockValue, checkProductsInfo, createBihrOrder, syncBihrCatalog
 } from './bihrService.js';
 import { checkRateLimit } from './redis.js';
-import { cacheGet, cacheSet } from './lib/cache.js';
+import { cacheGet, cacheSet, cacheBust } from './lib/cache.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
 
@@ -958,8 +958,14 @@ app.post('/api/bihr/sync-catalog', async (req: any, res: any) => {
   const { catalogType } = req.body;
   try {
     syncBihrCatalog(catalogType || 'HardPart')
-      .then(success => {
+      .then(async success => {
         console.log(`[BIHR SYNC BACKGROUND]: Sincronización finalizada con éxito: ${success}`);
+        // Bust catalog caches after the background sync finishes: imports
+        // upsert products/categories and pricing, so every cached page that
+        // serves from them must be invalidated once the run is done.
+        await cacheBust('cache:products');
+        await cacheBust('cache:categories');
+        await cacheBust('cache:filters');
       })
       .catch(err => {
         console.error('[BIHR SYNC BACKGROUND ERROR]:', err);
@@ -1249,6 +1255,16 @@ app.get('/api/vehicles', async (req, res) => {
 
   try {
     const cacheKey = `/api/vehicles?action=${action || ''}&brand=${brand || ''}&model=${model || ''}&year=${year || ''}`;
+    const redisKey = `cache:vehicles:${JSON.stringify({
+      action: action || '',
+      brand: brand || '',
+      model: model || '',
+      year: year || '',
+    })}`;
+    const cached = await cacheGet<any[]>(redisKey);
+    if (cached) {
+      return res.json(cached);
+    }
 
     // Cachar jerarquía de vehículos por 5 min fresca, 30 min grace (SWR)
     const result = await executeSWR(cacheKey, async () => {
@@ -1389,6 +1405,7 @@ app.get('/api/vehicles', async (req, res) => {
       }
     }, 300, 1800);
 
+    await cacheSet(redisKey, result, 600);
     return res.json(result);
   } catch (err: any) {
     console.error('[VEHICLES ERROR]:', err);
@@ -1707,6 +1724,20 @@ app.get('/api/catalog/filters', async (req, res) => {
     const { category_id, search, universal } = req.query as any;
 
     const cacheKey = `/api/catalog/filters?category_id=${category_id || ''}&search=${search || ''}&universal=${universal || ''}`;
+    const redisKey = `cache:filters:${JSON.stringify({
+      category_id: category_id || '',
+      search: search || '',
+      universal: universal || '',
+    })}`;
+    const cached = await cacheGet<{
+      brands: string[];
+      price_min: number;
+      price_max: number;
+      attributes: Record<string, string[]>;
+    }>(redisKey);
+    if (cached) {
+      return res.json(cached);
+    }
 
     const result = await executeSWR(cacheKey, async () => {
       const conditions = sql`WHERE status = 'published'`;
@@ -1764,6 +1795,7 @@ app.get('/api/catalog/filters', async (req, res) => {
       return { brands, price_min: priceMin, price_max: priceMax, attributes };
     }, 300, 1800);
 
+    await cacheSet(redisKey, result, 300);
     res.json(result);
   } catch (err: any) {
     console.error('[FILTERS ERROR]:', err);
@@ -2576,6 +2608,10 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             }
           }
           await client.query('COMMIT');
+          // Bust product + filter cache: variations affect the product detail
+          // page and any filter UI that surfaces variant attributes.
+          await cacheBust('cache:products');
+          await cacheBust('cache:filters');
           return res.json({ success: true });
         } catch (e) {
           await client.query('ROLLBACK');
@@ -2768,6 +2804,11 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             await pool.query('INSERT INTO product_links (product_id, linked_product_id, link_type) VALUES ($1, $2, $3)', [newId, c.id, 'cross_sell']);
           }
         }
+
+        // Bust product + filter cache: a new product changes both the
+        // catalog listings and any aggregated brand/category filter facets.
+        await cacheBust('cache:products');
+        await cacheBust('cache:filters');
 
         return res.json({ success: true, id: newId });
       }
@@ -3346,6 +3387,11 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           }
         }
 
+        // Bust product + filter cache: a mass price recalc touches most rows
+        // in the catalog listing and the min/max price filter facets.
+        await cacheBust('cache:products');
+        await cacheBust('cache:filters');
+
         return res.json({ success: true, updatedCount: updateCount });
       }
 
@@ -3793,13 +3839,19 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         if (req.method !== 'POST') return res.status(405).end();
         const { productId } = req.body;
         if (!productId) return res.status(400).json({ error: 'Falta productId' });
-        
+
         await db.execute(sql`
           DELETE FROM order_items WHERE product_id = ${parseInt(productId)}
         `);
         await db.execute(sql`
           DELETE FROM products WHERE id = ${parseInt(productId)}
         `);
+
+        // Bust product + filter cache: removing a product invalidates the
+        // catalog listing and any aggregated filter facets that included it.
+        await cacheBust('cache:products');
+        await cacheBust('cache:filters');
+
         return res.json({ success: true });
       }
 
@@ -3927,6 +3979,12 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           }
         }
 
+        // Bust product + filter cache: any field change (price, stock, brand,
+        // category, status, etc.) can shift both the listing and the filter
+        // facets computed from it.
+        await cacheBust('cache:products');
+        await cacheBust('cache:filters');
+
         return res.json({ success: true, id: productId });
       }
 
@@ -3993,7 +4051,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         if (req.method !== 'POST') return res.status(405).end();
         const { id, name, slug, parent_id, description } = req.body;
         if (!name || !slug) return res.status(400).json({ error: 'Faltan datos obligatorios' });
-        
+
         if (id) {
           await pool.query(
             'UPDATE categories SET name = $1, slug = $2, parent_id = $3, description = $4, updated_at = NOW() WHERE id = $5',
@@ -4005,12 +4063,24 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             [name, slug, parent_id || null, description || null]
           );
         }
+
+        // Bust category + filter cache: a category rename/reparent changes
+        // the navigation tree and any filter UI grouped by category.
+        await cacheBust('cache:categories');
+        await cacheBust('cache:filters');
+
         return res.json({ success: true });
       }
       case 'delete-category': {
         if (req.method !== 'POST') return res.status(405).end();
         const { id } = req.body;
         await pool.query('DELETE FROM categories WHERE id = $1', [id]);
+
+        // Bust category + filter cache: removing a category affects the
+        // navigation tree and any product filter facets that referenced it.
+        await cacheBust('cache:categories');
+        await cacheBust('cache:filters');
+
         return res.json({ success: true });
       }
 
@@ -4047,18 +4117,28 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         if (req.method !== 'POST') return res.status(405).end();
         const { id, name } = req.body;
         if (!name) return res.status(400).json({ error: 'Faltan datos obligatorios' });
-        
+
         if (id) {
           await pool.query('UPDATE vehicle_brands SET name = $1 WHERE id = $2', [name, id]);
         } else {
           await pool.query('INSERT INTO vehicle_brands (name) VALUES ($1)', [name]);
         }
+
+        // Bust vehicle cache: brand changes propagate to vehicle-fitment
+        // selectors across the storefront.
+        await cacheBust('cache:vehicles');
+
         return res.json({ success: true });
       }
       case 'delete-vehicle-brand': {
         if (req.method !== 'POST') return res.status(405).end();
         const { id } = req.body;
         await pool.query('DELETE FROM vehicle_brands WHERE id = $1', [id]);
+
+        // Bust vehicle cache: removing a brand invalidates the fitment
+        // selector and any model listings that depended on it.
+        await cacheBust('cache:vehicles');
+
         return res.json({ success: true });
       }
       
@@ -4077,18 +4157,28 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         if (req.method !== 'POST') return res.status(405).end();
         const { id, brand_id, name } = req.body;
         if (!name || !brand_id) return res.status(400).json({ error: 'Faltan datos obligatorios' });
-        
+
         if (id) {
           await pool.query('UPDATE vehicle_models SET brand_id = $1, name = $2 WHERE id = $3', [brand_id, name, id]);
         } else {
           await pool.query('INSERT INTO vehicle_models (brand_id, name) VALUES ($1, $2)', [brand_id, name]);
         }
+
+        // Bust vehicle cache: model changes affect the vehicle-fitment
+        // selectors used in product compatibility filters.
+        await cacheBust('cache:vehicles');
+
         return res.json({ success: true });
       }
       case 'delete-vehicle-model': {
         if (req.method !== 'POST') return res.status(405).end();
         const { id } = req.body;
         await pool.query('DELETE FROM vehicle_models WHERE id = $1', [id]);
+
+        // Bust vehicle cache: removing a model invalidates fitment selectors
+        // and any cached compatibility listings that included it.
+        await cacheBust('cache:vehicles');
+
         return res.json({ success: true });
       }
 
@@ -5241,6 +5331,12 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
       } catch (e: any) {
         console.error(`[AUTO-INVOICE ERROR] Failed to auto-generate invoice for Order ${orderId}:`, e);
       }
+
+      // Bust product + filter cache: order finalization decrements stock on
+      // the purchased products, which would otherwise be served stale by the
+      // cached catalog listings and stock-related filter facets.
+      await cacheBust('cache:products');
+      await cacheBust('cache:filters');
     }
 
     res.json({ success: true });
@@ -6162,6 +6258,12 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         } catch (e: any) {
           console.error(`[STRIPE WEBHOOK] Invoice error for Order ${orderId}:`, e);
         }
+
+        // Bust product + filter cache: stock was decremented in the loop
+        // above, so the cached catalog listing and any stock/availability
+        // filter facets are now stale.
+        await cacheBust('cache:products');
+        await cacheBust('cache:filters');
 
         try {
           const orderRowRes = await db.execute(sql`
