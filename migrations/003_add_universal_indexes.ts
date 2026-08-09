@@ -30,32 +30,38 @@ const indexes: IndexSpec[] = [
     name: 'idx_products_universal_id',
     description: 'Partial index on id for universal products (lookups, COUNT, pagination).',
     statement: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_universal_id
-      ON products (id) WHERE universal = true`,
+      ON products (id)
+      WHERE (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')`,
   },
   {
     name: 'idx_products_universal_category',
     description: 'Composite (category_id, id) for category-filtered universal queries.',
     statement: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_universal_category
-      ON products (category_id, id) WHERE universal = true`,
+      ON products (category_id, id)
+      WHERE (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')`,
   },
   {
     name: 'idx_products_universal_brand',
     description: 'Composite (brand, id) for brand-filtered universal queries (NULL brand excluded).',
     statement: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_universal_brand
-      ON products (brand, id) WHERE universal = true AND brand IS NOT NULL`,
+      ON products (brand, id)
+      WHERE (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')
+        AND brand IS NOT NULL`,
   },
   {
     name: 'idx_products_universal_instock',
     description: 'Composite (in_stock, id) for in-stock-filtered universal queries.',
     statement: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_universal_instock
-      ON products (in_stock, id) WHERE universal = true AND in_stock = true`,
+      ON products (in_stock, id)
+      WHERE (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')
+        AND in_stock = true`,
   },
   {
     name: 'idx_products_universal_search',
     description: 'GIN full-text search index (Spanish) on name + description for universal products.',
     statement: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_products_universal_search
       ON products USING gin(to_tsvector('spanish', coalesce(name, '') || ' ' || coalesce(description, '')))
-      WHERE universal = true`,
+      WHERE (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')`,
   },
 ];
 
