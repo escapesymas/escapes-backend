@@ -80,8 +80,8 @@ function sanitizeSku(sku: string | null | undefined): string {
 async function loadCatalogMap(catalogPath: string): Promise<Map<string, string>> {
   console.log(`[CATALOG] Reading ${catalogPath}`);
   const raw = await readFile(catalogPath, 'utf-8');
-  const catalog = JSON.parse(raw) as { References?: CatalogReference[] };
-  const references = catalog.References || [];
+  const catalog = JSON.parse(raw) as { References?: CatalogReference[]; Products?: CatalogReference[] };
+  const references = catalog.References || catalog.Products || [];
   console.log(`[CATALOG] Total references: ${references.length}`);
 
   const map = new Map<string, string>();
