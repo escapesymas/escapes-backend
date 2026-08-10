@@ -560,33 +560,51 @@ app.post(
       try { fs.unlinkSync(file.path); } catch {}
       return res.status(400).json({ error: 'El archivo debe ser un .zip' });
     }
-    const csvDir = String(req.body?.csvDir || CSV_DIR_DEFAULT);
+    const csvDir = String(req.body?.csvDir || resolveCsvDir());
     const shouldClean = req.body?.clean === '1' || req.body?.clean === 'true';
 
     try {
-      if (shouldClean && fs.existsSync(csvDir)) {
-        for (const f of fs.readdirSync(csvDir)) {
-          try { fs.unlinkSync(path.join(csvDir, f)); } catch {}
+      // Make sure the target dir exists and is writable by the backend user.
+      // Older images may not have /app/server/catalog-csv pre-created.
+      try {
+        fs.mkdirSync(csvDir, { recursive: true });
+        // The container runs as the `backend` user; only /app/server/uploads and
+        // /app/server/invoices are pre-chowned in the Dockerfile. If we can't
+        // write to the requested dir, fall back to /app/server/uploads/catalog-csv.
+        fs.accessSync(csvDir, fs.constants.W_OK);
+      } catch (permErr) {
+        const fallback = path.join(uploadDir, 'catalog-csv');
+        console.warn(`[CSV UPLOAD] ${csvDir} not writable (${permErr.message}); using ${fallback}`);
+        fs.mkdirSync(fallback, { recursive: true });
+      }
+
+      const finalDir = fs.existsSync(csvDir) && (() => {
+        try { fs.accessSync(csvDir, fs.constants.W_OK); return true; } catch { return false; }
+      })() ? csvDir : path.join(uploadDir, 'catalog-csv');
+
+      if (shouldClean && fs.existsSync(finalDir)) {
+        for (const f of fs.readdirSync(finalDir)) {
+          try { fs.unlinkSync(path.join(finalDir, f)); } catch {}
         }
       }
-      fs.mkdirSync(csvDir, { recursive: true });
+      fs.mkdirSync(finalDir, { recursive: true });
 
       // Extract using `unzip` (already present in the alpine image since curl).
       const { execSync } = await import('node:child_process');
-      execSync(`unzip -o -q '${file.path}' -d '${csvDir}'`, { stdio: 'inherit' });
+      execSync(`unzip -o -q '${file.path}' -d '${finalDir}'`, { stdio: 'inherit' });
 
-      const csvCount = fs.existsSync(csvDir)
-        ? fs.readdirSync(csvDir).filter((f) => f.endsWith('.csv')).length
+      const csvCount = fs.existsSync(finalDir)
+        ? fs.readdirSync(finalDir).filter((f) => f.endsWith('.csv')).length
         : 0;
 
       try { fs.unlinkSync(file.path); } catch {}
 
-      console.log(`[CSV UPLOAD] extracted ${csvCount} csv files into ${csvDir}`);
+      console.log(`[CSV UPLOAD] extracted ${csvCount} csv files into ${finalDir}`);
       return res.json({
         success: true,
-        csvDir,
+        csvDir: finalDir,
         csvCount,
-        message: `Extraídos ${csvCount} CSVs en ${csvDir}`,
+        message: `Extraídos ${csvCount} CSVs en ${finalDir}`,
       });
     } catch (err: any) {
       console.error('[CSV UPLOAD ERROR]', err);
@@ -1285,6 +1303,18 @@ app.get('/api/bihr/sync-images-v2/status', async (req: any, res: any) => {
 // This is the richest data source (Picture1-6 columns, multi-image products).
 // ---------------------------------------------------------------------------
 const CSV_DIR_DEFAULT = '/app/server/catalog-csv';
+const CSV_DIR_FALLBACK = '/app/server/uploads/catalog-csv';
+
+function resolveCsvDir(): string {
+  for (const dir of [CSV_DIR_DEFAULT, CSV_DIR_FALLBACK]) {
+    try {
+      if (fs.existsSync(dir) && fs.readdirSync(dir).some((f) => f.endsWith('.csv'))) {
+        return dir;
+      }
+    } catch {}
+  }
+  return CSV_DIR_DEFAULT;
+}
 
 app.post('/api/bihr/sync-images-v4/start', async (req: any, res: any) => {
   if (!requireAdminKey(req, res)) return;
@@ -1295,7 +1325,7 @@ app.post('/api/bihr/sync-images-v4/start', async (req: any, res: any) => {
   const batch = Number(req.body?.batch) || 50;
   const concurrency = Number(req.body?.concurrency) || 8;
   const loopAll = req.body?.loopAll === true;
-  const csvDir = String(req.body?.csvDir || CSV_DIR_DEFAULT);
+  const csvDir = String(req.body?.csvDir || resolveCsvDir());
 
   const scriptPath = path.join(process.cwd(), 'scripts', 'download-images-from-csv.ts');
   if (!fs.existsSync(scriptPath)) {
