@@ -765,33 +765,28 @@ app.get('/api/admin/trace-image', async (req: any, res: any) => {
     if (prod.rows.length === 0) return res.status(404).json({ error: 'product not found' });
     const p = prod.rows[0];
 
-    // Build the downloader's catalog map (only rows with non-empty Picture1)
+    // Build the downloader's catalog map (only rows with non-empty Picture1).
+    // IMPORTANT: use a multi-line-aware CSV parser. CSVs have quoted cells
+    // (HtmlDescription, Description) containing newlines, so a naive
+    // `text.split(/\r?\n/)` followed by per-line comma split produces
+    // mis-aligned rows and drops most of the catalog.
     const csvDir = resolveCsvDir();
     const map = new Map<string, { url: string; source: string }>();
     if (fs.existsSync(csvDir)) {
       for (const file of fs.readdirSync(csvDir).filter((f: string) => f.endsWith('.csv'))) {
         const txt = fs.readFileSync(path.join(csvDir, file), 'utf-8');
-        const lines = txt.split(/\r?\n/);
-        if (lines.length === 0) continue;
-        const header = (lines[0] || '').split(',');
+        const rows = parseCsvText(txt);
+        if (rows.length < 2) continue;
+        const header = rows[0];
         const partIdx = header.indexOf('PartNumber');
         const picIdx = header.indexOf('Picture1');
         const supIdx = header.indexOf('SupplierProductCode');
         if (partIdx === -1 || picIdx === -1) continue;
-        for (let i = 1; i < lines.length; i++) {
-          const line = lines[i];
-          if (!line) continue;
-          // Tiny per-line splitter — PartNumber/SupplierProductCode/Picture1
-          // are never quoted with commas in the catalog.
-          let depth = 0, cell = '', cells: string[] = [];
-          for (const ch of line + ',') {
-            if (ch === '"') depth = 1 - depth;
-            else if (ch === ',' && depth === 0) { cells.push(cell); cell = ''; }
-            else cell += ch;
-          }
-          const part = (cells[partIdx] || '').trim();
-          const pic = (cells[picIdx] || '').trim();
-          const sup = supIdx !== -1 ? (cells[supIdx] || '').trim() : '';
+        for (let i = 1; i < rows.length; i++) {
+          const r = rows[i];
+          const part = (r[partIdx] || '').trim();
+          const pic = (r[picIdx] || '').trim();
+          const sup = supIdx !== -1 ? (r[supIdx] || '').trim() : '';
           if (part && pic && !map.has(part)) {
             map.set(part, { url: pic, source: `${file}:PartNumber` });
           }
@@ -838,6 +833,53 @@ app.get('/api/admin/trace-image', async (req: any, res: any) => {
     }
 
     return res.json(trace);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Quick catalog stats using the multi-line-aware parser.
+// Returns the real catalog map size (matching what the downloader sees).
+app.get('/api/admin/catalog-stats', async (_req: any, res: any) => {
+  if (!requireAdminKey(_req, res)) return;
+  try {
+    const csvDir = resolveCsvDir();
+    const map = new Map<string, string>();
+    let totalRows = 0;
+    let rowsWithPicture = 0;
+    let files = 0;
+    const start = Date.now();
+    if (fs.existsSync(csvDir)) {
+      for (const file of fs.readdirSync(csvDir).filter((f: string) => f.endsWith('.csv'))) {
+        files++;
+        const txt = fs.readFileSync(path.join(csvDir, file), 'utf-8');
+        const rows = parseCsvText(txt);
+        if (rows.length < 2) continue;
+        const header = rows[0];
+        const partIdx = header.indexOf('PartNumber');
+        const picIdx = header.indexOf('Picture1');
+        const supIdx = header.indexOf('SupplierProductCode');
+        if (partIdx === -1 || picIdx === -1) continue;
+        for (let i = 1; i < rows.length; i++) {
+          const r = rows[i];
+          totalRows++;
+          const part = (r[partIdx] || '').trim();
+          const pic = (r[picIdx] || '').trim();
+          const sup = supIdx !== -1 ? (r[supIdx] || '').trim() : '';
+          if (part && pic) rowsWithPicture++;
+          if (part && pic && !map.has(part)) map.set(part, pic);
+          if (sup && pic && !map.has(sup)) map.set(sup, pic);
+        }
+      }
+    }
+    return res.json({
+      csvDir,
+      files,
+      totalRows,
+      rowsWithPicture,
+      mapSize: map.size,
+      elapsedMs: Date.now() - start,
+    });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
@@ -1570,6 +1612,48 @@ function resolveCsvDir(): string {
   // No CSVs found anywhere — return the persistent location so the downloader
   // and the upload endpoint know where to write.
   return CSV_DIR_DEFAULT;
+}
+
+/** Parse a CSV that may contain multi-line quoted fields (Bihr catalog uses these
+ * for HtmlDescription/Description). Returns array of rows (first row is header). */
+function parseCsvText(text: string): string[][] {
+  const rows: string[][] = [];
+  let current: string[] = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"' && text[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        field += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ',') {
+        current.push(field);
+        field = '';
+      } else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        current.push(field);
+        field = '';
+        if (current.some((v) => v !== '')) rows.push(current);
+        current = [];
+      } else {
+        field += ch;
+      }
+    }
+  }
+  if (field !== '' || current.length > 0) {
+    current.push(field);
+    if (current.some((v) => v !== '')) rows.push(current);
+  }
+  return rows;
 }
 
 app.post('/api/bihr/sync-images-v4/start', async (req: any, res: any) => {
