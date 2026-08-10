@@ -955,7 +955,7 @@ app.get('/api/admin/image-regen-state', async (_req: any, res: any) => {
 app.get('/api/admin/image-downloader-log', async (_req: any, res: any) => {
   if (!requireAdminKey(_req, res)) return;
   try {
-    const path = '/tmp/image-dl-v5.log';
+    const path = '/app/server/uploads/image-dl-v5.log';
     if (!fs.existsSync(path)) return res.json({ exists: false, content: '' });
     const stat = fs.statSync(path);
     // Tail last 200KB
@@ -1835,9 +1835,11 @@ app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
   if (loopAll) args.push('--all');
 
   console.log(`[IMAGE DOWNLOADER V5] spawn: npx tsx ${args.join(' ')}`);
-  // Tee child stdout/stderr to a file the admin can inspect via /api/admin/image-downloader-log
-  const logPath = '/tmp/image-dl-v5.log';
-  try { fs.writeFileSync(logPath, ''); } catch {}
+  // Tee child stdout/stderr to a file the admin can inspect via /api/admin/image-downloader-log.
+  // Use /app/server/uploads (the persistent volume) instead of /tmp because the runtime
+  // user can't write to /tmp in this container.
+  const logPath = '/app/server/uploads/image-dl-v5.log';
+  try { fs.writeFileSync(logPath, ''); } catch (e) { console.error('[V5 LOG INIT]', e); }
   const logStream = fs.createWriteStream(logPath, { flags: 'a' });
   const child = spawn('npx', ['tsx', ...args], {
     cwd: process.cwd(),
