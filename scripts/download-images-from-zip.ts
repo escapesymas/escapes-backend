@@ -330,7 +330,22 @@ async function fetchImageFromZip(brand: string, sku: string, index: BrandIndex):
     return zlib.inflateSync(compressed);
   }
   const compressed = buf.subarray(dataStart, dataStart + actualCompSize);
-  return zlib.inflateSync(compressed);
+  try {
+    return zlib.inflateSync(compressed);
+  } catch (inflateErr: any) {
+    const detail = {
+      brand,
+      sku,
+      method,
+      actualCompSize,
+      actualUncompSize,
+      bufLen: buf.length,
+      dataStart,
+      first16: compressed.subarray(0, Math.min(16, compressed.length)).toString('hex'),
+      status: rangeResp.status,
+    };
+    throw new Error(`inflate failed (${inflateErr.message}): ${JSON.stringify(detail)}`);
+  }
 }
 
 async function writeVariants(image: Buffer, safeSku: string): Promise<void> {
