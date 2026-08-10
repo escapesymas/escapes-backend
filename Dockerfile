@@ -31,6 +31,6 @@ RUN chmod +x /usr/local/bin/escapes-post-deploy.sh
 RUN npm install --legacy-peer-deps --include=dev
 USER backend
 EXPOSE 3001
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
   CMD curl -fsS http://localhost:3001/api/health || exit 1
 CMD ["npx", "tsx", "index.ts"]
