@@ -46,10 +46,8 @@
 - **Impacto**: 98k productos con imagen visible = SEO + conversión
 
 #### 2. Monitoring en producción
-- **Sentry** (frontend + backend) para capturar errores JS/TS y 5xx
-  - `npm i @sentry/nextjs` en frontend, `@sentry/node` en backend
-  - Configurar DSN en Coolify env vars
-  - Source maps en build
+- ✅ **Sentry backend** (`@sentry/node`) — captura 5xx, unhandled exceptions/rejections. Commit `64e1aad`. Activar con `SENTRY_DSN` en Coolify env vars.
+- ⏳ **Sentry frontend** — pendiente (repo separado)
 - **UptimeRobot** o **Better Stack** para monitorizar `https://api.escapesymas.com/api/health` cada 1 min
   - Alertas vía email/webhook si down > 2 min
 - **Esfuerzo**: 2-3 horas
