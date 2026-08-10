@@ -1875,8 +1875,17 @@ app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
   // Use /app/server/uploads (the persistent volume) instead of /tmp because the runtime
   // user can't write to /tmp in this container.
   const logPath = '/app/server/uploads/image-dl-v5.log';
-  try { fs.writeFileSync(logPath, ''); } catch (e) { console.error('[V5 LOG INIT]', e); }
+  // Init log file with header so we can confirm the spawn code path ran.
+  const initHeader = `[SPAWN ${new Date().toISOString()}] batch=${batch} concurrency=${concurrency} loopAll=${loopAll} csvDir=${csvDir}\n`;
+  try {
+    fs.writeFileSync(logPath, initHeader);
+  } catch (e: any) {
+    console.error('[V5 LOG INIT]', e?.message || e);
+  }
   const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+  // Use 'inherit' for stdio so output is captured reliably — Node pipes can lose data
+  // when the consumer disconnects. With inherit, stdout/stderr go to the parent's
+  // stdout/stderr directly, AND we tee to the log file via 'pipe' below.
   const child = spawn('npx', ['tsx', ...args], {
     cwd: process.cwd(),
     env: process.env,
@@ -1893,7 +1902,13 @@ app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
     process.stderr.write(`[IMAGE-DL] ${chunk}`);
     logStream.write(chunk);
   });
-  child.on('exit', () => { try { logStream.end(); } catch {} });
+  child.on('exit', () => {
+    logStream.end();
+    // Append an exit marker so we can detect when the log is current vs stale.
+    try {
+      fs.appendFileSync(logPath, `[EXIT ${new Date().toISOString()}]\n`);
+    } catch {}
+  });
 
   child.on('exit', (code, signal) => {
     console.log(`[IMAGE DOWNLOADER V5] exited code=${code} signal=${signal}`);
