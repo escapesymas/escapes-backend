@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { mkdir, writeFile, readFile, readdir } from 'node:fs/promises';
+import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { sql } from 'drizzle-orm';
@@ -17,9 +18,7 @@ const CSV_DIR_FALLBACK = '/app/server/catalog-csv';
 function resolveCsvDir(): string {
   for (const dir of [CSV_DIR_DEFAULT, CSV_DIR_FALLBACK]) {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const fs = require('node:fs') as typeof import('node:fs');
-      if (fs.existsSync(dir) && fs.readdirSync(dir).some((f) => f.endsWith('.csv'))) {
+      if (existsSync(dir) && readdirSync(dir).some((f) => f.endsWith('.csv'))) {
         return dir;
       }
     } catch {}
@@ -157,7 +156,7 @@ function sanitizeSku(sku: string | null | undefined): string {
 }
 
 async function loadCatalogMap(csvDir: string): Promise<Map<string, string>> {
-  const finalDir = fs.existsSync(csvDir) && (await readdir(csvDir)).some((f) => f.endsWith('.csv'))
+  const finalDir = existsSync(csvDir) && readdirSync(csvDir).some((f) => f.endsWith('.csv'))
     ? csvDir
     : resolveCsvDir();
   console.log(`[CATALOG] Reading CSVs from ${finalDir}`);
