@@ -21,6 +21,7 @@ interface CliOptions {
   concurrency: number;
   csvDir: string;
   loopAll: boolean;
+  recheckFiles: boolean;
 }
 
 interface ProductRow {
@@ -67,15 +68,17 @@ function parseArgs(args: string[]): CliOptions {
   let concurrency = DEFAULT_CONCURRENCY;
   let csvDir = CSV_DIR_DEFAULT;
   let loopAll = false;
+  let recheckFiles = false;
   for (const arg of args) {
     if (arg.startsWith('--batch=')) batch = parseInt(arg.slice(8), 10);
     else if (arg.startsWith('--concurrency=')) concurrency = parseInt(arg.slice(14), 10);
     else if (arg.startsWith('--csv-dir=')) csvDir = arg.slice(10);
     else if (arg === '--all') loopAll = true;
+    else if (arg === '--recheck-files') recheckFiles = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (batch <= 0 || concurrency <= 0) throw new Error('batch and concurrency must be positive');
-  return { batch, concurrency, csvDir, loopAll };
+  return { batch, concurrency, csvDir, loopAll, recheckFiles };
 }
 
 function sanitizeSku(sku: string | null | undefined): string {
@@ -555,6 +558,49 @@ async function countCandidates(): Promise<number> {
   return result.rows[0]?.total ?? 0;
 }
 
+/**
+ * Scan all products with images and reset the ones whose webp file is missing
+ * on disk. Recovery for when the upload volume was wiped but the DB kept
+ * image references (or a container recreation lost the writable layer).
+ *
+ * For each product with non-null images, we check if its 800px variant file
+ * exists at OPTIMIZED_DIR/{sku}_0_800.webp. If not, we reset images to NULL
+ * so the regular loopAll picks it up for re-download.
+ *
+ * Loads the id+sku list in one query (small projection, ~100k rows is fine),
+ * then walks the filesystem in a single pass. Reports progress every 1000
+ * products and resets in batches of 500 to keep the UPDATE cheap.
+ */
+async function resetMissingFiles(): Promise<void> {
+  selfLog('[RECHECK] Starting file-existence scan...');
+  const result = await pool.query(`
+    SELECT id, sku FROM products
+    WHERE images IS NOT NULL AND images::text NOT LIKE '%no-image%' AND images::text NOT IN ('[]','null')
+      AND sku IS NOT NULL AND sku <> ''
+  `);
+  const rows = result.rows as Array<{ id: number; sku: string }>;
+  selfLog(`[RECHECK] ${rows.length} products with images to verify`);
+  const missing: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const { id, sku } = rows[i];
+    const file = path.join(OPTIMIZED_DIR, `${sanitizeSku(sku)}_0_800.webp`);
+    if (!existsSync(file)) missing.push(id);
+    if ((i + 1) % 1000 === 0) selfLog(`[RECHECK] progress ${i + 1}/${rows.length}`);
+  }
+  selfLog(`[RECHECK] ${missing.length} products with missing files`);
+  if (missing.length === 0) return;
+  // Reset in batches of 500 to avoid a single huge statement.
+  const BATCH = 500;
+  for (let i = 0; i < missing.length; i += BATCH) {
+    const slice = missing.slice(i, i + BATCH);
+    await pool.query(
+      `UPDATE products SET images = NULL WHERE id = ANY($1::int[])`,
+      [slice],
+    );
+  }
+  selfLog(`[RECHECK] Reset ${missing.length} products to NULL — they'll be re-downloaded`);
+}
+
 async function runBatch(
   options: CliOptions,
   skuMap: Map<string, { brand: string }>,
@@ -620,6 +666,9 @@ async function main(): Promise<void> {
   selfLog(`[INFO] batch=${options.batch} concurrency=${options.concurrency} csvDir=${options.csvDir}`);
   await loadFailedBrands();
   selfLog(`[INFO] failedBrands=${failedBrands.size} (cached)`);
+  if (options.recheckFiles) {
+    await resetMissingFiles();
+  }
   const { skuMap, partMap } = await loadCatalogMap(options.csvDir);
   const totalCandidates = await countCandidates();
   selfLog(`[INFO] totalCandidates=${totalCandidates} skuMapSize=${skuMap.size} partMapSize=${partMap.size}`);
