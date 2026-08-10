@@ -977,6 +977,29 @@ app.get('/api/admin/image-downloader-log', async (_req: any, res: any) => {
   }
 });
 
+app.get('/api/admin/uploads-listing', async (_req: any, res: any) => {
+  if (!requireAdminKey(_req, res)) return;
+  try {
+    const dir = '/app/server/uploads';
+    const exists = fs.existsSync(dir);
+    if (!exists) return res.json({ exists: false, dir, files: [], error: 'uploads dir missing' });
+    const files = fs.readdirSync(dir, { withFileTypes: true }).map((d) => ({
+      name: d.name,
+      isFile: d.isFile(),
+      isDir: d.isDirectory(),
+      size: d.isFile() ? fs.statSync(path.join(dir, d.name)).size : null,
+    }));
+    let stat: { uid: number; gid: number; mode: string } | null = null;
+    try {
+      const s = fs.statSync(dir);
+      stat = { uid: s.uid, gid: s.gid, mode: '0' + (s.mode & 0o777).toString(8) };
+    } catch {}
+    res.json({ exists: true, dir, files, stat, cwd: process.cwd() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 interface CacheEntry<T> {
   data: T;
