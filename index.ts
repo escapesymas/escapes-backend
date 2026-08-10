@@ -658,10 +658,26 @@ app.get('/api/admin/inspect-catalog', async (req: any, res: any) => {
       `SELECT COUNT(*)::int AS total FROM products WHERE (images IS NULL OR images::text = '[]') AND sku IS NOT NULL AND sku <> ''`,
     );
 
+    // Check whether /app/server/uploads/optimized is on a persistent volume.
+    // If the container was just rebuilt and this dir already has thousands of
+    // files, then uploads IS persistent; if it's empty, it isn't.
+    const optimizedDir = path.join(uploadDir, 'optimized');
+    let optimizedStats: any = { exists: false };
+    try {
+      if (fs.existsSync(optimizedDir)) {
+        const files = fs.readdirSync(optimizedDir);
+        optimizedStats = { exists: true, fileCount: files.length, sample: files.slice(0, 3) };
+      }
+    } catch (e: any) {
+      optimizedStats = { exists: false, error: e.message };
+    }
+
     return res.json({
       success: true,
       dirUsed,
       dirs,
+      uploadDir,
+      optimizedStats,
       dbSample: sampleDb.rows,
       dbMissing: missingCount.rows[0]?.total ?? 0,
     });
