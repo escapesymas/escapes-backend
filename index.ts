@@ -1023,7 +1023,8 @@ app.get('/api/admin/disk-usage', async (_req: any, res: any) => {
   if (!requireAdminKey(_req, res)) return;
   try {
     // 1. `df -h` overall
-    const dfOutput = execSync('df -h', { encoding: 'utf-8' });
+    let dfOutput = '';
+    try { dfOutput = execSync('df -h', { encoding: 'utf-8' }); } catch (e: any) { dfOutput = 'df failed: ' + (e?.message || String(e)); }
     // 2. `du` of every top-level item we care about
     const targets = [
       '/app/server',
@@ -1050,16 +1051,23 @@ app.get('/api/admin/disk-usage', async (_req: any, res: any) => {
     // 3. Docker image sizes (coolify often retains N+1 images)
     let dockerImages = '';
     try {
-      dockerImages = execSync('docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" 2>/dev/null | head -40', { encoding: 'utf-8' });
+      dockerImages = execSync('docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" 2>/dev/null', { encoding: 'utf-8' });
     } catch (e: any) {
       dockerImages = 'docker not available: ' + (e?.message || String(e));
     }
     // 4. Docker container sizes
     let dockerContainers = '';
     try {
-      dockerContainers = execSync('docker ps -a --format "{{.Names}} {{.Size}}" 2>/dev/null | head -20', { encoding: 'utf-8' });
+      dockerContainers = execSync('docker ps -a --format "{{.Names}} {{.Size}}" 2>/dev/null', { encoding: 'utf-8' });
     } catch (e: any) {
       dockerContainers = 'docker not available: ' + (e?.message || String(e));
+    }
+    // 5. Docker dangling images count via `docker image ls -f dangling=true`
+    let danglingImages = '';
+    try {
+      danglingImages = execSync('docker images -f "dangling=true" --format "{{.ID}} {{.Size}}" 2>/dev/null', { encoding: 'utf-8' });
+    } catch (e: any) {
+      danglingImages = 'docker not available: ' + (e?.message || String(e));
     }
     res.json({
       ok: true,
@@ -1067,9 +1075,52 @@ app.get('/api/admin/disk-usage', async (_req: any, res: any) => {
       du: duResults,
       dockerImages: dockerImages || '(empty)',
       dockerContainers: dockerContainers || '(empty)',
+      danglingImages: danglingImages || '(empty)',
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
+// Remove dangling images to free disk. Use with caution.
+app.post('/api/admin/docker-prune', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const action = String(req.body?.action || 'images'); // 'images' | 'all' | 'containers' | 'builder'
+    let cmd = '';
+    if (action === 'images') {
+      cmd = 'docker image prune -f';
+    } else if (action === 'all') {
+      cmd = 'docker system prune -f --volumes';
+    } else if (action === 'containers') {
+      cmd = 'docker container prune -f';
+    } else if (action === 'builder') {
+      cmd = 'docker builder prune -f --all';
+    } else {
+      return res.status(400).json({ error: 'action must be one of: images, all, containers, builder' });
+    }
+    const output = execSync(cmd, { encoding: 'utf-8', timeout: 120_000 });
+    let dfAfter = '';
+    try { dfAfter = execSync('df -h /', { encoding: 'utf-8' }); } catch {}
+    res.json({ ok: true, action, cmd, output: output || '(no output)', dfAfter });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message, code: err.code, stderr: err?.stderr?.toString() });
+  }
+});
+
+// Force-remove old stopped Docker images older than X. Be careful.
+app.post('/api/admin/docker-image-rm', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const id = String(req.body?.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id is required' });
+    if (!/^[a-f0-9]{6,64}$/.test(id)) return res.status(400).json({ error: 'invalid id format' });
+    const output = execSync(`docker rmi -f ${id}`, { encoding: 'utf-8', timeout: 60_000 });
+    let dfAfter = '';
+    try { dfAfter = execSync('df -h /', { encoding: 'utf-8' }); } catch {}
+    res.json({ ok: true, id, output: output || '(no output)', dfAfter });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message, code: err.code, stderr: err?.stderr?.toString() });
   }
 });
 
