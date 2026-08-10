@@ -1984,6 +1984,7 @@ app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
   const batch = Number(req.body?.batch) || 50;
   const concurrency = Number(req.body?.concurrency) || 4;
   const loopAll = req.body?.loopAll === true;
+  const recheckFiles = req.body?.recheckFiles === true;
   const csvDir = String(req.body?.csvDir || resolveCsvDir());
 
   const scriptPath = path.join(process.cwd(), 'scripts', 'download-images-from-zip.ts');
@@ -1998,6 +1999,7 @@ app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
 
   const args = [scriptPath, `--batch=${batch}`, `--concurrency=${concurrency}`, `--csv-dir=${csvDir}`];
   if (loopAll) args.push('--all');
+  if (recheckFiles) args.push('--recheck-files');
 
   console.log(`[IMAGE DOWNLOADER V5] spawn: npx tsx ${args.join(' ')}`);
   // Tee child stdout/stderr to a file the admin can inspect via /api/admin/image-downloader-log.
