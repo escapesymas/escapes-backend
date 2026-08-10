@@ -942,6 +942,16 @@ app.get('/api/admin/catalog-stats', async (_req: any, res: any) => {
 
 // ================================================================
 // SISTEMA DE CACHÉ EN MEMORIA (SWR - Stale While Revalidate)
+app.get('/api/admin/image-regen-state', async (_req: any, res: any) => {
+  if (!requireAdminKey(_req, res)) return;
+  try {
+    const r = await pool.query('SELECT * FROM image_regen_state WHERE id = 1');
+    res.json(r.rows[0] || null);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 interface CacheEntry<T> {
   data: T;
