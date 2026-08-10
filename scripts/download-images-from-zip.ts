@@ -326,7 +326,8 @@ async function fetchImageFromZip(brand: string, sku: string, index: BrandIndex):
     return Buffer.from(await newResp.arrayBuffer());
   }
 
-  // method=8 (deflate) — raw deflate in zip, so use inflateSync
+  // method=8 (deflate) — raw deflate in zip, so use inflateRawSync (NOT inflateSync
+  // which expects the 2-byte zlib header + adler32 checksum).
   if (buf.length < dataStart + actualCompSize) {
     const newEnd = entry.offset + 30 + fnameLen + extraLen + actualCompSize - 1;
     const newResp = await fetch(zipUrl, {
@@ -339,11 +340,11 @@ async function fetchImageFromZip(brand: string, sku: string, index: BrandIndex):
     });
     if (!newResp.ok && newResp.status !== 206) throw new Error(`Re-fetch failed: HTTP ${newResp.status}`);
     const compressed = Buffer.from(await newResp.arrayBuffer());
-    return zlib.inflateSync(compressed);
+    return zlib.inflateRawSync(compressed);
   }
   const compressed = buf.subarray(dataStart, dataStart + actualCompSize);
   try {
-    return zlib.inflateSync(compressed);
+    return zlib.inflateRawSync(compressed);
   } catch (inflateErr: any) {
     const detail = {
       brand,
