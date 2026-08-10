@@ -92,6 +92,18 @@ function brandFromCsvFilename(filename: string): string {
   return m ? m[7] : stem;
 }
 
+// Self-log to /app/server/uploads/image-dl-v5-self.log — bypasses the parent's
+// pipe tee which can drop output if the parent process restarts.
+const SELF_LOG = '/app/server/uploads/image-dl-v5-self.log';
+function selfLog(msg: string): void {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try {
+    require('node:fs').appendFileSync(SELF_LOG, line);
+  } catch {}
+  // Also keep stdout for parent pipe
+  console.log(msg);
+}
+
 /** Build sku → image URL map, AND sku → brand (for the zip). */
 async function loadCatalogMap(csvDir: string): Promise<{
   urlMap: Map<string, { url: string; brand: string }>;
@@ -342,8 +354,10 @@ async function fetchImageFromZip(brand: string, sku: string, index: BrandIndex):
       bufLen: buf.length,
       dataStart,
       first16: compressed.subarray(0, Math.min(16, compressed.length)).toString('hex'),
+      last16: compressed.subarray(Math.max(0, compressed.length - 16)).toString('hex'),
       status: rangeResp.status,
     };
+    selfLog(`INFLATE FAIL: ${JSON.stringify(detail)}`);
     throw new Error(`inflate failed (${inflateErr.message}): ${JSON.stringify(detail)}`);
   }
 }
@@ -465,6 +479,7 @@ async function runBatch(
         totals.errors++;
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[${index + 1}/${products.length}] Product ${product.id}: failed - ${message}`);
+        selfLog(`FAIL ${product.id} sku=${product.sku}: ${message}`);
       } finally {
         totals.processed++;
         await updateImageRegenState({
@@ -483,10 +498,12 @@ async function runBatch(
 }
 
 async function main(): Promise<void> {
+  selfLog('=== main() start ===');
   const options = parseArgs(process.argv.slice(2));
-  console.log(`[INFO] batch=${options.batch} concurrency=${options.concurrency} csvDir=${options.csvDir}`);
+  selfLog(`[INFO] batch=${options.batch} concurrency=${options.concurrency} csvDir=${options.csvDir}`);
   const { skuMap } = await loadCatalogMap(options.csvDir);
   const totalCandidates = await countCandidates();
+  selfLog(`[INFO] totalCandidates=${totalCandidates} skuMapSize=${skuMap.size}`);
   let effectiveBatch = Math.min(options.batch, totalCandidates);
   await updateImageRegenState({
     status: 'running',
@@ -494,7 +511,7 @@ async function main(): Promise<void> {
     total: totalCandidates, current_sku: '',
   });
   if (effectiveBatch === 0) {
-    console.log('[DONE] No products with missing images found.');
+    selfLog('[DONE] No products with missing images found.');
     await updateImageRegenState({ status: 'completed' });
     return;
   }
@@ -503,16 +520,16 @@ async function main(): Promise<void> {
   while (true) {
     totals.processed = 0; totals.downloaded = 0; totals.skipped = 0; totals.errors = 0;
     await runBatch(options, skuMap, effectiveBatch, totals);
-    console.log(`[BATCH ${batchNum}] downloaded=${totals.downloaded} skipped=${totals.skipped} errors=${totals.errors}`);
+    selfLog(`[BATCH ${batchNum}] downloaded=${totals.downloaded} skipped=${totals.skipped} errors=${totals.errors}`);
     if (!options.loopAll) break;
     const remaining = await countCandidates();
-    console.log(`[LOOP] remaining=${remaining}`);
+    selfLog(`[LOOP] remaining=${remaining}`);
     if (remaining === 0) break;
     effectiveBatch = Math.min(options.batch, remaining);
     batchNum++;
   }
   await updateImageRegenState({ status: 'completed', current_sku: '' });
-  console.log(`[ALL DONE] batches=${batchNum}`);
+  selfLog(`[ALL DONE] batches=${batchNum}`);
 }
 
 main()
