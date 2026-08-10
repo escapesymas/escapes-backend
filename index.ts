@@ -830,6 +830,61 @@ app.get('/api/admin/trace-image', async (req: any, res: any) => {
       } catch (err: any) {
         trace.fetchError = err.message;
       }
+
+      // Try the authenticated Bihr API endpoint as a fallback.
+      // Historical scripts (regenerate_images.py) used:
+      //   GET https://api.bihr.net/api/v2.1/Products/Image/{product_code}
+      //   Authorization: Bearer <token from /Authentication/Token>
+      // The catalog URLs from api.mybihr.com may be invalid/expired.
+      try {
+        const bihrBase = process.env.BIHR_API_BASE || 'https://api.bihr.net';
+        const bihrUser = process.env.BIHR_USERNAME || '';
+        const bihrKey = process.env.BIHR_MACKEY || '';
+        if (bihrUser && bihrKey) {
+          const tokenResp = await fetch(`${bihrBase}/api/v2.1/Authentication/Token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ UserName: bihrUser, PassWord: bihrKey }).toString(),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (tokenResp.ok) {
+            const tj = await tokenResp.json() as any;
+            const token = tj.access_token;
+            trace.authTokenObtained = true;
+            trace.authTokenExpiresIn = tj.expires_in;
+            const candidates: string[] = [];
+            if (p.sku) candidates.push(`${bihrBase}/api/v2.1/Products/Image/${encodeURIComponent(p.sku)}`);
+            if (p.supplier_code && p.supplier_code !== p.sku) {
+              candidates.push(`${bihrBase}/api/v2.1/Products/Image/${encodeURIComponent(p.supplier_code)}`);
+            }
+            trace.authResults = [];
+            for (const u of candidates) {
+              try {
+                const ar = await fetch(u, {
+                  headers: { Authorization: `Bearer ${token}` },
+                  signal: AbortSignal.timeout(15_000),
+                });
+                const ab = Buffer.from(await ar.arrayBuffer());
+                trace.authResults.push({
+                  url: u,
+                  status: ar.status,
+                  contentType: ar.headers.get('content-type'),
+                  size: ab.length,
+                  isJpeg: ab.length > 4 && ab[0] === 0xff && ab[1] === 0xd8,
+                });
+              } catch (e: any) {
+                trace.authResults.push({ url: u, error: e.message });
+              }
+            }
+          } else {
+            trace.authTokenError = `${tokenResp.status}: ${(await tokenResp.text()).slice(0, 200)}`;
+          }
+        } else {
+          trace.authTokenMissing = 'BIHR_USERNAME/BIHR_MACKEY not set';
+        }
+      } catch (err: any) {
+        trace.authError = err.message;
+      }
     }
 
     return res.json(trace);
