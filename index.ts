@@ -27,8 +27,13 @@ import {
 } from './bihrService.js';
 import { checkRateLimit } from './redis.js';
 import { cacheGet, cacheSet, cacheBust } from './lib/cache.js';
+import { initSentry, sentryErrorHandler } from './lib/sentry.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
+
+// Initialize Sentry as early as possible so subsequent unhandled errors are
+// captured. No-op when SENTRY_DSN is unset (local dev).
+initSentry();
 
 const stripeLiveKey = process.env.STRIPE_SECRET_KEY;
 if (!stripeLiveKey) {
@@ -7508,6 +7513,11 @@ async function bootstrapCatalogCsv(): Promise<void> {
     console.error('[BOOTSTRAP] Failed to extract catalog-csv.zip:', err.message);
   }
 }
+
+// Sentry error handler — must be the LAST middleware so it sees errors from
+// every route. It captures 5xx into Sentry and then delegates to Express's
+// default handler so the client still gets a proper response.
+app.use(sentryErrorHandler());
 
 app.listen(PORT, () => {
   console.log(`
