@@ -1313,7 +1313,9 @@ function resolveCsvDir(): string {
       }
     } catch {}
   }
-  return CSV_DIR_DEFAULT;
+  // No CSVs found anywhere — return a writable path. /app/server/uploads is the
+  // only directory the `backend` user can write to in the current Dockerfile.
+  return CSV_DIR_FALLBACK;
 }
 
 app.post('/api/bihr/sync-images-v4/start', async (req: any, res: any) => {
