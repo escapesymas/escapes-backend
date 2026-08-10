@@ -1358,8 +1358,12 @@ app.get('/api/bihr/sync-images-v2/status', async (req: any, res: any) => {
 // Reads image URLs from the Bihr extended catalog (CSV files per brand).
 // This is the richest data source (Picture1-6 columns, multi-image products).
 // ---------------------------------------------------------------------------
-const CSV_DIR_DEFAULT = '/app/server/catalog-csv';
-const CSV_DIR_FALLBACK = '/app/server/uploads/catalog-csv';
+// Primary CSV location lives inside /app/server/uploads, which is the persistent
+// volume in Coolify. CSVs therefore survive container restarts.
+const CSV_DIR_DEFAULT = '/app/server/uploads/catalog-csv';
+// Legacy / fallback path (ephemeral). Kept as a search target in case some
+// older deployment wrote CSVs there.
+const CSV_DIR_FALLBACK = '/app/server/catalog-csv';
 
 function resolveCsvDir(): string {
   for (const dir of [CSV_DIR_DEFAULT, CSV_DIR_FALLBACK]) {
@@ -1369,9 +1373,9 @@ function resolveCsvDir(): string {
       }
     } catch {}
   }
-  // No CSVs found anywhere — return a writable path. /app/server/uploads is the
-  // only directory the `backend` user can write to in the current Dockerfile.
-  return CSV_DIR_FALLBACK;
+  // No CSVs found anywhere — return the persistent location so the downloader
+  // and the upload endpoint know where to write.
+  return CSV_DIR_DEFAULT;
 }
 
 app.post('/api/bihr/sync-images-v4/start', async (req: any, res: any) => {
