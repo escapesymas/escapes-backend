@@ -686,6 +686,73 @@ app.get('/api/admin/inspect-catalog', async (req: any, res: any) => {
   }
 });
 
+// Debug: return products whose SKU does NOT match any catalog PartNumber
+// (helps explain why image regen reports so many "no image in catalog").
+app.get('/api/admin/debug-sku-mismatch', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const csvDir = resolveCsvDir();
+    const map = new Set<string>();
+    if (fs.existsSync(csvDir)) {
+      for (const file of fs.readdirSync(csvDir).filter((f) => f.endsWith('.csv'))) {
+        const txt = fs.readFileSync(path.join(csvDir, file), 'utf-8');
+        const lines = txt.split(/\r?\n/);
+        const header = (lines[0] || '').split(',');
+        const pnIdx = header.indexOf('PartNumber');
+        const supIdx = header.indexOf('SupplierProductCode');
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i];
+          // Use a tiny CSV splitter for the PartNumber/SupplierProductCode cells
+          // (they're never quoted with commas in the catalog).
+          let depth = 0, cell = '', cells: string[] = [];
+          for (const ch of line + ',') {
+            if (ch === '"') depth = 1 - depth;
+            else if (ch === ',' && depth === 0) { cells.push(cell); cell = ''; }
+            else cell += ch;
+          }
+          if (pnIdx >= 0 && cells[pnIdx]) map.add(cells[pnIdx].trim());
+          if (supIdx >= 0 && cells[supIdx]) map.add(cells[supIdx].trim());
+        }
+      }
+    }
+
+    const sample = await pool.query(
+      `SELECT id, sku, supplier_code, name, LENGTH(sku) AS sku_len
+       FROM products
+       WHERE (images IS NULL OR images::text = '[]')
+         AND sku IS NOT NULL AND sku <> ''
+       ORDER BY id LIMIT 20`,
+    );
+    const matched = sample.rows.filter((r: any) => map.has(r.sku) || map.has(r.supplier_code));
+    const unmatched = sample.rows.filter((r: any) => !map.has(r.sku) && !map.has(r.supplier_code));
+
+    const dbSkus = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE sku IS NULL OR sku = '')::int AS empty_sku,
+              COUNT(*) FILTER (WHERE sku ~ '^[0-9]+$')::int AS numeric_only,
+              COUNT(*) FILTER (WHERE LENGTH(sku) < 5)::int AS short_sku
+       FROM products WHERE (images IS NULL OR images::text = '[]')`,
+    );
+
+    return res.json({
+      success: true,
+      catalogMapSize: map.size,
+      sampleSize: sample.rows.length,
+      matchedCount: matched.length,
+      unmatchedCount: unmatched.length,
+      sampleMatched: matched.slice(0, 5),
+      sampleUnmatched: unmatched.slice(0, 5),
+      dbSkuStats: dbSkus.rows[0],
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // SISTEMA DE CACHÉ EN MEMORIA (SWR - Stale While Revalidate)
 // ================================================================
