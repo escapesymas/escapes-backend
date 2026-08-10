@@ -393,6 +393,37 @@ function imageRecordFor(row: ProductRow, safeSku: string, originalUrl: string): 
   };
 }
 
+// Brands whose zip returned 404 (or otherwise unreachable) — once a brand is
+// known-bad, we skip the fetch and mark every product of that brand with a
+// placeholder so the loop doesn't re-pick them. Persisted to disk so we don't
+// re-fetch across restarts.
+const FAILED_BRANDS_FILE = '/app/server/uploads/bihr-failed-brands.json';
+const failedBrands: Set<string> = new Set();
+
+async function loadFailedBrands(): Promise<void> {
+  try {
+    if (existsSync(FAILED_BRANDS_FILE)) {
+      const raw = await (await import('node:fs/promises')).readFile(FAILED_BRANDS_FILE, 'utf-8');
+      const list = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        for (const b of list) failedBrands.add(b);
+      }
+    }
+  } catch {}
+}
+
+async function saveFailedBrands(): Promise<void> {
+  try {
+    const arr: string[] = [];
+    failedBrands.forEach((b) => arr.push(b));
+    arr.sort();
+    await (await import('node:fs/promises')).writeFile(
+      FAILED_BRANDS_FILE,
+      JSON.stringify(arr),
+    );
+  } catch {}
+}
+
 async function processProduct(
   row: ProductRow,
   position: number,
@@ -412,7 +443,32 @@ async function processProduct(
     `);
     return 'no-image';
   }
-  const index = await loadBrandIndex(entry.brand);
+  if (failedBrands.has(entry.brand)) {
+    console.log(`[${position}/${total}] Product ${row.id}: skip brand ${entry.brand} (known bad)`);
+    await db.execute(sql`
+      UPDATE products
+      SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:brand-${entry.brand}-no-zip`, alt: row.name || row.sku || '' }])}::jsonb
+      WHERE id = ${row.id}
+    `);
+    return 'no-image';
+  }
+  let index: BrandIndex;
+  try {
+    index = await loadBrandIndex(entry.brand);
+  } catch (err: any) {
+    // Remember the brand as failed (write to disk) so we don't re-fetch
+    // its (likely 404) zip for every product of that brand.
+    failedBrands.add(entry.brand);
+    await saveFailedBrands();
+    selfLog(`BRAND-FAIL ${entry.brand}: ${err?.message || err}`);
+    console.error(`[${position}/${total}] Product ${row.id}: brand ${entry.brand} marked as failed - ${err?.message || err}`);
+    await db.execute(sql`
+      UPDATE products
+      SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:brand-${entry.brand}-no-zip`, alt: row.name || row.sku || '' }])}::jsonb
+      WHERE id = ${row.id}
+    `);
+    return 'no-image';
+  }
   const image = await fetchImageFromZip(entry.brand, row.sku, index);
   if (!image) {
     console.log(`[${position}/${total}] Product ${row.id}: not in ${entry.brand} zip`);
@@ -513,6 +569,8 @@ async function main(): Promise<void> {
   selfLog('=== main() start ===');
   const options = parseArgs(process.argv.slice(2));
   selfLog(`[INFO] batch=${options.batch} concurrency=${options.concurrency} csvDir=${options.csvDir}`);
+  await loadFailedBrands();
+  selfLog(`[INFO] failedBrands=${failedBrands.size} (cached)`);
   const { skuMap } = await loadCatalogMap(options.csvDir);
   const totalCandidates = await countCandidates();
   selfLog(`[INFO] totalCandidates=${totalCandidates} skuMapSize=${skuMap.size}`);
