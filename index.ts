@@ -958,6 +958,27 @@ app.get('/api/health', async (_req, res) => {
   });
 });
 
+// Diagnostic endpoint: shows env state without exposing secrets.
+app.get('/api/health/diag', async (_req, res) => {
+  res.json({
+    ok: true,
+    env: {
+      NODE_ENV: process.env.NODE_ENV,
+      PORT: process.env.PORT,
+      ADMIN_KEY_set: !!process.env.ADMIN_KEY,
+      ADMIN_KEY_len: process.env.ADMIN_KEY?.length ?? 0,
+      ADMIN_KEY_starts: process.env.ADMIN_KEY?.slice(0, 12),
+      ADMIN_KEY_matches_expected: process.env.ADMIN_KEY === 'escapes-admin-sync-key-2026-change-me',
+      REDIS_URL_set: !!process.env.REDIS_URL,
+      DATABASE_URL_set: !!process.env.DATABASE_URL,
+      BIHR_USERNAME_set: !!process.env.BIHR_USERNAME,
+    },
+    cwd: process.cwd(),
+    pid: process.pid,
+    uptimeSec: process.uptime(),
+  });
+});
+
 app.get('/api/health/stripe', async (_req: any, res: any) => {
   try {
     if (!stripeLiveKey) {
