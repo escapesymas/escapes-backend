@@ -952,6 +952,31 @@ app.get('/api/admin/image-regen-state', async (_req: any, res: any) => {
   }
 });
 
+app.get('/api/admin/image-downloader-log', async (_req: any, res: any) => {
+  if (!requireAdminKey(_req, res)) return;
+  try {
+    const path = '/tmp/image-dl-v5.log';
+    if (!fs.existsSync(path)) return res.json({ exists: false, content: '' });
+    const stat = fs.statSync(path);
+    // Tail last 200KB
+    const maxBytes = 200 * 1024;
+    const start = Math.max(0, stat.size - maxBytes);
+    const fd = fs.openSync(path, 'r');
+    const len = stat.size - start;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    fs.closeSync(fd);
+    res.json({
+      exists: true,
+      sizeBytes: stat.size,
+      truncated: stat.size > maxBytes,
+      content: buf.toString('utf-8'),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 interface CacheEntry<T> {
   data: T;
@@ -1810,6 +1835,10 @@ app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
   if (loopAll) args.push('--all');
 
   console.log(`[IMAGE DOWNLOADER V5] spawn: npx tsx ${args.join(' ')}`);
+  // Tee child stdout/stderr to a file the admin can inspect via /api/admin/image-downloader-log
+  const logPath = '/tmp/image-dl-v5.log';
+  try { fs.writeFileSync(logPath, ''); } catch {}
+  const logStream = fs.createWriteStream(logPath, { flags: 'a' });
   const child = spawn('npx', ['tsx', ...args], {
     cwd: process.cwd(),
     env: process.env,
@@ -1820,10 +1849,13 @@ app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
 
   child.stdout.on('data', (chunk: Buffer) => {
     process.stdout.write(`[IMAGE-DL] ${chunk}`);
+    logStream.write(chunk);
   });
   child.stderr.on('data', (chunk: Buffer) => {
     process.stderr.write(`[IMAGE-DL] ${chunk}`);
+    logStream.write(chunk);
   });
+  child.on('exit', () => { try { logStream.end(); } catch {} });
 
   child.on('exit', (code, signal) => {
     console.log(`[IMAGE DOWNLOADER V5] exited code=${code} signal=${signal}`);
