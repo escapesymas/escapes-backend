@@ -20,6 +20,10 @@ COPY --chown=backend:nodejs schemas/ ./schemas/
 COPY --chown=backend:nodejs migrations/ ./migrations/
 COPY --chown=backend:nodejs scripts/ ./scripts/
 COPY --chown=backend:nodejs moto_catalog.json ./
+# Bundled Bihr extended catalog CSVs (zip). Extracted on first boot into
+# /app/server/uploads/catalog-csv by the startup hook (index.ts) so the image
+# downloader has data without needing to upload anything manually.
+COPY --chown=backend:nodejs catalog-csv.zip ./catalog-csv.zip
 # Host-side post-deploy hook (no-op when invoked inside the container;
 # the host cron at /etc/cron.d/escapes-post-deploy does the real work).
 COPY --chown=root:root infra/escapes-post-deploy.sh /usr/local/bin/escapes-post-deploy.sh

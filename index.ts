@@ -6884,6 +6884,31 @@ app.post('/api/chat/message', chatLimiter, chatHandler);
 // ================================================================
 // ARRANQUE
 // ================================================================
+// On first boot, extract the bundled catalog-csv.zip into the persistent
+// uploads dir if no CSVs are present. This makes the image self-sufficient —
+// no manual upload step required after a redeploy.
+async function bootstrapCatalogCsv(): Promise<void> {
+  const bundledZip = path.join(process.cwd(), 'catalog-csv.zip');
+  if (!fs.existsSync(bundledZip)) return;
+
+  // Already have CSVs? Skip.
+  const target = CSV_DIR_DEFAULT;
+  if (fs.existsSync(target) && fs.readdirSync(target).some((f) => f.endsWith('.csv'))) {
+    return;
+  }
+
+  console.log(`[BOOTSTRAP] Extracting ${bundledZip} → ${target}`);
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    const { execSync } = await import('node:child_process');
+    execSync(`unzip -o -q '${bundledZip}' -d '${target}'`, { stdio: 'inherit' });
+    const csvCount = fs.readdirSync(target).filter((f) => f.endsWith('.csv')).length;
+    console.log(`[BOOTSTRAP] Extracted ${csvCount} CSV files`);
+  } catch (err: any) {
+    console.error('[BOOTSTRAP] Failed to extract catalog-csv.zip:', err.message);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════╗
@@ -6893,6 +6918,8 @@ app.listen(PORT, () => {
 ║  🌐  WordPress proxy: ${WP_URL}        ║
 ╚══════════════════════════════════════════════════════╝
   `);
+  // Fire-and-forget; don't block listen() on CSV extraction
+  bootstrapCatalogCsv().catch((e) => console.error('[BOOTSTRAP] error:', e));
 });
 
 export default app;
