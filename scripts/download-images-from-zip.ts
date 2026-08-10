@@ -104,10 +104,16 @@ function selfLog(msg: string): void {
   console.log(msg);
 }
 
-/** Build sku → image URL map, AND sku → brand (for the zip). */
+/** Build sku → image URL map, sku → brand (for the zip), and
+ *  any-key → CSV PartNumber (Bihr's internal SKU, used in zip filenames).
+ *  The products table stores our internal `sku` and the human-readable
+ *  `supplier_code`, neither of which match the zip filenames; only the
+ *  CSV's PartNumber does. We index by all three so the downloader can
+ *  resolve any product to the right zip entry. */
 async function loadCatalogMap(csvDir: string): Promise<{
   urlMap: Map<string, { url: string; brand: string }>;
   skuMap: Map<string, { brand: string }>;
+  partMap: Map<string, { brand: string; partNumber: string }>;
 }> {
   const finalDir = existsSync(csvDir) && readdirSync(csvDir).some((f) => f.endsWith('.csv'))
     ? csvDir : resolveCsvDir();
@@ -117,6 +123,7 @@ async function loadCatalogMap(csvDir: string): Promise<{
 
   const urlMap = new Map<string, { url: string; brand: string }>();
   const skuMap = new Map<string, { brand: string }>();
+  const partMap = new Map<string, { brand: string; partNumber: string }>();
 
   // Simple per-line parser that handles quoted fields with commas/newlines.
   const parseCsv = (text: string): string[][] => {
@@ -157,6 +164,7 @@ async function loadCatalogMap(csvDir: string): Promise<{
     const partIdx = header.indexOf('PartNumber');
     const picIdx = header.indexOf('Picture1');
     const supIdx = header.indexOf('SupplierProductCode');
+    const oldIdx = header.indexOf('OldPartNumber');
     if (partIdx === -1 || picIdx === -1) continue;
 
     let rowsAdded = 0;
@@ -165,20 +173,29 @@ async function loadCatalogMap(csvDir: string): Promise<{
       const part = (r[partIdx] || '').trim();
       const pic = (r[picIdx] || '').trim();
       const sup = supIdx !== -1 ? (r[supIdx] || '').trim() : '';
+      const old = oldIdx !== -1 ? (r[oldIdx] || '').trim() : '';
       if (part && pic && !urlMap.has(part)) {
         urlMap.set(part, { url: pic, brand });
         skuMap.set(part, { brand });
+        partMap.set(part, { brand, partNumber: part });
         rowsAdded++;
       }
-      if (sup && pic && !urlMap.has(sup)) {
-        urlMap.set(sup, { url: pic, brand });
-        skuMap.set(sup, { brand });
+      // Index by every alias we know about so product lookup (by sku or
+      // supplier_code) resolves to the CSV's PartNumber (zip filename stem).
+      for (const alias of [sup, old]) {
+        if (alias && pic && !urlMap.has(alias)) {
+          urlMap.set(alias, { url: pic, brand });
+        }
+        if (alias) {
+          skuMap.set(alias, { brand });
+          partMap.set(alias, { brand, partNumber: part });
+        }
       }
     }
   }
 
-  console.log(`[CATALOG] urlMap size: ${urlMap.size}, skuMap size: ${skuMap.size}`);
-  return { urlMap, skuMap };
+  console.log(`[CATALOG] urlMap size: ${urlMap.size}, skuMap size: ${skuMap.size}, partMap size: ${partMap.size}`);
+  return { urlMap, skuMap, partMap };
 }
 
 /** Read index from disk cache, or build it. */
@@ -429,6 +446,7 @@ async function processProduct(
   position: number,
   total: number,
   skuMap: Map<string, { brand: string }>,
+  partMap: Map<string, { brand: string; partNumber: string }>,
 ): Promise<'downloaded' | 'no-image'> {
   const safeSku = sanitizeSku(row.sku);
   if (!safeSku) throw new Error('SKU empty');
@@ -443,6 +461,10 @@ async function processProduct(
     `);
     return 'no-image';
   }
+  // Look up the CSV's PartNumber — that's the stem used in the zip filenames,
+  // not the product's internal sku or supplier_code.
+  const partEntry = partMap.get(row.sku) || partMap.get(row.supplier_code);
+  const partNumber = partEntry?.partNumber || row.supplier_code || row.sku;
   if (failedBrands.has(entry.brand)) {
     console.log(`[${position}/${total}] Product ${row.id}: skip brand ${entry.brand} (known bad)`);
     await db.execute(sql`
@@ -469,7 +491,7 @@ async function processProduct(
     `);
     return 'no-image';
   }
-  const image = await fetchImageFromZip(entry.brand, row.sku, index);
+  const image = await fetchImageFromZip(entry.brand, partNumber, index);
   if (!image) {
     console.log(`[${position}/${total}] Product ${row.id}: not in ${entry.brand} zip`);
     await db.execute(sql`
@@ -522,6 +544,7 @@ async function countCandidates(): Promise<number> {
 async function runBatch(
   options: CliOptions,
   skuMap: Map<string, { brand: string }>,
+  partMap: Map<string, { brand: string; partNumber: string }>,
   effectiveBatch: number,
   totals: CumulativeTotals,
 ): Promise<CumulativeTotals> {
@@ -540,7 +563,7 @@ async function runBatch(
       if (index >= products.length) return;
       const product = products[index];
       try {
-        const status = await processProduct(product, index + 1, products.length, skuMap);
+        const status = await processProduct(product, index + 1, products.length, skuMap, partMap);
         if (status === 'downloaded') totals.downloaded++;
         else totals.skipped++;
       } catch (error) {
@@ -571,9 +594,9 @@ async function main(): Promise<void> {
   selfLog(`[INFO] batch=${options.batch} concurrency=${options.concurrency} csvDir=${options.csvDir}`);
   await loadFailedBrands();
   selfLog(`[INFO] failedBrands=${failedBrands.size} (cached)`);
-  const { skuMap } = await loadCatalogMap(options.csvDir);
+  const { skuMap, partMap } = await loadCatalogMap(options.csvDir);
   const totalCandidates = await countCandidates();
-  selfLog(`[INFO] totalCandidates=${totalCandidates} skuMapSize=${skuMap.size}`);
+  selfLog(`[INFO] totalCandidates=${totalCandidates} skuMapSize=${skuMap.size} partMapSize=${partMap.size}`);
   let effectiveBatch = Math.min(options.batch, totalCandidates);
   await updateImageRegenState({
     status: 'running',
@@ -589,7 +612,7 @@ async function main(): Promise<void> {
   let batchNum = 1;
   while (true) {
     totals.processed = 0; totals.downloaded = 0; totals.skipped = 0; totals.errors = 0;
-    await runBatch(options, skuMap, effectiveBatch, totals);
+    await runBatch(options, skuMap, partMap, effectiveBatch, totals);
     selfLog(`[BATCH ${batchNum}] downloaded=${totals.downloaded} skipped=${totals.skipped} errors=${totals.errors}`);
     if (!options.loopAll) break;
     const remaining = await countCandidates();
