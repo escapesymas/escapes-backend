@@ -1000,6 +1000,25 @@ app.get('/api/admin/uploads-listing', async (_req: any, res: any) => {
   }
 });
 
+app.get('/api/admin/image-downloader-log-self', async (_req: any, res: any) => {
+  if (!requireAdminKey(_req, res)) return;
+  try {
+    const path = '/app/server/uploads/image-dl-v5-self.log';
+    if (!fs.existsSync(path)) return res.json({ exists: false, content: '' });
+    const stat = fs.statSync(path);
+    const maxBytes = 200 * 1024;
+    const start = Math.max(0, stat.size - maxBytes);
+    const fd = fs.openSync(path, 'r');
+    const len = stat.size - start;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    fs.closeSync(fd);
+    res.json({ exists: true, sizeBytes: stat.size, truncated: stat.size > maxBytes, content: buf.toString('utf-8') });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/admin/test-log-write', async (_req: any, res: any) => {
   if (!requireAdminKey(_req, res)) return;
   const logPath = '/app/server/uploads/image-dl-v5.log';
