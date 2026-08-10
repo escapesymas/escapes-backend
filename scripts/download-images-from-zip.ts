@@ -85,9 +85,11 @@ function sanitizeSku(sku: string | null | undefined): string {
 
 function brandFromCsvFilename(filename: string): string {
   // cat-extended-full-ES01-ES001-es-2026_08_09_00_15_02_<BRAND>.csv
+  // The year is preceded by '-' (e.g. 'es-2026'), not '_'. Match the timestamp
+  // block without requiring a leading underscore.
   const stem = filename.replace(/\.csv$/, '');
-  const m = stem.match(/_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}_(.+)$/);
-  return m ? m[1] : stem;
+  const m = stem.match(/(?:^|[^_\d])(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(.+)$/);
+  return m ? m[7] : stem;
 }
 
 /** Build sku → image URL map, AND sku → brand (for the zip). */
