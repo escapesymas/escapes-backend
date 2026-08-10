@@ -491,6 +491,20 @@ async function processProduct(
     `);
     return 'no-image';
   }
+  // If the brand's zip exists but is empty (0 image files), treat it as
+  // failed — every product of this brand will miss the lookup and we should
+  // not waste cycles re-fetching the (cached) empty index for each one.
+  if (index.files.length === 0) {
+    failedBrands.add(entry.brand);
+    await saveFailedBrands();
+    selfLog(`BRAND-EMPTY ${entry.brand}: zip has 0 files`);
+    await db.execute(sql`
+      UPDATE products
+      SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:brand-${entry.brand}-empty-zip`, alt: row.name || row.sku || '' }])}::jsonb
+      WHERE id = ${row.id}
+    `);
+    return 'no-image';
+  }
   const image = await fetchImageFromZip(entry.brand, partNumber, index);
   if (!image) {
     console.log(`[${position}/${total}] Product ${row.id}: not in ${entry.brand} zip`);
