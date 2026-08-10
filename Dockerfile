@@ -5,7 +5,7 @@ ENV NODE_ENV=production PORT=3001
 # No ARG/ENV with defaults - all config comes from Coolify env_file
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 backend
-RUN mkdir -p /app/server/uploads /app/server/invoices && chown backend:nodejs /app/server/uploads /app/server/invoices
+RUN mkdir -p /app/server/uploads /app/server/invoices /app/server/catalog-csv && chown backend:nodejs /app/server/uploads /app/server/invoices /app/server/catalog-csv
 COPY --chown=backend:nodejs package.json ./
 COPY --chown=backend:nodejs tsconfig.json ./
 COPY --chown=backend:nodejs index.ts ./
