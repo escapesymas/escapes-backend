@@ -1,5 +1,5 @@
 FROM node:22-alpine
-RUN apk add --no-cache wget curl
+RUN apk add --no-cache wget curl unzip
 WORKDIR /app/server
 ENV NODE_ENV=production PORT=3001
 # No ARG/ENV with defaults - all config comes from Coolify env_file

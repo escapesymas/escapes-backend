@@ -544,6 +544,58 @@ app.post('/api/upload/avatar', upload.single('avatar'), async (req: any, res: an
   }
 });
 
+// Admin-only: upload the Bihr catalog CSV zip and extract it to
+// /app/server/catalog-csv/. Used to recover after container restarts when
+// the CSV dir is not on a persistent volume.
+// Body: multipart/form-data with field "file" = cat-extended-full-*.zip
+// Optional form field: "clean" = "1" to wipe the dir before extracting.
+app.post(
+  '/api/admin/upload-csv-zip',
+  upload.single('file'),
+  async (req: any, res: any) => {
+    if (!requireAdminKey(req, res)) return;
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: 'No se ha subido ningún archivo (campo "file")' });
+    if (!/\.zip$/i.test(file.originalname)) {
+      try { fs.unlinkSync(file.path); } catch {}
+      return res.status(400).json({ error: 'El archivo debe ser un .zip' });
+    }
+    const csvDir = String(req.body?.csvDir || CSV_DIR_DEFAULT);
+    const shouldClean = req.body?.clean === '1' || req.body?.clean === 'true';
+
+    try {
+      if (shouldClean && fs.existsSync(csvDir)) {
+        for (const f of fs.readdirSync(csvDir)) {
+          try { fs.unlinkSync(path.join(csvDir, f)); } catch {}
+        }
+      }
+      fs.mkdirSync(csvDir, { recursive: true });
+
+      // Extract using `unzip` (already present in the alpine image since curl).
+      const { execSync } = await import('node:child_process');
+      execSync(`unzip -o -q '${file.path}' -d '${csvDir}'`, { stdio: 'inherit' });
+
+      const csvCount = fs.existsSync(csvDir)
+        ? fs.readdirSync(csvDir).filter((f) => f.endsWith('.csv')).length
+        : 0;
+
+      try { fs.unlinkSync(file.path); } catch {}
+
+      console.log(`[CSV UPLOAD] extracted ${csvCount} csv files into ${csvDir}`);
+      return res.json({
+        success: true,
+        csvDir,
+        csvCount,
+        message: `Extraídos ${csvCount} CSVs en ${csvDir}`,
+      });
+    } catch (err: any) {
+      console.error('[CSV UPLOAD ERROR]', err);
+      try { fs.unlinkSync(file.path); } catch {}
+      return res.status(500).json({ error: err.message || 'Error extrayendo el zip' });
+    }
+  },
+);
+
 // ================================================================
 // SISTEMA DE CACHÉ EN MEMORIA (SWR - Stale While Revalidate)
 // ================================================================
