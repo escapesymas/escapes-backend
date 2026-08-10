@@ -1000,6 +1000,19 @@ app.get('/api/admin/uploads-listing', async (_req: any, res: any) => {
   }
 });
 
+app.post('/api/admin/test-log-write', async (_req: any, res: any) => {
+  if (!requireAdminKey(_req, res)) return;
+  const logPath = '/app/server/uploads/image-dl-v5.log';
+  try {
+    fs.writeFileSync(logPath, `test write at ${new Date().toISOString()}\n`);
+    const stat = fs.statSync(logPath);
+    const content = fs.readFileSync(logPath, 'utf-8');
+    res.json({ ok: true, logPath, size: stat.size, content });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
 // ================================================================
 interface CacheEntry<T> {
   data: T;
