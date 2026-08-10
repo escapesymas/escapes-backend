@@ -9,7 +9,23 @@ const DEFAULT_BATCH = 50;
 const DEFAULT_CONCURRENCY = 8;
 const SIZES = [800, 400, 200] as const;
 const OPTIMIZED_DIR = '/app/server/uploads/optimized';
-const CSV_DIR_DEFAULT = '/app/server/catalog-csv';
+// Primary location lives inside /app/server/uploads (the Coolify persistent
+// volume). Fallback is the legacy path inside the image itself.
+const CSV_DIR_DEFAULT = '/app/server/uploads/catalog-csv';
+const CSV_DIR_FALLBACK = '/app/server/catalog-csv';
+
+function resolveCsvDir(): string {
+  for (const dir of [CSV_DIR_DEFAULT, CSV_DIR_FALLBACK]) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fs = require('node:fs') as typeof import('node:fs');
+      if (fs.existsSync(dir) && fs.readdirSync(dir).some((f) => f.endsWith('.csv'))) {
+        return dir;
+      }
+    } catch {}
+  }
+  return CSV_DIR_DEFAULT;
+}
 
 interface CliOptions {
   batch: number;
@@ -141,15 +157,18 @@ function sanitizeSku(sku: string | null | undefined): string {
 }
 
 async function loadCatalogMap(csvDir: string): Promise<Map<string, string>> {
-  console.log(`[CATALOG] Reading CSVs from ${csvDir}`);
-  const files = (await readdir(csvDir)).filter((f) => f.endsWith('.csv'));
+  const finalDir = fs.existsSync(csvDir) && (await readdir(csvDir)).some((f) => f.endsWith('.csv'))
+    ? csvDir
+    : resolveCsvDir();
+  console.log(`[CATALOG] Reading CSVs from ${finalDir}`);
+  const files = (await readdir(finalDir)).filter((f) => f.endsWith('.csv'));
   console.log(`[CATALOG] ${files.length} CSV files`);
 
   const map = new Map<string, string>();
   let totalRows = 0;
 
   for (const file of files) {
-    const text = await readFile(path.join(csvDir, file), 'utf-8');
+    const text = await readFile(path.join(finalDir, file), 'utf-8');
     const rows = parseCsv(text);
     if (rows.length === 0) continue;
 
