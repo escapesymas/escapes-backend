@@ -614,6 +614,62 @@ app.post(
   },
 );
 
+// Admin debug endpoint: inspect catalog CSV presence, sample PartNumbers and DB SKUs.
+// Helps diagnose why image regen reports "no image in catalog".
+app.get('/api/admin/inspect-catalog', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const dirUsed = resolveCsvDir();
+    const candidates = [CSV_DIR_DEFAULT, CSV_DIR_FALLBACK];
+    const dirs: Record<string, { exists: boolean; csvCount: number; sampleFiles: string[]; sampleHeaders: string[] | null; samplePartNumbers: string[] | null }> = {};
+    for (const dir of candidates) {
+      const entry: any = { exists: fs.existsSync(dir), csvCount: 0, sampleFiles: [], sampleHeaders: null, samplePartNumbers: null };
+      if (entry.exists) {
+        try {
+          const all = fs.readdirSync(dir);
+          const csvs = all.filter((f) => f.endsWith('.csv'));
+          entry.csvCount = csvs.length;
+          entry.sampleFiles = csvs.slice(0, 3);
+          if (csvs.length > 0) {
+            const first = csvs[0];
+            const txt = fs.readFileSync(path.join(dir, first), 'utf-8');
+            const firstLine = txt.split(/\r?\n/)[0] || '';
+            entry.sampleHeaders = firstLine.split(',').slice(0, 8);
+            const rows = txt.split(/\r?\n/).slice(1, 6);
+            const pnIdx = entry.sampleHeaders.indexOf('PartNumber');
+            if (pnIdx >= 0) {
+              entry.samplePartNumbers = rows
+                .map((r) => r.split(',')[pnIdx] || '')
+                .filter(Boolean)
+                .slice(0, 5);
+            }
+          }
+        } catch (e: any) {
+          entry.error = e.message;
+        }
+      }
+      dirs[dir] = entry;
+    }
+
+    const sampleDb = await pool.query(
+      `SELECT sku, supplier_code FROM products WHERE sku IS NOT NULL AND sku <> '' ORDER BY id LIMIT 5`,
+    );
+    const missingCount = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM products WHERE (images IS NULL OR images::text = '[]') AND sku IS NOT NULL AND sku <> ''`,
+    );
+
+    return res.json({
+      success: true,
+      dirUsed,
+      dirs,
+      dbSample: sampleDb.rows,
+      dbMissing: missingCount.rows[0]?.total ?? 0,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // SISTEMA DE CACHÉ EN MEMORIA (SWR - Stale While Revalidate)
 // ================================================================
