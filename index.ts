@@ -1773,6 +1773,70 @@ app.post('/api/bihr/sync-images-v4/start', async (req: any, res: any) => {
   });
 });
 
+// Image downloader v5 — uses Bihr's per-brand AllPicturesZIP + HTTP Range to fetch
+// images one at a time (no full zip download). See docs/BIHR_IMAGE_SOURCES.md.
+app.post('/api/bihr/sync-images-v5/start', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  if (isImageDownloaderRunning()) {
+    return res.status(409).json({ error: 'El descargador ya está en ejecución', running: true });
+  }
+
+  const batch = Number(req.body?.batch) || 50;
+  const concurrency = Number(req.body?.concurrency) || 4;
+  const loopAll = req.body?.loopAll === true;
+  const csvDir = String(req.body?.csvDir || resolveCsvDir());
+
+  const scriptPath = path.join(process.cwd(), 'scripts', 'download-images-from-zip.ts');
+  if (!fs.existsSync(scriptPath)) {
+    return res.status(500).json({ error: `Script no encontrado: ${scriptPath}` });
+  }
+  if (!fs.existsSync(csvDir)) {
+    return res.status(400).json({
+      error: `No se encontró el directorio CSV en ${csvDir}. Sube los CSVs primero.`,
+    });
+  }
+
+  const args = [scriptPath, `--batch=${batch}`, `--concurrency=${concurrency}`, `--csv-dir=${csvDir}`];
+  if (loopAll) args.push('--all');
+
+  console.log(`[IMAGE DOWNLOADER V5] spawn: npx tsx ${args.join(' ')}`);
+  const child = spawn('npx', ['tsx', ...args], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  imageDownloaderChild = child;
+  imageDownloaderPid = child.pid ?? null;
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    process.stdout.write(`[IMAGE-DL] ${chunk}`);
+  });
+  child.stderr.on('data', (chunk: Buffer) => {
+    process.stderr.write(`[IMAGE-DL] ${chunk}`);
+  });
+
+  child.on('exit', (code, signal) => {
+    console.log(`[IMAGE DOWNLOADER V5] exited code=${code} signal=${signal}`);
+    if (imageDownloaderChild === child) {
+      imageDownloaderChild = null;
+      imageDownloaderPid = null;
+    }
+    if (code !== 0 && code !== null) {
+      pool.query(
+        `UPDATE image_regen_state SET status='failed', updated_at=NOW() WHERE id=1`,
+      ).catch((err) => console.error('[IMAGE DOWNLOADER V5] failed state update', err));
+    }
+  });
+
+  res.json({
+    success: true,
+    message: 'Descargador de imágenes v5 iniciado (Bihr AllPicturesZIP via Range)',
+    pid: imageDownloaderPid,
+    script: scriptPath,
+    csvDir,
+  });
+});
+
 let categoryMap: Record<number, { name: string; slug: string }> = {};
 let categoryMapLoading = false;
 
