@@ -290,10 +290,19 @@ async function countCandidates(): Promise<number> {
   return result.rows[0]?.total ?? 0;
 }
 
+/** Shared cumulative counters so the live dashboard reflects session totals, not per-batch. */
+interface CumulativeTotals {
+  processed: number;
+  downloaded: number;
+  skipped: number;
+  errors: number;
+}
+
 async function runBatch(
   options: CliOptions,
   catalogMap: Map<string, string>,
   effectiveBatch: number,
+  totals: CumulativeTotals,
 ): Promise<{ processed: number; downloaded: number; skipped: number; errors: number }> {
   const result = await db.execute(sql`
     SELECT id, sku, supplier_code, images, name
@@ -310,10 +319,6 @@ async function runBatch(
   if (products.length === 0) return { processed: 0, downloaded: 0, skipped: 0, errors: 0 };
 
   let nextIndex = 0;
-  let processed = 0;
-  let downloaded = 0;
-  let skipped = 0;
-  let errors = 0;
 
   async function worker(): Promise<void> {
     while (true) {
@@ -324,19 +329,19 @@ async function runBatch(
       try {
         const status = await processProduct(product, index + 1, products.length, catalogMap);
         resultStatus = status;
-        if (status === 'downloaded') downloaded++;
-        else skipped++;
+        if (status === 'downloaded') totals.downloaded++;
+        else totals.skipped++;
       } catch (error) {
-        errors++;
+        totals.errors++;
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[${index + 1}/${products.length}] Product ${product.id}: failed - ${message}`);
       } finally {
-        processed++;
+        totals.processed++;
         await updateImageRegenState({
-          processed,
-          success: downloaded,
-          failed: errors,
-          skipped,
+          processed: totals.processed,
+          success: totals.downloaded,
+          failed: totals.errors,
+          skipped: totals.skipped,
           current_sku: product.sku ?? '',
         }).catch((err) => console.error('[STATE UPDATE ERROR]', err));
       }
@@ -346,7 +351,12 @@ async function runBatch(
   const workerCount = Math.min(options.concurrency, products.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
-  return { processed, downloaded, skipped, errors };
+  return {
+    processed: totals.processed,
+    downloaded: totals.downloaded,
+    skipped: totals.skipped,
+    errors: totals.errors,
+  };
 }
 
 async function main(): Promise<void> {
@@ -377,10 +387,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  let totalProcessed = 0;
-  let totalDownloaded = 0;
-  let totalErrors = 0;
-  let totalSkipped = 0;
+  // Cumulative counters shared with runBatch() so the live state row reflects
+  // session totals (not just the current batch). Reset to 0 here so the
+  // dashboard shows clean numbers from the first batch onward.
+  const totals: CumulativeTotals = { processed: 0, downloaded: 0, skipped: 0, errors: 0 };
   let batchNum = 1;
 
   while (true) {
@@ -388,11 +398,8 @@ async function main(): Promise<void> {
       options,
       catalogMap,
       effectiveBatch,
+      totals,
     );
-    totalProcessed += processed;
-    totalDownloaded += downloaded;
-    totalErrors += errors;
-    totalSkipped += skipped;
 
     console.log(
       `[BATCH ${batchNum} DONE] processed=${processed} downloaded=${downloaded} skipped=${skipped} errors=${errors}`,
@@ -410,14 +417,14 @@ async function main(): Promise<void> {
 
   await updateImageRegenState({
     status: 'completed',
-    processed: totalProcessed,
-    success: totalDownloaded,
-    failed: totalErrors,
-    skipped: totalSkipped,
+    processed: totals.processed,
+    success: totals.downloaded,
+    failed: totals.errors,
+    skipped: totals.skipped,
     current_sku: '',
   });
   console.log(
-    `[ALL DONE] batches=${batchNum} totalProcessed=${totalProcessed} downloaded=${totalDownloaded} skipped=${totalSkipped} errors=${totalErrors}`,
+    `[ALL DONE] batches=${batchNum} processed=${totals.processed} downloaded=${totals.downloaded} skipped=${totals.skipped} errors=${totals.errors}`,
   );
 }
 
