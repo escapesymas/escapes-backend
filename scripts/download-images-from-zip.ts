@@ -404,12 +404,23 @@ async function processProduct(
   const entry = skuMap.get(row.sku) || skuMap.get(row.supplier_code);
   if (!entry) {
     console.log(`[${position}/${total}] Product ${row.id}: no brand mapping`);
+    // Mark with a placeholder so this product isn't re-picked on next iteration.
+    await db.execute(sql`
+      UPDATE products
+      SET images = ${JSON.stringify([{ src: '', originalUrl: 'no-image:no-brand-mapping', alt: row.name || row.sku || '' }])}::jsonb
+      WHERE id = ${row.id}
+    `);
     return 'no-image';
   }
   const index = await loadBrandIndex(entry.brand);
   const image = await fetchImageFromZip(entry.brand, row.sku, index);
   if (!image) {
     console.log(`[${position}/${total}] Product ${row.id}: not in ${entry.brand} zip`);
+    await db.execute(sql`
+      UPDATE products
+      SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:not-in-${entry.brand}-zip`, alt: row.name || row.sku || '' }])}::jsonb
+      WHERE id = ${row.id}
+    `);
     return 'no-image';
   }
   await writeVariants(image, safeSku);
