@@ -275,8 +275,17 @@ async function fetchImageFromZip(brand: string, sku: string, index: BrandIndex):
     throw new Error(`Range fetch failed: HTTP ${rangeResp.status}`);
   }
   const buf = Buffer.from(await rangeResp.arrayBuffer());
-  // Find PK\x03\x04
-  const lfhIdx = buf.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+  if (rangeResp.status !== 206) {
+    throw new Error(`Range request ignored: got HTTP ${rangeResp.status} (expected 206 Partial Content). Response size=${buf.length}, expected=${endByte - startByte + 1}`);
+  }
+  // Local file header should be at offset (entry.offset - startByte) since we asked for that range.
+  const expectedLfhOffset = entry.offset - startByte;
+  const PK_0304 = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+  let lfhIdx = buf.indexOf(PK_0304, expectedLfhOffset);
+  if (lfhIdx < 0) {
+    // Fall back to anywhere in buffer (server may have shifted us)
+    lfhIdx = buf.indexOf(PK_0304);
+  }
   if (lfhIdx < 0) throw new Error('Local file header not found in response');
   // LFH: 4 sig + 2 ver + 2 flags + 2 compression + 2 mod_time + 2 mod_date + 4 crc + 4 comp + 4 uncomp + 2 fname_len + 2 extra_len = 30
   const method = buf.readUInt16LE(lfhIdx + 8);     // 0=stored, 8=deflate
