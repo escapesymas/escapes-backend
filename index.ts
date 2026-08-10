@@ -1019,9 +1019,63 @@ app.get('/api/admin/image-downloader-log-self', async (_req: any, res: any) => {
   }
 });
 
+app.get('/api/admin/disk-usage', async (_req: any, res: any) => {
+  if (!requireAdminKey(_req, res)) return;
+  try {
+    // 1. `df -h` overall
+    const dfOutput = execSync('df -h', { encoding: 'utf-8' });
+    // 2. `du` of every top-level item we care about
+    const targets = [
+      '/app/server',
+      '/app/server/uploads',
+      '/app/server/uploads/optimized',
+      '/app/server/uploads/catalog-csv',
+      '/app/server/uploads/image-dl-v5.log',
+      '/app/server/uploads/image-dl-v5-self.log',
+      '/app/server/uploads/bihr-zip-index.json',
+      '/app/server/uploads/bihr-failed-brands.json',
+      '/tmp',
+      '/tmp/image-proxy-cache',
+    ];
+    const duResults: { path: string; size: string; raw: string }[] = [];
+    for (const p of targets) {
+      try {
+        const out = execSync(`du -sh ${p} 2>/dev/null || echo "0\t${p}"`, { encoding: 'utf-8' }).trim();
+        const parts = out.split(/\s+/);
+        duResults.push({ path: p, size: parts[0] || '0', raw: out });
+      } catch (e: any) {
+        duResults.push({ path: p, size: 'err', raw: e?.message || String(e) });
+      }
+    }
+    // 3. Docker image sizes (coolify often retains N+1 images)
+    let dockerImages = '';
+    try {
+      dockerImages = execSync('docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" 2>/dev/null | head -40', { encoding: 'utf-8' });
+    } catch (e: any) {
+      dockerImages = 'docker not available: ' + (e?.message || String(e));
+    }
+    // 4. Docker container sizes
+    let dockerContainers = '';
+    try {
+      dockerContainers = execSync('docker ps -a --format "{{.Names}} {{.Size}}" 2>/dev/null | head -20', { encoding: 'utf-8' });
+    } catch (e: any) {
+      dockerContainers = 'docker not available: ' + (e?.message || String(e));
+    }
+    res.json({
+      ok: true,
+      df: dfOutput,
+      du: duResults,
+      dockerImages: dockerImages || '(empty)',
+      dockerContainers: dockerContainers || '(empty)',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
 app.post('/api/admin/test-log-write', async (_req: any, res: any) => {
   if (!requireAdminKey(_req, res)) return;
-  const logPath = '/app/server/uploads/image-dl-v5.log';
+  const logPath = '/app/server/uploads/test-write.log';
   try {
     fs.writeFileSync(logPath, `test write at ${new Date().toISOString()}\n`);
     const stat = fs.statSync(logPath);
