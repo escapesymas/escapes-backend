@@ -14,7 +14,7 @@ const OPTIMIZED_DIR = '/app/server/uploads/optimized';
 const CSV_DIR_DEFAULT = '/app/server/uploads/catalog-csv';
 const CSV_DIR_FALLBACK = '/app/server/catalog-csv';
 const ZIP_BASE = 'https://static.bihr.pro/eBihr/Pictures';
-const ZIP_INDEX_CACHE = '/tmp/bihr-zip-index.json'; // { brand → { totalSize, cdOffset, cdSize, files: [{name, offset, compSize}] } }
+const ZIP_INDEX_CACHE = '/app/server/uploads/bihr-zip-index.json'; // { brand → { totalSize, cdOffset, cdSize, files: [{name, offset, compSize}] } }
 
 interface CliOptions {
   batch: number;
@@ -279,12 +279,34 @@ async function fetchImageFromZip(brand: string, sku: string, index: BrandIndex):
   const lfhIdx = buf.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
   if (lfhIdx < 0) throw new Error('Local file header not found in response');
   // LFH: 4 sig + 2 ver + 2 flags + 2 compression + 2 mod_time + 2 mod_date + 4 crc + 4 comp + 4 uncomp + 2 fname_len + 2 extra_len = 30
+  const method = buf.readUInt16LE(lfhIdx + 8);     // 0=stored, 8=deflate
   const fnameLen = buf.readUInt16LE(lfhIdx + 26);
   const extraLen = buf.readUInt16LE(lfhIdx + 28);
   const actualCompSize = buf.readUInt32LE(lfhIdx + 18);
+  const actualUncompSize = buf.readUInt32LE(lfhIdx + 22);
   const dataStart = lfhIdx + 30 + fnameLen + extraLen;
+
+  // For method=0 (stored) the data is uncompressed, so actualCompSize == actualUncompSize
+  // and we just return the bytes directly.
+  if (method === 0) {
+    if (buf.length >= dataStart + actualCompSize) {
+      return buf.subarray(dataStart, dataStart + actualCompSize);
+    }
+    // Re-fetch exact bytes
+    const newResp = await fetch(zipUrl, {
+      headers: {
+        'User-Agent': 'EscapesYMas-Bihr-Image-Downloader/4.0',
+        Range: `bytes=${entry.offset + 30 + fnameLen + extraLen}-${entry.offset + 30 + fnameLen + extraLen + actualCompSize - 1}`,
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!newResp.ok && newResp.status !== 206) throw new Error(`Re-fetch failed: HTTP ${newResp.status}`);
+    return Buffer.from(await newResp.arrayBuffer());
+  }
+
+  // method=8 (deflate) — raw deflate in zip, so use inflateSync
   if (buf.length < dataStart + actualCompSize) {
-    // Need to fetch more — recompute range with exact size
     const newEnd = entry.offset + 30 + fnameLen + extraLen + actualCompSize - 1;
     const newResp = await fetch(zipUrl, {
       headers: {
