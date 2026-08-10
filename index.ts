@@ -749,6 +749,100 @@ app.get('/api/admin/debug-sku-mismatch', async (req: any, res: any) => {
   }
 });
 
+// Trace a single product's image resolution: what URL the downloader would
+// try, and whether it actually returns 200 from Bihr. Helps debug the
+// success=0 / failed=104k problem without SSH'ing into the container.
+app.get('/api/admin/trace-image', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const productId = Number(req.query.productId);
+    if (!productId) return res.status(400).json({ error: 'productId is required' });
+
+    const prod = await pool.query(
+      `SELECT id, sku, supplier_code, name, images FROM products WHERE id = $1`,
+      [productId],
+    );
+    if (prod.rows.length === 0) return res.status(404).json({ error: 'product not found' });
+    const p = prod.rows[0];
+
+    // Build the downloader's catalog map (only rows with non-empty Picture1)
+    const csvDir = resolveCsvDir();
+    const map = new Map<string, { url: string; source: string }>();
+    if (fs.existsSync(csvDir)) {
+      for (const file of fs.readdirSync(csvDir).filter((f: string) => f.endsWith('.csv'))) {
+        const txt = fs.readFileSync(path.join(csvDir, file), 'utf-8');
+        const lines = txt.split(/\r?\n/);
+        if (lines.length === 0) continue;
+        const header = (lines[0] || '').split(',');
+        const partIdx = header.indexOf('PartNumber');
+        const picIdx = header.indexOf('Picture1');
+        const supIdx = header.indexOf('SupplierProductCode');
+        if (partIdx === -1 || picIdx === -1) continue;
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i];
+          if (!line) continue;
+          // Tiny per-line splitter — PartNumber/SupplierProductCode/Picture1
+          // are never quoted with commas in the catalog.
+          let depth = 0, cell = '', cells: string[] = [];
+          for (const ch of line + ',') {
+            if (ch === '"') depth = 1 - depth;
+            else if (ch === ',' && depth === 0) { cells.push(cell); cell = ''; }
+            else cell += ch;
+          }
+          const part = (cells[partIdx] || '').trim();
+          const pic = (cells[picIdx] || '').trim();
+          const sup = supIdx !== -1 ? (cells[supIdx] || '').trim() : '';
+          if (part && pic && !map.has(part)) {
+            map.set(part, { url: pic, source: `${file}:PartNumber` });
+          }
+          if (sup && pic && !map.has(sup)) {
+            map.set(sup, { url: pic, source: `${file}:SupplierProductCode` });
+          }
+        }
+      }
+    }
+
+    const bySku = p.sku ? map.get(p.sku) : null;
+    const bySupplier = p.supplier_code ? map.get(p.supplier_code) : null;
+    const picked = bySku || bySupplier;
+    const trace: any = {
+      productId,
+      sku: p.sku,
+      supplier_code: p.supplier_code,
+      mapSize: map.size,
+      mapHasSku: !!bySku,
+      mapHasSupplier: !!bySupplier,
+      pickedSource: picked?.source ?? null,
+      pickedUrlPrefix: picked ? picked.url.slice(0, 140) : null,
+    };
+
+    if (picked) {
+      const headers = {
+        Accept: 'image/avif,image/webp,image/jpeg,image/png,image/*',
+        'User-Agent': 'EscapesYMas-Bihr-Image-Downloader/3.0',
+      };
+      try {
+        const r = await fetch(picked.url, {
+          headers,
+          redirect: 'follow',
+          signal: AbortSignal.timeout(20_000),
+        });
+        trace.fetchStatus = r.status;
+        trace.fetchContentType = r.headers.get('content-type');
+        const buf = Buffer.from(await r.arrayBuffer());
+        trace.fetchSize = buf.length;
+        trace.fetchIsJpeg = buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8;
+      } catch (err: any) {
+        trace.fetchError = err.message;
+      }
+    }
+
+    return res.json(trace);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // SISTEMA DE CACHÉ EN MEMORIA (SWR - Stale While Revalidate)
 // ================================================================
