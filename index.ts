@@ -1228,13 +1228,73 @@ app.get('/api/bihr/sync-images-v2/status', async (req: any, res: any) => {
 });
 
 // ---------------------------------------------------------------------------
-// Image downloader v3 (download-images-from-catalog.ts)
-// Reads image URLs from the Bihr catalog JSON (DefaultPicture field) instead
-// of calling the non-existent /Products/Image endpoint.
+// Image downloader v4 (download-images-from-csv.ts)
+// Reads image URLs from the Bihr extended catalog (CSV files per brand).
+// This is the richest data source (Picture1-6 columns, multi-image products).
 // ---------------------------------------------------------------------------
-const CATALOG_PATH_DEFAULT = '/app/server/uploads/bihr-catalog.json';
+const CSV_DIR_DEFAULT = '/app/server/catalog-csv';
 
-app.post('/api/bihr/sync-images-v3/start', async (req: any, res: any) => {
+app.post('/api/bihr/sync-images-v4/start', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  if (isImageDownloaderRunning()) {
+    return res.status(409).json({ error: 'El descargador ya está en ejecución', running: true });
+  }
+
+  const batch = Number(req.body?.batch) || 50;
+  const concurrency = Number(req.body?.concurrency) || 8;
+  const loopAll = req.body?.loopAll === true;
+  const csvDir = String(req.body?.csvDir || CSV_DIR_DEFAULT);
+
+  const scriptPath = path.join(process.cwd(), 'scripts', 'download-images-from-csv.ts');
+  if (!fs.existsSync(scriptPath)) {
+    return res.status(500).json({ error: `Script no encontrado: ${scriptPath}` });
+  }
+  if (!fs.existsSync(csvDir)) {
+    return res.status(400).json({
+      error: `No se encontró el directorio CSV en ${csvDir}. Sube los CSVs primero.`,
+    });
+  }
+
+  const args = [scriptPath, `--batch=${batch}`, `--concurrency=${concurrency}`, `--csv-dir=${csvDir}`];
+  if (loopAll) args.push('--all');
+
+  console.log(`[IMAGE DOWNLOADER V4] spawn: npx tsx ${args.join(' ')}`);
+  const child = spawn('npx', ['tsx', ...args], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  imageDownloaderChild = child;
+  imageDownloaderPid = child.pid ?? null;
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    process.stdout.write(`[IMAGE-DL] ${chunk}`);
+  });
+  child.stderr.on('data', (chunk: Buffer) => {
+    process.stderr.write(`[IMAGE-DL] ${chunk}`);
+  });
+
+  child.on('exit', (code, signal) => {
+    console.log(`[IMAGE DOWNLOADER V4] exited code=${code} signal=${signal}`);
+    if (imageDownloaderChild === child) {
+      imageDownloaderChild = null;
+      imageDownloaderPid = null;
+    }
+    if (code !== 0 && code !== null) {
+      pool.query(
+        `UPDATE image_regen_state SET status='failed', updated_at=NOW() WHERE id=1`,
+      ).catch((err) => console.error('[IMAGE DOWNLOADER V4] failed state update', err));
+    }
+  });
+
+  res.json({
+    success: true,
+    message: 'Descargador de imágenes v4 iniciado (catálogo CSV Bihr)',
+    pid: imageDownloaderPid,
+    script: scriptPath,
+    csvDir,
+  });
+});
   if (!requireAdminKey(req, res)) return;
   if (isImageDownloaderRunning()) {
     return res.status(409).json({ error: 'El descargador ya está en ejecución', running: true });
