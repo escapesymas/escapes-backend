@@ -585,6 +585,18 @@ async function runBatch(
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[${index + 1}/${products.length}] Product ${product.id}: failed - ${message}`);
         selfLog(`FAIL ${product.id} sku=${product.sku}: ${message}`);
+        // Mark the product so it isn't re-selected next batch. Without this,
+        // any product that throws here will sit in the queue forever and
+        // prevent the loop from reaching remaining=0.
+        try {
+          await db.execute(sql`
+            UPDATE products
+            SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:download-error`, alt: product.name || product.sku || '' }])}::jsonb
+            WHERE id = ${product.id}
+          `);
+        } catch (markErr) {
+          selfLog(`MARK-FAIL ${product.id}: ${markErr instanceof Error ? markErr.message : String(markErr)}`);
+        }
       } finally {
         totals.processed++;
         await updateImageRegenState({
