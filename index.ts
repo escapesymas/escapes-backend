@@ -748,10 +748,6 @@ app.get('/api/admin/debug-sku-mismatch', async (req: any, res: any) => {
     return res.status(500).json({ error: err.message });
   }
 });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
-  }
-});
 
 // ================================================================
 // SISTEMA DE CACHÉ EN MEMORIA (SWR - Stale While Revalidate)
