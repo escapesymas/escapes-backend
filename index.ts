@@ -28,12 +28,16 @@ import {
 import { checkRateLimit } from './redis.js';
 import { cacheGet, cacheSet, cacheBust } from './lib/cache.js';
 import { initSentry, sentryErrorHandler } from './lib/sentry.js';
+import { cdnUrl, cdnBanner } from './lib/uploads-cdn.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
 
 // Initialize Sentry as early as possible so subsequent unhandled errors are
 // captured. No-op when SENTRY_DSN is unset (local dev).
 initSentry();
+
+// Surface CDN config on boot so the operator can verify at a glance.
+console.log(cdnBanner());
 
 const stripeLiveKey = process.env.STRIPE_SECRET_KEY;
 if (!stripeLiveKey) {
@@ -6906,28 +6910,28 @@ function mapProductToFrontend(row: any) {
     // Reescritura a local: si src apunta a una URL remota y existe archivo local para este SKU/variante, sustituir.
     if (img.src && isRemoteImageUrl(img.src)) {
       const local = localImageForSku(row.sku, 'desktop', idx);
-      if (local) img.src = local;
+      if (local) img.src = cdnUrl(local);
       else if (/^https?:\/\/(api\.|cdn\.)?mybihr\.com\//i.test(img.src)) {
         img.src = `/api/image-proxy?w=800&url=${encodeURIComponent(img.src)}`;
       }
     }
     if (img.srcMobile && isRemoteImageUrl(img.srcMobile)) {
       const local = localImageForSku(row.sku, 'mobile', idx);
-      if (local) img.srcMobile = local;
+      if (local) img.srcMobile = cdnUrl(local);
       else if (/^https?:\/\/(api\.|cdn\.)?mybihr\.com\//i.test(img.srcMobile)) {
         img.srcMobile = `/api/image-proxy?w=600&url=${encodeURIComponent(img.srcMobile)}`;
       }
     }
     if (img.srcCardDesktop && isRemoteImageUrl(img.srcCardDesktop)) {
       const local = localImageForSku(row.sku, 'card-desktop', idx);
-      if (local) img.srcCardDesktop = local;
+      if (local) img.srcCardDesktop = cdnUrl(local);
       else if (/^https?:\/\/(api\.|cdn\.)?mybihr\.com\//i.test(img.srcCardDesktop)) {
         img.srcCardDesktop = `/api/image-proxy?w=400&url=${encodeURIComponent(img.srcCardDesktop)}`;
       }
     }
     if (img.srcCardMobile && isRemoteImageUrl(img.srcCardMobile)) {
       const local = localImageForSku(row.sku, 'card-mobile', idx);
-      if (local) img.srcCardMobile = local;
+      if (local) img.srcCardMobile = cdnUrl(local);
       else if (/^https?:\/\/(api\.|cdn\.)?mybihr\.com\//i.test(img.srcCardMobile)) {
         img.srcCardMobile = `/api/image-proxy?w=200&url=${encodeURIComponent(img.srcCardMobile)}`;
       }
