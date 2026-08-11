@@ -30,6 +30,7 @@ import { cacheGet, cacheSet, cacheBust } from './lib/cache.js';
 import { initSentry, sentryErrorHandler } from './lib/sentry.js';
 import { cdnUrl, cdnBanner } from './lib/uploads-cdn.js';
 import { syncBihrStock, startBihrStockCron, lastBihrStockSync } from './lib/bihr-stock-sync.js';
+import { meiliSearchProducts, reindexMeilisearch, lastReindexSummary, isMeilisearchEnabled, meilisearchBanner } from './lib/search.js';
 import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats } from './lib/stripe-webhook.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
@@ -40,6 +41,7 @@ initSentry();
 
 // Surface CDN config on boot so the operator can verify at a glance.
 console.log(cdnBanner());
+console.log(meilisearchBanner());
 
 const stripeLiveKey = process.env.STRIPE_SECRET_KEY;
 if (!stripeLiveKey) {
@@ -1872,6 +1874,28 @@ app.get('/api/admin/sync-bihr-stock/status', async (req: any, res: any) => {
 });
 
 // ---------------------------------------------------------------------------
+// Meilisearch reindex (admin-only, P2 #10)
+// Pushes every published product into the Meilisearch index so the catalog
+// search endpoint can serve typo-tolerant queries. The index name defaults to
+// "products" and is overridable via MEILISEARCH_INDEX. Idempotent — safe to
+// re-run; Meilisearch upserts by primary key.
+// ---------------------------------------------------------------------------
+app.post('/api/admin/reindex-search', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const summary = await reindexMeilisearch();
+    res.json(summary);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Error al reindexar el buscador', details: err?.message || String(err) });
+  }
+});
+
+app.get('/api/admin/reindex-search/status', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
+  res.json(lastReindexSummary() || { message: 'never run', enabled: isMeilisearchEnabled() });
+});
+
+// ---------------------------------------------------------------------------
 // Image downloader v4 (download-images-from-csv.ts)
 // Reads image URLs from the Bihr extended catalog (CSV files per brand).
 // This is the richest data source (Picture1-6 columns, multi-image products).
@@ -2552,17 +2576,42 @@ app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
         conditions.append(sql` AND (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')`);
       }
 
+      // Meilisearch fast path: when search= is set and Meili is reachable,
+      // we get a fuzzy/typo-tolerant ID list and use it as a structural
+      // filter so the catalog query still applies brand/price/category
+      // narrowing. Fall back to ILIKE if Meili is unreachable or returns no
+      // hits so search never breaks the catalog endpoint.
+      let meiliIds: number[] | null = null;
+      if (search && isMeilisearchEnabled()) {
+        // Ask for a generous slice so category/brand narrowing still has
+        // something to filter through.
+        const m = await meiliSearchProducts(String(search), Math.max(perPage * 5, 200), 0);
+        if (m && m.ids.length > 0) {
+          meiliIds = m.ids;
+        }
+      }
+
       if (search) {
-        const searchPattern = `%${sanitizeLike(search)}%`;
-        conditions.append(sql`
-          AND (
-            LOWER(name) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-            OR LOWER(sku) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-            OR LOWER(description) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-            OR LOWER(supplier_code) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-            OR LOWER(barcode) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-            OR LOWER(old_part_number) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-          )`);
+        if (meiliIds) {
+          // Use the Meili IDs as the source of truth. Empty list means
+          // "Meili said nothing matches" — short-circuit to an empty page.
+          if (meiliIds.length === 0) {
+            return { products: [], total: 0, totalPages: 0 };
+          }
+          conditions.append(sql` AND p.id = ANY(${meiliIds}::int[])`);
+        } else {
+          // Fallback: ILIKE across name/sku/description/supplier_code/etc.
+          const searchPattern = `%${sanitizeLike(search)}%`;
+          conditions.append(sql`
+            AND (
+              LOWER(name) LIKE LOWER(${searchPattern}) ESCAPE '\\'
+              OR LOWER(sku) LIKE LOWER(${searchPattern}) ESCAPE '\\'
+              OR LOWER(description) LIKE LOWER(${searchPattern}) ESCAPE '\\'
+              OR LOWER(supplier_code) LIKE LOWER(${searchPattern}) ESCAPE '\\'
+              OR LOWER(barcode) LIKE LOWER(${searchPattern}) ESCAPE '\\'
+              OR LOWER(old_part_number) LIKE LOWER(${searchPattern}) ESCAPE '\\'
+            )`);
+        }
       }
 
       // Filter params
@@ -2645,6 +2694,30 @@ app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
       const countRes = await db.execute(sql`SELECT count(*) as total FROM (SELECT 1 FROM products ${conditions} LIMIT 10000) sub`);
       const total = Number(countRes.rows[0]?.total || 0);
       const totalPages = total > 10000 ? Math.ceil(10000 / perPage) : Math.ceil(total / perPage) || 1;
+
+      // When Meili gave us an ID list, the relevance order is in that
+      // array — so we fetch ALL matching rows from Postgres, sort by the
+      // Meili index in JS, and paginate in memory. The slice is bounded
+      // by `perPage * 5 = 100-250 rows` so this stays cheap.
+      if (meiliIds && meiliIds.length > 0) {
+        const allRes = await db.execute(sql`
+          SELECT p.*,
+                 COALESCE((SELECT avg_rating FROM product_rating_stats WHERE product_id = p.id), 0) AS avg_rating,
+                 COALESCE((SELECT review_count FROM product_rating_stats WHERE product_id = p.id), 0) AS review_count
+          FROM products p
+          ${conditions}
+        `);
+        const byId = new Map<number, any>();
+        for (const row of allRes.rows as any[]) byId.set(row.id, row);
+        const ordered = meiliIds
+          .map((id) => byId.get(id))
+          .filter((r): r is any => Boolean(r));
+        const total = ordered.length;
+        const totalPages = Math.max(1, Math.ceil(total / perPage));
+        const slice = ordered.slice(offset, offset + perPage);
+        const products = slice.map(mapProductToFrontend);
+        return { products, total, totalPages };
+      }
 
       const productsRes = await db.execute(sql`
         SELECT * FROM (
