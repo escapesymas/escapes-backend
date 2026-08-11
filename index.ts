@@ -2540,8 +2540,23 @@ app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
 
       // Filter params
       if (brand) {
-        const brandLower = brand.toLowerCase();
-        conditions.append(sql` AND LOWER(brand) = LOWER(${brandLower})`);
+        // Accept either a single brand ("RST") or a comma-separated list
+        // ("RST,SHARK,Held"). The carousel for the homepage "Equipamiento
+        // destacado" section pulls from several pilot-gear brands so it
+        // shows a mix of categories rather than one brand's dominant type.
+        const brandList = String(brand)
+          .split(',')
+          .map((b) => b.trim())
+          .filter(Boolean);
+        if (brandList.length === 1) {
+          conditions.append(sql` AND LOWER(brand) = LOWER(${brandList[0]})`);
+        } else if (brandList.length > 1) {
+          // Build OR chain with parameterized values to avoid SQL injection
+          const orChain = brandList
+            .map((b) => sql`LOWER(brand) = LOWER(${b})`)
+            .reduce((acc, frag, i) => (i === 0 ? frag : sql`${acc} OR ${frag}`));
+          conditions.append(sql` AND (${orChain})`);
+        }
       }
       if (min_price) {
         const mp = parseInt(min_price);
@@ -2553,6 +2568,12 @@ app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
       }
       if (in_stock === 'true') {
         conditions.append(sql` AND stock > 0`);
+      }
+      if (req.query.has_image === 'true') {
+        // Excludes the no-image:* placeholders the downloader leaves behind
+        // for brands/products where Bihr doesn't have an image. Matches
+        // "real" images by the .webp extension on src fields.
+        conditions.append(sql` AND images IS NOT NULL AND images::text NOT LIKE '%no-image%' AND images::text LIKE '%.webp%'`);
       }
       if (attrs) {
         try {
@@ -2608,7 +2629,7 @@ app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
           ${conditions}
           ORDER BY split_part(p.name, ',', 1), p.stock DESC, p.id ASC
         ) distinct_products
-        ORDER BY created_at DESC
+        ORDER BY ${req.query.sort === 'random' ? sql`RANDOM()` : sql`created_at DESC`}
         LIMIT ${perPage} OFFSET ${offset}
       `);
       const products = productsRes.rows.map(mapProductToFrontend);
