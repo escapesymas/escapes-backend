@@ -23,7 +23,13 @@ set -e
 VPS_IP=${ESCAPES_VPS_IP:-212.227.134.161}
 SSH_KEY=${ESCAPES_SSH_KEY:-$HOME/.ssh/id_ed25519}
 SIDECAR_NAME="escapes-image-dl-sidecar"
+# Host-side path (for tail/status from the local shell) — bound into the
+# container at /app/server/uploads, so writes from inside the container land
+# here too.
 SIDECAR_LOG="/data/escapes-uploads/image-dl-sidecar.log"
+# Path as seen FROM INSIDE the sidecar container — used by the loop script
+# and tee so writes hit the bind-mounted volume.
+SIDECAR_LOG_IN_CONTAINER="/app/server/uploads/image-dl-sidecar.log"
 APP_UUID="wg90ssxowlynpipdyxil35lw"
 
 SSH="ssh -i $SSH_KEY -o BatchMode=yes root@$VPS_IP"
@@ -56,6 +62,10 @@ case "${1:-}" in
     # DATABASE_URL, REDIS_URL, BIHR_*, etc.
     ENV_FILE="/data/coolify/applications/$APP_UUID/.env"
     echo "Starting sidecar..."
+    # Build the container command with SIDECAR_LOG pre-expanded (it lives on
+    # the HOST, not inside the container, so the variable must be substituted
+    # locally before the command reaches the container's /bin/sh).
+    CONTAINER_CMD="/app/server/scripts/image-downloader-loop.sh 2>&1 | tee -a $SIDECAR_LOG_IN_CONTAINER"
     $SSH "docker run -d \
       --name $SIDECAR_NAME \
       --restart unless-stopped \
@@ -69,7 +79,7 @@ case "${1:-}" in
       --log-opt max-file=3 \
       --entrypoint /bin/sh \
       $IMAGE_TAG \
-      -c 'touch $SIDECAR_LOG && /app/server/scripts/image-downloader-loop.sh' 2>&1 | tee -a $SIDECAR_LOG"
+      -c '$CONTAINER_CMD'"
     echo "Sidecar started. Logs: tail -f $SIDECAR_LOG on VPS"
     ;;
 esac
