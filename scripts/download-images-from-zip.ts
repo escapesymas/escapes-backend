@@ -15,6 +15,9 @@ const CSV_DIR_DEFAULT = '/app/server/uploads/catalog-csv';
 const CSV_DIR_FALLBACK = '/app/server/catalog-csv';
 const ZIP_BASE = 'https://static.bihr.pro/eBihr/Pictures';
 const ZIP_INDEX_CACHE = '/app/server/uploads/bihr-zip-index.json'; // { brand → { totalSize, cdOffset, cdSize, files: [{name, offset, compSize}] } }
+const BIHR_API_BASE = process.env.BIHR_API_BASE || 'https://api.bihr.net';
+const BIHR_USERNAME = process.env.BIHR_USERNAME || '';
+const BIHR_MACKEY = process.env.BIHR_MACKEY || '';
 
 interface CliOptions {
   batch: number;
@@ -413,6 +416,219 @@ function imageRecordFor(row: ProductRow, safeSku: string, originalUrl: string): 
   };
 }
 
+// ---------- Bihr API fallback (per-SKU image) ----------
+//
+// When a brand's static zip returns 404 from static.bihr.pro (e.g. EK CHAIN,
+// NG BRAKE DISC, ALL BALLS, V PARTS), fall back to the authenticated
+// per-product endpoint. The token is cached in memory for ~1h (token expiry
+// minus a safety margin).
+interface BihrToken {
+  token: string;
+  expiresAt: number;
+}
+let cachedToken: BihrToken | null = null;
+// Circuit breaker: when the API is down or rate-limiting hard, we see a run
+// of auth/HTTP failures. After CIRCUIT_BREAKER_THRESHOLD consecutive API
+// failures (auth OR 429 OR timeout), we open the circuit — getBihrToken()
+// returns null and the caller marks the product as "api-unreachable" rather
+// than retrying. The circuit re-closes after CIRCUIT_BREAKER_RESET_MS so
+// transient outages recover.
+let apiConsecutiveFails = 0;
+let apiCircuitOpenedAt = 0;
+const CIRCUIT_BREAKER_THRESHOLD = 5;
+const CIRCUIT_BREAKER_RESET_MS = 5 * 60_000;
+
+function isCircuitOpen(): boolean {
+  if (apiConsecutiveFails < CIRCUIT_BREAKER_THRESHOLD) return false;
+  if (Date.now() - apiCircuitOpenedAt > CIRCUIT_BREAKER_RESET_MS) {
+    // Try again — half-open.
+    selfLog(`BIHR-API circuit half-open (was open for ${Math.round((Date.now() - apiCircuitOpenedAt) / 1000)}s)`);
+    apiConsecutiveFails = 0;
+    return false;
+  }
+  return true;
+}
+
+function bumpCircuit(reason: string): void {
+  apiConsecutiveFails++;
+  if (apiConsecutiveFails === CIRCUIT_BREAKER_THRESHOLD) {
+    apiCircuitOpenedAt = Date.now();
+    selfLog(`BIHR-API circuit OPEN for ${CIRCUIT_BREAKER_RESET_MS / 1000}s — ${reason}`);
+  } else if (apiConsecutiveFails > CIRCUIT_BREAKER_THRESHOLD) {
+    // Already open, but reset timer if we're still failing.
+    apiCircuitOpenedAt = Date.now();
+  } else {
+    selfLog(`BIHR-API fail #${apiConsecutiveFails}: ${reason}`);
+  }
+}
+
+async function getBihrToken(): Promise<string | null> {
+  if (!BIHR_USERNAME || !BIHR_MACKEY) return null;
+  if (isCircuitOpen()) return null;
+  const now = Date.now();
+  if (cachedToken && cachedToken.expiresAt > now + 60_000) return cachedToken.token;
+  try {
+    const resp = await fetch(`${BIHR_API_BASE}/api/v2.1/Authentication/Token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ UserName: BIHR_USERNAME, PassWord: BIHR_MACKEY }).toString(),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!resp.ok) {
+      bumpCircuit(`AUTH HTTP ${resp.status}`);
+      cachedToken = null;
+      return null;
+    }
+    const data: any = await resp.json();
+    if (!data?.access_token) {
+      bumpCircuit('AUTH no access_token');
+      cachedToken = null;
+      return null;
+    }
+    apiConsecutiveFails = 0;
+    cachedToken = {
+      token: data.access_token,
+      expiresAt: now + (Number(data.expires_in) || 3600) * 1000,
+    };
+    return cachedToken.token;
+  } catch (err: any) {
+    bumpCircuit(`AUTH ${err?.message || err}`);
+    cachedToken = null;
+    return null;
+  }
+}
+
+async function fetchImageFromBihrApi(supplierCode: string): Promise<Buffer | null> {
+  const token = await getBihrToken();
+  if (!token) return null;
+  const url = `${BIHR_API_BASE}/api/v2.1/Products/Image/${encodeURIComponent(supplierCode)}`;
+  // Bihr's API is rate-limited and returns HTTP 429 when we hit too fast. The
+  // happy path (zip-based) doesn't go through the API at all, so this only
+  // affects products in brands whose zip returned 404. We serialize the API
+  // path with a fixed ~250ms gap to stay well under the limit, and back off
+  // aggressively on 429.
+  await bihrApiGate();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (resp.ok) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        // 404 sometimes returns a tiny HTML error page — guard against it.
+        if (buf.length < 200) return null;
+        // Successful call → API is healthy, reset circuit state.
+        apiConsecutiveFails = 0;
+        return buf;
+      }
+      if (resp.status === 404) return null;
+      if (resp.status === 429) {
+        bumpCircuit(`API 429 for ${supplierCode}`);
+        // Exponential backoff: 1s, 2s, 4s, 8s.
+        const wait = 1000 * Math.pow(2, attempt);
+        selfLog(`BIHR-API 429 for ${supplierCode}, backing off ${wait}ms`);
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      bumpCircuit(`API HTTP ${resp.status} for ${supplierCode}`);
+      return null;
+    } catch (err: any) {
+      bumpCircuit(`API timeout/err ${supplierCode}: ${err?.message || err}`);
+      return null;
+    }
+  }
+  selfLog(`BIHR-API giving up on ${supplierCode} after 4 retries`);
+  return null;
+}
+
+// Process-wide mutex + rate limiter for the Bihr API. The API is rate-limited
+// (HTTP 429 on bursts), so we serialize ALL API calls across workers and add a
+// minimum gap between them. This makes API throughput ~4 req/s — slow but
+// sustainable. The zip-based path doesn't go through here, so brands with
+// working zips aren't slowed down.
+let bihrApiChain: Promise<unknown> = Promise.resolve();
+let bihrApiLastCallAt = 0;
+const BIHR_API_MIN_GAP_MS = 250;
+async function bihrApiGate(): Promise<void> {
+  // Chain each call onto the previous one so only one is ever in-flight.
+  // (The workers still run in parallel for the zip path; the API path queues.)
+  const prev = bihrApiChain;
+  let release!: () => void;
+  bihrApiChain = new Promise<void>((res) => (release = res));
+  await prev;
+  try {
+    const now = Date.now();
+    const wait = bihrApiLastCallAt + BIHR_API_MIN_GAP_MS - now;
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    bihrApiLastCallAt = Date.now();
+  } finally {
+    release();
+  }
+}
+
+// Module-level fallback chain: called from any branch in processProduct that
+// failed to find the image in the brand zip. Tries (1) the authenticated
+// Bihr per-product API, then (2) the direct CDN URL from the CSV. Respects
+// the circuit breaker for the API path.
+async function tryApiFallback(
+  row: ProductRow,
+  brand: string,
+  urlMap: Map<string, { url: string; brand: string }>,
+): Promise<Buffer | null> {
+  if (!isCircuitOpen()) {
+    const code = row.supplier_code || row.sku;
+    if (code) {
+      selfLog(`BIHR-API-TRY ${brand}/${code}`);
+      const buf = await fetchImageFromBihrApi(code);
+      if (buf) {
+        selfLog(`BIHR-API-OK ${brand}/${code} (${buf.length}B)`);
+        return buf;
+      }
+    }
+  }
+  // Try the CSV-embedded CDN URL. Cheap, no auth, public.
+  return await tryUrlFallback(row, urlMap);
+}
+
+// Third-tier fallback: the Bihr catalog CSV embeds direct CDN URLs for each
+// product's Picture1..6 (api.mybihr.com/medias/{id}-{n}-{size}?context=...).
+// These URLs are the same images packaged in the brand zip, but they're
+// publicly addressable — no auth, no rate limit. This is the most reliable
+// source when both zip and authenticated API fail.
+async function tryUrlFallback(
+  row: ProductRow,
+  urlMap: Map<string, { url: string; brand: string }>,
+): Promise<Buffer | null> {
+  // Look up by supplier_code or sku (the CSV indexes these as aliases).
+  const urlEntry =
+    urlMap.get(row.supplier_code) ||
+    urlMap.get(row.sku);
+  if (!urlEntry?.url) return null;
+  selfLog(`BIHR-URL-TRY ${urlEntry.url.slice(0, 100)}...`);
+  try {
+    const resp = await fetch(urlEntry.url, {
+      signal: AbortSignal.timeout(15_000),
+      headers: { 'User-Agent': 'EscapesYMas-Bihr-Image-Downloader/5.0' },
+    });
+    if (!resp.ok) {
+      selfLog(`BIHR-URL HTTP ${resp.status}`);
+      return null;
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length < 1000) {
+      // Some 404 responses are tiny HTML pages — reject them.
+      selfLog(`BIHR-URL too small (${buf.length}B), rejecting`);
+      return null;
+    }
+    selfLog(`BIHR-URL-OK ${buf.length}B`);
+    return buf;
+  } catch (err: any) {
+    selfLog(`BIHR-URL-ERR ${err?.message || err}`);
+    return null;
+  }
+}
+
 // Brands whose zip returned 404 (or otherwise unreachable) — once a brand is
 // known-bad, we skip the fetch and mark every product of that brand with a
 // placeholder so the loop doesn't re-pick them. Persisted to disk so we don't
@@ -450,6 +666,7 @@ async function processProduct(
   total: number,
   skuMap: Map<string, { brand: string }>,
   partMap: Map<string, { brand: string; partNumber: string }>,
+  urlMap: Map<string, { url: string; brand: string }>,
 ): Promise<'downloaded' | 'no-image'> {
   const safeSku = sanitizeSku(row.sku);
   if (!safeSku) throw new Error('SKU empty');
@@ -469,24 +686,61 @@ async function processProduct(
   const partEntry = partMap.get(row.sku) || partMap.get(row.supplier_code);
   const partNumber = partEntry?.partNumber || row.supplier_code || row.sku;
   if (failedBrands.has(entry.brand)) {
-    console.log(`[${position}/${total}] Product ${row.id}: skip brand ${entry.brand} (known bad)`);
+    // Brand zip is known-bad (404). Try the API fallback before giving up.
+    console.log(`[${position}/${total}] Product ${row.id}: brand ${entry.brand} zip 404, trying API`);
+    const apiImage = await tryApiFallback(row, entry.brand, urlMap);
+    if (apiImage) {
+      await writeVariants(apiImage, safeSku);
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      await db.execute(sql`
+        UPDATE products
+        SET images = ${JSON.stringify(images)}::jsonb
+        WHERE id = ${row.id}
+      `);
+      console.log(`[${position}/${total}] Product ${row.id}: API fallback ${safeSku}_0_800.webp`);
+      return 'downloaded';
+    }
+    const noImgReason = isCircuitOpen() ? 'no-image:brand-X-api-circuit-open' : `no-image:brand-${entry.brand}-no-zip`;
     await db.execute(sql`
       UPDATE products
-      SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:brand-${entry.brand}-no-zip`, alt: row.name || row.sku || '' }])}::jsonb
+      SET images = ${JSON.stringify([{ src: '', originalUrl: noImgReason, alt: row.name || row.sku || '' }])}::jsonb
       WHERE id = ${row.id}
     `);
     return 'no-image';
   }
-  let index: BrandIndex;
-  try {
-    index = await loadBrandIndex(entry.brand);
-  } catch (err: any) {
-    // Remember the brand as failed (write to disk) so we don't re-fetch
-    // its (likely 404) zip for every product of that brand.
-    failedBrands.add(entry.brand);
-    await saveFailedBrands();
-    selfLog(`BRAND-FAIL ${entry.brand}: ${err?.message || err}`);
-    console.error(`[${position}/${total}] Product ${row.id}: brand ${entry.brand} marked as failed - ${err?.message || err}`);
+
+  // Module-level API fallback helper (hoisted; safe to use above).
+  let index: BrandIndex | null = null;
+  // Skip the zip fetch if we already know this brand's zip is unreachable —
+  // we'll fall through to the API fallback below.
+  if (!failedBrands.has(entry.brand)) {
+    try {
+      index = await loadBrandIndex(entry.brand);
+    } catch (err: any) {
+      // Remember the brand as failed (write to disk) so we don't re-fetch
+      // its (likely 404) zip for every product of that brand. The API
+      // fallback below will still try per-SKU.
+      failedBrands.add(entry.brand);
+      await saveFailedBrands();
+      selfLog(`BRAND-FAIL ${entry.brand}: ${err?.message || err}`);
+      console.error(`[${position}/${total}] Product ${row.id}: brand ${entry.brand} zip failed (${err?.message || err}), will try API fallback`);
+    }
+  }
+
+  // No index (brand zip 404) → API only.
+  if (!index) {
+    const apiImage = await tryApiFallback(row, entry.brand, urlMap);
+    if (apiImage) {
+      await writeVariants(apiImage, safeSku);
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      await db.execute(sql`
+        UPDATE products
+        SET images = ${JSON.stringify(images)}::jsonb
+        WHERE id = ${row.id}
+      `);
+      console.log(`[${position}/${total}] Product ${row.id}: API fallback ${safeSku}_0_800.webp`);
+      return 'downloaded';
+    }
     await db.execute(sql`
       UPDATE products
       SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:brand-${entry.brand}-no-zip`, alt: row.name || row.sku || '' }])}::jsonb
@@ -501,6 +755,18 @@ async function processProduct(
     failedBrands.add(entry.brand);
     await saveFailedBrands();
     selfLog(`BRAND-EMPTY ${entry.brand}: zip has 0 files`);
+    const apiImage = await tryApiFallback(row, entry.brand, urlMap);
+    if (apiImage) {
+      await writeVariants(apiImage, safeSku);
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      await db.execute(sql`
+        UPDATE products
+        SET images = ${JSON.stringify(images)}::jsonb
+        WHERE id = ${row.id}
+      `);
+      console.log(`[${position}/${total}] Product ${row.id}: API fallback (empty zip) ${safeSku}_0_800.webp`);
+      return 'downloaded';
+    }
     await db.execute(sql`
       UPDATE products
       SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:brand-${entry.brand}-empty-zip`, alt: row.name || row.sku || '' }])}::jsonb
@@ -510,7 +776,19 @@ async function processProduct(
   }
   const image = await fetchImageFromZip(entry.brand, partNumber, index);
   if (!image) {
-    console.log(`[${position}/${total}] Product ${row.id}: not in ${entry.brand} zip`);
+    console.log(`[${position}/${total}] Product ${row.id}: not in ${entry.brand} zip, trying API`);
+    const apiImage = await tryApiFallback(row, entry.brand, urlMap);
+    if (apiImage) {
+      await writeVariants(apiImage, safeSku);
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      await db.execute(sql`
+        UPDATE products
+        SET images = ${JSON.stringify(images)}::jsonb
+        WHERE id = ${row.id}
+      `);
+      console.log(`[${position}/${total}] Product ${row.id}: API fallback ${safeSku}_0_800.webp`);
+      return 'downloaded';
+    }
     await db.execute(sql`
       UPDATE products
       SET images = ${JSON.stringify([{ src: '', originalUrl: `no-image:not-in-${entry.brand}-zip`, alt: row.name || row.sku || '' }])}::jsonb
@@ -605,6 +883,7 @@ async function runBatch(
   options: CliOptions,
   skuMap: Map<string, { brand: string }>,
   partMap: Map<string, { brand: string; partNumber: string }>,
+  urlMap: Map<string, { url: string; brand: string }>,
   effectiveBatch: number,
   totals: CumulativeTotals,
 ): Promise<CumulativeTotals> {
@@ -623,7 +902,7 @@ async function runBatch(
       if (index >= products.length) return;
       const product = products[index];
       try {
-        const status = await processProduct(product, index + 1, products.length, skuMap, partMap);
+        const status = await processProduct(product, index + 1, products.length, skuMap, partMap, urlMap);
         if (status === 'downloaded') totals.downloaded++;
         else totals.skipped++;
       } catch (error) {
@@ -669,9 +948,9 @@ async function main(): Promise<void> {
   if (options.recheckFiles) {
     await resetMissingFiles();
   }
-  const { skuMap, partMap } = await loadCatalogMap(options.csvDir);
+  const { skuMap, partMap, urlMap } = await loadCatalogMap(options.csvDir);
   const totalCandidates = await countCandidates();
-  selfLog(`[INFO] totalCandidates=${totalCandidates} skuMapSize=${skuMap.size} partMapSize=${partMap.size}`);
+  selfLog(`[INFO] totalCandidates=${totalCandidates} skuMapSize=${skuMap.size} partMapSize=${partMap.size} urlMapSize=${urlMap.size}`);
   let effectiveBatch = Math.min(options.batch, totalCandidates);
   await updateImageRegenState({
     status: 'running',
@@ -687,7 +966,7 @@ async function main(): Promise<void> {
   let batchNum = 1;
   while (true) {
     totals.processed = 0; totals.downloaded = 0; totals.skipped = 0; totals.errors = 0;
-    await runBatch(options, skuMap, partMap, effectiveBatch, totals);
+    await runBatch(options, skuMap, partMap, urlMap, effectiveBatch, totals);
     selfLog(`[BATCH ${batchNum}] downloaded=${totals.downloaded} skipped=${totals.skipped} errors=${totals.errors}`);
     if (!options.loopAll) break;
     const remaining = await countCandidates();
