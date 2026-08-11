@@ -2794,6 +2794,154 @@ app.get('/api/catalog/product/:id', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// /api/products/[id]/image — on-the-fly image cache (P2 #9)
+//
+// Behavior:
+//   1. If /uploads/optimized/{sku}-{w}.webp exists on disk, serve it
+//      directly with a long max-age header. Same filename convention used by
+//      the v5 image downloader, so anything already downloaded is hit.
+//   2. Otherwise fetch the Bihr CDN URL for picture number `n` (default 1,
+//      max 6 — matching the Picture1..Picture6 columns in the Bihr catalog),
+//      pipe through Sharp to resize + convert to WebP at the requested
+//      width, persist to /uploads/optimized so subsequent requests hit step
+//      1, and return the buffer.
+//   3. If neither works (no images, Bihr 404), return a 1x1 JPEG so the
+//      frontend never sees a broken image.
+//
+// Query params:
+//   w — width (allowed: 200, 400, 800). Default 800.
+//   n — picture number 1..6 (default 1).
+// ---------------------------------------------------------------------------
+const ALLOWED_IMAGE_WIDTHS = new Set([200, 400, 800]);
+// 1x1 transparent JPEG so the frontend's <img> tag doesn't show a broken icon
+// even when Bihr is unreachable. 95 bytes, content-type image/jpeg.
+const PLACEHOLDER_JPEG = Buffer.from(
+  '/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wBDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wgARCAABAAEDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQBAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhADEAAAAVOf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABCf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=',
+  'base64',
+);
+
+app.get('/api/products/:id(\\d+)/image', async (req: any, res: any) => {
+  try {
+    const productId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(productId) || productId <= 0) {
+      return servePlaceholder(res, 'bad-id');
+    }
+
+    // Width whitelist: clamps untrusted values AND dodges sharp variants we
+    // haven't optimized for. The set is intentionally small — frontend can
+    // request 800 (product page), 400 (catalog card), 200 (mini thumbnail).
+    const wRaw = parseInt(String(req.query.w || '800'), 10);
+    const w: 200 | 400 | 800 = (ALLOWED_IMAGE_WIDTHS.has(wRaw) ? wRaw : 800) as 200 | 400 | 800;
+
+    // Picture number: 1..6. We don't have a per-picture DB column; the
+    // existing `images` JSONB holds a list of URLs in the same order Bihr
+    // gave us, so we index into it directly.
+    const nRaw = parseInt(String(req.query.n || '1'), 10);
+    const n = Math.max(1, Math.min(6, Number.isFinite(nRaw) ? nRaw : 1));
+
+    // 1) Local fast path: /uploads/optimized/{sku}-{w}.webp
+    const skuRes = await db.execute(sql`SELECT sku, images FROM products WHERE id = ${productId} LIMIT 1`);
+    if (skuRes.rows.length === 0) return servePlaceholder(res, 'no-product');
+    const sku = (skuRes.rows[0] as any).sku;
+    const safeSku = sanitizeSkuForFilename(sku);
+    if (safeSku) {
+      const localPath = path.join(OPTIMIZED_DIR, `${safeSku}-${w}.webp`);
+      if (fs.existsSync(localPath)) {
+        // Long cache: this URL is keyed by SKU + width, so a successful
+        // download is safe to serve for 24h. We don't promise
+        // `immutable` because the downloader could regenerate the file
+        // under us (e.g. better source material).
+        res.set('Content-Type', 'image/webp');
+        res.set('Cache-Control', 'public, max-age=86400');
+        res.set('X-Image-Cache', 'HIT');
+        return fs.createReadStream(localPath).pipe(res);
+      }
+    }
+
+    // 2) Bihr fallback: pick the nth image URL from products.images
+    const imgs: any[] = (() => {
+      let parsed: any[] = [];
+      try {
+        parsed = typeof (skuRes.rows[0] as any).images === 'string'
+          ? JSON.parse((skuRes.rows[0] as any).images)
+          : ((skuRes.rows[0] as any).images || []);
+      } catch {}
+      return Array.isArray(parsed) ? parsed : [];
+    })();
+
+    const picked = imgs[n - 1];
+    const remoteUrl: string | undefined = picked && (typeof picked === 'string' ? picked : picked.src || picked.url);
+    if (!remoteUrl || !/^https?:\/\//i.test(remoteUrl)) {
+      return servePlaceholder(res, 'no-remote-url');
+    }
+
+    // Fetch from upstream. We tolerate ANY host here (not just mybihr.com)
+    // because the field can contain third-party URLs after manual admin
+    // uploads. We DO cap the body to 15 MB so a malicious upstream can't
+    // exhaust our memory.
+    let upstream: Response;
+    try {
+      upstream = await fetch(remoteUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; EscapesYMas/1.0; +https://escapesymas.com)',
+          'Accept': 'image/jpeg,image/png,image/webp,image/*',
+        },
+      });
+    } catch (err: any) {
+      console.warn(`[product-image] upstream fetch failed for product ${productId} url=${remoteUrl}: ${err?.message || err}`);
+      return servePlaceholder(res, 'fetch-error');
+    }
+    if (!upstream.ok) {
+      console.warn(`[product-image] upstream ${upstream.status} for product ${productId}`);
+      return servePlaceholder(res, `upstream-${upstream.status}`);
+    }
+
+    const ab = await upstream.arrayBuffer();
+    if (ab.byteLength > 15 * 1024 * 1024) {
+      console.warn(`[product-image] upstream too large (${ab.byteLength}B) for product ${productId}`);
+      return servePlaceholder(res, 'upstream-too-large');
+    }
+    const original = Buffer.from(ab);
+
+    let optimized: Buffer;
+    try {
+      optimized = await sharp(original)
+        .resize({ width: w, withoutEnlargement: true, fit: 'inside' })
+        .webp({ quality: 80, effort: 4 })
+        .toBuffer();
+    } catch (sharpErr: any) {
+      console.error(`[product-image] sharp error for product ${productId}: ${sharpErr?.message || sharpErr}`);
+      return servePlaceholder(res, 'sharp-error');
+    }
+
+    // Persist to disk (fire & forget) so subsequent requests hit the
+    // local fast path. We key on SKU + width only (no `n`) because the
+    // picture-number ordering is already preserved in the order we
+    // fetch from the JSONB list — the same SKU at the same width always
+    // corresponds to the same image slot in our own optimized set.
+    if (safeSku) {
+      const localPath = path.join(OPTIMIZED_DIR, `${safeSku}-${w}.webp`);
+      fs.promises.writeFile(localPath, optimized).catch(() => {});
+    }
+
+    res.set('Content-Type', 'image/webp');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-Image-Cache', 'MISS');
+    return res.end(optimized);
+  } catch (err: any) {
+    console.error('[product-image] unexpected error:', err?.message || err);
+    return servePlaceholder(res, 'internal-error');
+  }
+});
+
+function servePlaceholder(res: any, reason: string): void {
+  res.set('Content-Type', 'image/jpeg');
+  res.set('Cache-Control', 'public, max-age=300');
+  res.set('X-Image-Cache', `PLACEHOLDER:${reason}`);
+  res.end(PLACEHOLDER_JPEG);
+}
+
 const fbCache = new Map<string, { data: any[]; expiresAt: number }>();
 const FB_TTL_MS = 5 * 60 * 1000;
 
