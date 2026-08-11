@@ -1,0 +1,83 @@
+name: Backend CI
+
+# Runs the backend smoke tests (lib/stripe-webhook, lib/email) and
+# TypeScript check on every push to main and PR. Cheap: no Playwright,
+# no Next.js build. Postgres is brought up as a service container.
+#
+# Why:
+#   - `npx tsc --noEmit` catches type drift before deploy
+#   - The smoke tests exercise the idempotency / retry logic against a
+#     real Postgres so we don't ship a regression like the duplicate
+#     Stripe webhook payload class
+#   - Skips scheduled builds (only on push/PR)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: TypeScript + smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: escapes_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/escapes_test
+      JWT_SECRET: test-jwt-secret
+      STRIPE_SECRET_KEY: sk_test_dummy
+      STRIPE_WEBHOOK_SECRET: whsec_test_dummy
+      SMTP_HOST: 127.0.0.1
+      SMTP_ALLOW_UNSECURE: 'true'
+      SMTP_USER: test@example.com
+      SMTP_PASSWORD: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci --no-audit --no-fund
+
+      - name: Apply migrations
+        run: |
+          for m in 001_schema 002_initial_data 003_add_universal_indexes 004_stripe_webhook 005_email_queue; do
+            if [ -f "migrations/${m}.ts" ]; then
+              echo "Applying $m..."
+              npx tsx "migrations/${m}.ts"
+            fi
+          done
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Stripe webhook smoke test
+        run: npx tsx scripts/smoke-stripe-webhook.ts
+
+      - name: Email smoke test
+        run: npx tsx scripts/smoke-email.ts
