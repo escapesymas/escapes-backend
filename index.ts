@@ -32,6 +32,7 @@ import { cdnUrl, cdnBanner } from './lib/uploads-cdn.js';
 import { syncBihrStock, startBihrStockCron, lastBihrStockSync } from './lib/bihr-stock-sync.js';
 import { meiliSearchProducts, reindexMeilisearch, lastReindexSummary, isMeilisearchEnabled, meilisearchBanner } from './lib/search.js';
 import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats } from './lib/stripe-webhook.js';
+import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
 
@@ -3912,6 +3913,12 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         const query = sql`SELECT * FROM products ${conditions} ORDER BY ${sql.raw(safeSort)} ${sql.raw(safeOrder)} LIMIT ${lim} OFFSET ${offset}`;
         const products = await db.execute(query);
         const rows = products.rows;
+
+        // Total count for pagination — separate query so the client can
+        // render server-side pagination controls (total/total_pages).
+        const countQuery = sql`SELECT COUNT(*)::int AS total FROM products ${conditions}`;
+        const totalRes = await db.execute(countQuery);
+        const total = Number((totalRes.rows[0] as any)?.total || 0);
         
         if (rows.length > 0) {
           try {
@@ -3933,7 +3940,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           }
         }
 
-        return res.json(rows);
+        return res.json({ products: rows, total, page: p, limit: lim, sort: safeSort, order: safeOrder });
       }
 
       case 'create-product': {
@@ -7674,6 +7681,38 @@ app.get('/api/admin/stripe-webhook-stats', async (req: any, res: any) => {
     res.json(stats);
   } catch (err: any) {
     console.error('[STRIPE WEBHOOK STATS]:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Email retry queue (cada 1 minuto). Replays payloads that failed during
+// the live send. Backed by migrations/005_email_queue.sql.
+setInterval(() => {
+  processEmailRetryQueue().catch(e => console.error('[EMAIL RETRY CRON]:', e));
+}, 60 * 1000);
+
+// Open tracking pixel hit by customer email clients. Returns a 1x1
+// transparent GIF so the request resolves immediately with no visible
+// artifact on the rendered email.
+app.get('/api/email/track-open', async (req: any, res: any) => {
+  const messageId = req.query.m;
+  if (messageId) {
+    recordOpen(String(messageId)).catch(() => {});
+  }
+  // 1x1 transparent GIF (43 bytes), base64-decoded
+  const gif = Buffer.from('R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==', 'base64');
+  res.setHeader('Content-Type', 'image/gif');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.send(gif);
+});
+
+// Admin endpoint for email stats.
+app.get('/api/admin/email-stats', async (req: any, res: any) => {
+  try {
+    const stats = await emailStats();
+    res.json(stats);
+  } catch (err: any) {
+    console.error('[EMAIL STATS]:', err);
     res.status(500).json({ error: err.message });
   }
 });
