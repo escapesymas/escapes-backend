@@ -672,8 +672,27 @@ async function processProduct(
   if (!safeSku) throw new Error('SKU empty');
   const entry = skuMap.get(row.sku) || skuMap.get(row.supplier_code);
   if (!entry) {
-    console.log(`[${position}/${total}] Product ${row.id}: no brand mapping`);
-    // Mark with a placeholder so this product isn't re-picked on next iteration.
+    // No CSV row matched this product's sku or supplier_code. The Bihr CSV
+    // is a snapshot — products added to Bihr AFTER the snapshot date won't
+    // appear in it, but the authenticated per-product API may still have
+    // them. Try the API before giving up. Use row.brand (the product's own
+    // brand) for the originalUrl label — it's what users see in the catalog.
+    const code = row.supplier_code || row.sku;
+    console.log(`[${position}/${total}] Product ${row.id}: no brand mapping, trying API for ${code}`);
+    const apiBuf = await fetchImageFromBihrApi(code);
+    if (apiBuf) {
+      await writeVariants(apiBuf, safeSku);
+      const images = [imageRecordFor(row, safeSku, `api:${row.brand || 'unknown'}/${code}`)];
+      await db.execute(sql`
+        UPDATE products
+        SET images = ${JSON.stringify(images)}::jsonb
+        WHERE id = ${row.id}
+      `);
+      console.log(`[${position}/${total}] Product ${row.id}: API fallback (no CSV match) ${safeSku}_0_800.webp`);
+      return 'downloaded';
+    }
+    // API confirmed missing — mark so we don't retry every loop.
+    console.log(`[${position}/${total}] Product ${row.id}: no brand mapping (API also 404)`);
     await db.execute(sql`
       UPDATE products
       SET images = ${JSON.stringify([{ src: '', originalUrl: 'no-image:no-brand-mapping', alt: row.name || row.sku || '' }])}::jsonb
