@@ -1,0 +1,16 @@
+node_modules
+.git
+.gitignore
+*.log
+.env*
+uploads
+catalog-csv
+invoices
+test-results
+coverage
+README.md
+DEPLOY.md
+SERVICE-DISCOVERY.md
+CLEANUP.md
+IMPLEMENTATION-PLAN.md
+escapesymas-infra-reference.md
