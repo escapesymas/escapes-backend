@@ -6803,7 +6803,7 @@ async function processAbandonedCartEmails() {
 
       for (const raw of rows.rows) {
         const row = raw as any;
-        const cartTotalCents = parseInt(row.cart_total_cents) || 0;
+        const cartTotalCents = Math.round(parseFloat(row.cart_total_cents)) || 0;
         const discountCents = Math.floor(cartTotalCents * discountPct);
         try {
           const { subject, html, text } = renderAbandonedCartEmail(
@@ -6910,11 +6910,12 @@ app.post('/api/cart', async (req: any, res: any) => {
       const safeEmail = (userEmail && userEmail !== 'undefined' && userEmail.includes('@')) ? userEmail : null;
       const safeItems = Array.isArray(items) ? items.filter((it: any) => it && (it.id || it.product_id)) : [];
       if (safeEmail && safeItems.length > 0) {
-        const cartTotalCents = safeItems.reduce((acc: number, it: any) => {
-          const cents = typeof it.price === 'number' ? it.price : (parseInt(it.price) || 0);
-          const qty = parseInt(it.quantity) || 1;
+        const cartTotalCents = Math.round(safeItems.reduce((acc: number, it: any) => {
+          const rawPrice = typeof it.price === 'number' ? it.price : (parseFloat(it.price) || 0);
+          const cents = rawPrice < 1000 && !Number.isInteger(rawPrice) ? Math.round(rawPrice * 100) : Math.round(rawPrice);
+          const qty = Math.max(1, parseInt(it.quantity) || 1);
           return acc + cents * qty;
-        }, 0);
+        }, 0));
 
         const existingAbandoned = await db.execute(sql`
           SELECT id, recovered_at FROM cart_abandoned_emails
