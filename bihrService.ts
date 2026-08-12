@@ -57,7 +57,8 @@ export async function getBihrToken(): Promise<string> {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: formData.toString()
+      body: formData.toString(),
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) {
@@ -103,7 +104,8 @@ export async function getLiveStockLevel(productCode: string): Promise<'InStock' 
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept': 'application/json'
-      }
+      },
+      signal: AbortSignal.timeout(8000),
     });
 
     if (!response.ok) {
@@ -129,7 +131,8 @@ export async function getLiveStockValue(productCode: string): Promise<number> {
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept': 'application/json'
-      }
+      },
+      signal: AbortSignal.timeout(8000),
     });
 
     if (!response.ok) {

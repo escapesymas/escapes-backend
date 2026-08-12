@@ -4107,18 +4107,18 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         const avgOrderTotalCents = Number(aovRes.rows[0]?.avg_order_total_cents || 0);
 
-        // ── Live stock from Bihr (async, non-blocking — fail silently) ─────
+        // ── Live stock from Bihr — bihrService calls have their own 8s timeout ──
         let liveStock = { quantity: null as number | null, status: null as string | null };
-        try {
-          const productCode = product.supplier_code || product.barcode;
-          if (productCode) {
+        const productCode = product.supplier_code || product.barcode;
+        if (productCode) {
+          try {
             const [status, quantity] = await Promise.all([
               getLiveStockLevel(productCode),
               getLiveStockValue(productCode),
             ]);
             liveStock = { quantity, status };
-          }
-        } catch (_) { /* non-critical */ }
+          } catch (_) { /* non-critical: leave as null */ }
+        }
 
         return res.json({
           product,
