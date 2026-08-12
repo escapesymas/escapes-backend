@@ -4107,8 +4107,22 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         const avgOrderTotalCents = Number(aovRes.rows[0]?.avg_order_total_cents || 0);
 
+        // ── Live stock from Bihr (async, non-blocking — fail silently) ─────
+        let liveStock = { quantity: null as number | null, status: null as string | null };
+        try {
+          const productCode = product.supplier_code || product.barcode;
+          if (productCode) {
+            const [status, quantity] = await Promise.all([
+              getLiveStockLevel(productCode),
+              getLiveStockValue(productCode),
+            ]);
+            liveStock = { quantity, status };
+          }
+        } catch (_) { /* non-critical */ }
+
         return res.json({
           product,
+          live_stock: liveStock,
           stats: {
             all_time: {
               units_sold: unitsSold,
