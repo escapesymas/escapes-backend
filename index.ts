@@ -3943,6 +3943,214 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         return res.json({ products: rows, total, page: p, limit: lim, sort: safeSort, order: safeOrder });
       }
 
+      case 'product-detail': {
+        const { id } = req.query as any;
+        const productId = parseIntSafe(id);
+        if (!productId) return res.status(400).json({ error: 'Falta id' });
+
+        // ── Product row ────────────────────────────────────────────────
+        const productRes = await pool.query('SELECT * FROM products WHERE id = $1', [productId]);
+        if (productRes.rows.length === 0) {
+          return res.status(404).json({ error: 'Producto no encontrado' });
+        }
+        const product = productRes.rows[0] as any;
+
+        // Parse JSONB columns if the client sends them as strings (it does — products.images
+        // and products.compatibility are stored as JSONB and pg returns them as parsed objects
+        // for jsonb, but some setups stringify; normalize for the admin client).
+        if (typeof product.images === 'string') {
+          try { product.images = JSON.parse(product.images); } catch { product.images = []; }
+        }
+        if (typeof product.compatibility === 'string') {
+          try { product.compatibility = JSON.parse(product.compatibility); } catch { product.compatibility = []; }
+        }
+
+        // ── Period stats: current 30d and previous 30d ──────────────────
+        // All-time aggregates (excluding cancelled/refunded) for headline numbers.
+        const allTimeRes = await pool.query(`
+          SELECT
+            COALESCE(SUM(oi.quantity), 0)::int AS units_sold,
+            COALESCE(SUM(oi.price * oi.quantity), 0)::bigint AS revenue_cents,
+            COUNT(DISTINCT oi.order_id)::int AS order_count
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          WHERE oi.product_id = $1
+            AND o.status NOT IN ('cancelled', 'refunded')
+        `, [productId]);
+
+        const currentRes = await pool.query(`
+          SELECT
+            COALESCE(SUM(oi.quantity), 0)::int AS units_sold,
+            COALESCE(SUM(oi.price * oi.quantity), 0)::bigint AS revenue_cents,
+            COUNT(DISTINCT oi.order_id)::int AS order_count
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          WHERE oi.product_id = $1
+            AND o.created_at >= NOW() - INTERVAL '30 days'
+            AND o.status NOT IN ('cancelled', 'refunded')
+        `, [productId]);
+
+        const previousRes = await pool.query(`
+          SELECT
+            COALESCE(SUM(oi.quantity), 0)::int AS units_sold,
+            COALESCE(SUM(oi.price * oi.quantity), 0)::bigint AS revenue_cents,
+            COUNT(DISTINCT oi.order_id)::int AS order_count
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          WHERE oi.product_id = $1
+            AND o.created_at >= NOW() - INTERVAL '60 days'
+            AND o.created_at <  NOW() - INTERVAL '30 days'
+            AND o.status NOT IN ('cancelled', 'refunded')
+        `, [productId]);
+
+        // ── Daily revenue last 30 days (for chart) ──────────────────────
+        const dailyRes = await pool.query(`
+          SELECT
+            DATE(o.created_at) AS date,
+            COALESCE(SUM(oi.quantity), 0)::int AS units,
+            COALESCE(SUM(oi.price * oi.quantity), 0)::bigint AS revenue_cents,
+            COUNT(DISTINCT oi.order_id)::int AS order_count
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          WHERE oi.product_id = $1
+            AND o.created_at >= NOW() - INTERVAL '30 days'
+            AND o.status NOT IN ('cancelled', 'refunded')
+          GROUP BY DATE(o.created_at)
+          ORDER BY date ASC
+        `, [productId]);
+
+        // ── Return rate: refunded orders containing this product / total orders with it
+        const refundsRes = await pool.query(`
+          SELECT
+            COUNT(DISTINCT CASE WHEN o.status IN ('refunded') THEN oi.order_id END)::int AS refunded_orders,
+            COUNT(DISTINCT oi.order_id)::int AS total_orders
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          WHERE oi.product_id = $1
+        `, [productId]);
+
+        // ── Average order value when this product is in the cart ───────
+        const aovRes = await pool.query(`
+          SELECT COALESCE(AVG(o.total), 0)::bigint AS avg_order_total_cents
+          FROM orders o
+          WHERE o.id IN (
+            SELECT DISTINCT order_id FROM order_items WHERE product_id = $1
+          )
+          AND o.status NOT IN ('cancelled', 'refunded')
+        `, [productId]);
+
+        // ── Recent orders with this product (last 10) ───────────────────
+        const recentRes = await pool.query(`
+          SELECT
+            o.id AS order_id,
+            o.created_at,
+            o.status,
+            o.total::bigint AS total_cents,
+            oi.quantity,
+            oi.price::bigint AS unit_price_cents,
+            u.email AS customer_email
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          LEFT JOIN users u ON u.id = o.user_id
+          WHERE oi.product_id = $1
+          ORDER BY o.created_at DESC
+          LIMIT 10
+        `, [productId]);
+
+        // ── Margin: revenue minus cost-of-goods-sold using current product cost
+        const unitsSold = Number(allTimeRes.rows[0]?.units_sold || 0);
+        const revenueCents = Number(allTimeRes.rows[0]?.revenue_cents || 0);
+        const productCostCents = Number(product.cost || 0);
+        const cogsCents = unitsSold * productCostCents;
+        const marginCents = revenueCents - cogsCents;
+        const marginPct = revenueCents > 0 ? (marginCents / revenueCents) * 100 : 0;
+
+        // Stock turnover = units sold all-time / current stock (treat 0 stock as N/A)
+        const currentStock = Number(product.stock || 0);
+        const stockTurnover = currentStock > 0 ? +(unitsSold / currentStock).toFixed(2) : null;
+
+        const currentUnits = Number(currentRes.rows[0]?.units_sold || 0);
+        const currentRevenue = Number(currentRes.rows[0]?.revenue_cents || 0);
+        const previousUnits = Number(previousRes.rows[0]?.units_sold || 0);
+        const previousRevenue = Number(previousRes.rows[0]?.revenue_cents || 0);
+
+        // Build the daily chart with zero-fills so the client can render a contiguous timeline
+        const dailyMap = new Map<string, { units: number; revenue_cents: number; order_count: number }>();
+        for (const r of dailyRes.rows) {
+          const dateStr = (r.date instanceof Date ? r.date.toISOString() : String(r.date)).slice(0, 10);
+          dailyMap.set(dateStr, {
+            units: Number(r.units || 0),
+            revenue_cents: Number(r.revenue_cents || 0),
+            order_count: Number(r.order_count || 0),
+          });
+        }
+        const dailyChart: Array<{ date: string; units: number; revenue_cents: number; order_count: number }> = [];
+        const today = new Date();
+        for (let i = 29; i >= 0; i--) {
+          const d = new Date(today);
+          d.setUTCDate(d.getUTCDate() - i);
+          const dateStr = d.toISOString().slice(0, 10);
+          const row = dailyMap.get(dateStr);
+          dailyChart.push({
+            date: dateStr,
+            units: row?.units ?? 0,
+            revenue_cents: row?.revenue_cents ?? 0,
+            order_count: row?.order_count ?? 0,
+          });
+        }
+
+        const refundedOrders = Number(refundsRes.rows[0]?.refunded_orders || 0);
+        const totalOrdersWithProduct = Number(refundsRes.rows[0]?.total_orders || 0);
+        const returnRate = totalOrdersWithProduct > 0
+          ? +((refundedOrders / totalOrdersWithProduct) * 100).toFixed(1)
+          : 0;
+
+        const avgOrderTotalCents = Number(aovRes.rows[0]?.avg_order_total_cents || 0);
+
+        return res.json({
+          product,
+          stats: {
+            all_time: {
+              units_sold: unitsSold,
+              revenue_cents: revenueCents,
+              order_count: Number(allTimeRes.rows[0]?.order_count || 0),
+            },
+            current_30d: {
+              units_sold: currentUnits,
+              revenue_cents: currentRevenue,
+              order_count: Number(currentRes.rows[0]?.order_count || 0),
+            },
+            previous_30d: {
+              units_sold: previousUnits,
+              revenue_cents: previousRevenue,
+              order_count: Number(previousRes.rows[0]?.order_count || 0),
+            },
+            delta: {
+              units_pct: previousUnits > 0 ? +(((currentUnits - previousUnits) / previousUnits) * 100).toFixed(1) : null,
+              revenue_pct: previousRevenue > 0 ? +(((currentRevenue - previousRevenue) / previousRevenue) * 100).toFixed(1) : null,
+            },
+            daily_30d: dailyChart,
+            margin_cents: marginCents,
+            margin_pct: +marginPct.toFixed(1),
+            cogs_cents: cogsCents,
+            stock_turnover: stockTurnover,
+            return_rate_pct: returnRate,
+            refunded_orders: refundedOrders,
+            total_orders_with_product: totalOrdersWithProduct,
+            avg_order_total_cents: avgOrderTotalCents,
+          },
+          recent_orders: recentRes.rows.map((r: any) => ({
+            order_id: r.order_id,
+            created_at: r.created_at,
+            status: r.status,
+            total_cents: Number(r.total_cents || 0),
+            quantity: Number(r.quantity || 0),
+            unit_price_cents: Number(r.unit_price_cents || 0),
+            customer_email: r.customer_email || null,
+          })),
+        });
+      }
+
       case 'create-product': {
         if (req.method !== 'POST') return res.status(405).end();
         const b = req.body;
