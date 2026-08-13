@@ -5,8 +5,8 @@ FROM node:22-alpine AS builder
 WORKDIR /app/server
 
 # Install build tool dependencies
-COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --legacy-peer-deps --prefer-offline
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm (npm ci --legacy-peer-deps --prefer-offline || npm install --legacy-peer-deps)
 
 # Copy source files for compilation
 COPY tsconfig.json ./
@@ -35,8 +35,8 @@ RUN mkdir -p /app/server/uploads /app/server/invoices /app/server/catalog-csv &&
     chown -R backend:nodejs /app/server
 
 # Install production dependencies only
-COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --legacy-peer-deps --omit=dev --prefer-offline && \
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm (npm ci --legacy-peer-deps --omit=dev --prefer-offline || npm install --legacy-peer-deps --omit=dev) && \
     chown -R backend:nodejs /app/server/node_modules
 
 # Copy compiled JavaScript dist & assets from builder stage
