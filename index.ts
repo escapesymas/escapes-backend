@@ -32,6 +32,7 @@ import { cdnUrl, cdnBanner } from './lib/uploads-cdn.js';
 import { syncBihrStock, startBihrStockCron, lastBihrStockSync } from './lib/bihr-stock-sync.js';
 import { meiliSearchProducts, reindexMeilisearch, lastReindexSummary, isMeilisearchEnabled, meilisearchBanner } from './lib/search.js';
 import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats } from './lib/stripe-webhook.js';
+import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-webhook-service.js';
 import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
@@ -163,6 +164,10 @@ const db = drizzle(pool);
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount INTEGER DEFAULT 0;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_cost INTEGER DEFAULT 0;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS promo_code VARCHAR(50);
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(50);
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS stripe_charge_id VARCHAR(255);
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS last_payment_error TEXT;
 
       ALTER TABLE forum_posts ADD COLUMN IF NOT EXISTS is_pinned INTEGER DEFAULT 0;
       ALTER TABLE forum_posts ADD COLUMN IF NOT EXISTS is_closed INTEGER DEFAULT 0;
@@ -343,6 +348,10 @@ const orders = pgTable('orders', {
   trackingNumber: varchar('tracking_number', { length: 255 }),
   trackingUrl: varchar('tracking_url', { length: 500 }),
   costTotal: integer('cost_total').default(0),
+  paidAt: timestamp('paid_at'),
+  paymentMethod: varchar('payment_method', { length: 50 }),
+  stripeChargeId: varchar('stripe_charge_id', { length: 255 }),
+  lastPaymentError: text('last_payment_error'),
 });
 
 const orderItems = pgTable('order_items', {
@@ -521,6 +530,34 @@ app.use((req: any, res: any, next: any) => {
       next();
     });
 });
+
+// ================================================================
+// STRIPE WEBHOOKS (Registrado ANTES de express.json() para conservar el req.body Buffer crudo)
+// ================================================================
+const stripeWebhookEndpointHandler = async (req: any, res: any) => {
+  const sig = req.headers['stripe-signature'];
+  let event: any;
+
+  try {
+    event = constructStripeEvent(req.body, sig);
+  } catch (err: any) {
+    console.error('[STRIPE WEBHOOK SIGNATURE ERROR]:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  console.log(`[STRIPE WEBHOOK] Evento verificado: ${event.type} (${event.id})`);
+
+  try {
+    const result = await handleStripeWebhookEvent(event);
+    return res.status(200).json({ received: true, status: result.status });
+  } catch (err: any) {
+    console.error('[STRIPE WEBHOOK PROCESSING ERROR]:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), stripeWebhookEndpointHandler);
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookEndpointHandler);
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -7614,281 +7651,10 @@ async function checkPendingDropshippingOrders() {
   }
 }
 
-// ================================================================
-// STRIPE WEBHOOK
-// ================================================================
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req: any, res: any) => {
-  const sig = req.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  const testWebhookSecret = process.env.STRIPE_TEST_WEBHOOK_SECRET;
-
-  let event: any;
-  try {
-    if (!sig) throw new Error('No Stripe signature header');
-    if (!webhookSecret && !testWebhookSecret) {
-      throw new Error('STRIPE_WEBHOOK_SECRET not configured');
-    }
-    if (testWebhookSecret) {
-      try {
-        event = stripeTest.webhooks.constructEvent(req.body, sig, testWebhookSecret);
-      } catch (e) {
-        // Ignore and check live secret
-      }
-    }
-    if (!event && webhookSecret) {
-      try {
-        event = stripeLive.webhooks.constructEvent(req.body, sig, webhookSecret);
-      } catch (e) {
-        // Ignore
-      }
-    }
-    if (!event) {
-      throw new Error('Signature verification failed');
-    }
-  } catch (err: any) {
-    console.error('[STRIPE WEBHOOK] Signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  console.log(`[STRIPE WEBHOOK] Received event: ${event.type}`);
-
-  // Idempotency guard: if the same event.id has been processed before, the
-  // wrapper short-circuits and returns { status: 'duplicate' }. If the
-  // handler throws, the event is enqueued for retry with exponential
-  // backoff (see processStripeWebhookRetryQueue, run every 5 minutes
-  // below). The Stripe webhook signature check above is what guarantees
-  // the event is genuine; the wrapper guarantees we finalize any given
-  // event at most once.
-  const result = await processStripeEvent(event, async (ctx) => {
-    const event = ctx.event;
-
-    if (event.type === 'payment_intent.succeeded') {
-      const paymentIntent = event.data.object as any;
-      const orderId = paymentIntent.metadata?.orderId;
-
-      if (orderId) {
-        try {
-          await db.execute(sql`
-            UPDATE orders
-            SET status = 'processing', payment_id = ${paymentIntent.id}
-            WHERE id = ${parseInt(orderId)} AND status = 'pending'
-          `);
-
-          const itemsRes = await db.execute(sql`
-            SELECT product_id, quantity FROM order_items WHERE order_id = ${parseInt(orderId)}
-          `);
-          for (const rawItem of itemsRes.rows) {
-            const item = rawItem as any;
-            await db.execute(sql`
-              UPDATE products
-              SET stock = GREATEST(0, stock - ${parseInt(item.quantity as string)})
-              WHERE id = ${parseInt(item.product_id as string)}
-            `);
-          }
-
-          let invoiceRecord: any = null;
-          try {
-            invoiceRecord = await createInvoiceForOrder(parseInt(orderId));
-            console.log(`[STRIPE WEBHOOK] Invoice auto-generated for Order ${orderId}`);
-          } catch (e: any) {
-            console.error(`[STRIPE WEBHOOK] Invoice error for Order ${orderId}:`, e);
-          }
-
-          // Bust product + filter cache: stock was decremented in the loop
-          // above, so the cached catalog listing and any stock/availability
-          // filter facets are now stale.
-          await cacheBust('cache:products');
-          await cacheBust('cache:filters');
-
-          try {
-            const orderRowRes = await db.execute(sql`
-              SELECT total, subtotal, shipping_cost, discount_amount, shipping_data
-              FROM orders WHERE id = ${parseInt(orderId)}
-            `);
-            const orderRow = orderRowRes.rows[0] as any;
-            let customerEmail: string | null = null;
-            let customerName = '';
-            if (paymentIntent.receipt_email) {
-              customerEmail = paymentIntent.receipt_email;
-            } else if (paymentIntent.shipping) {
-              customerEmail = paymentIntent.shipping.email || null;
-            }
-            if (!customerEmail && paymentIntent.metadata && paymentIntent.metadata.customer_email) {
-              customerEmail = paymentIntent.metadata.customer_email;
-            }
-            if (!customerEmail && orderRow && orderRow.shipping_data) {
-              try {
-                const sd = typeof orderRow.shipping_data === 'string' ? JSON.parse(orderRow.shipping_data) : orderRow.shipping_data;
-                customerEmail = sd?.email || null;
-                customerName = [sd?.firstName, sd?.lastName].filter(Boolean).join(' ');
-              } catch {}
-            }
-
-            if (customerEmail) {
-              const totalEur = ((orderRow?.total || 0) / 100).toFixed(2);
-              const invoiceNum = invoiceRecord?.invoice_number || '';
-              const subject = `Pedido #${orderId} confirmado · Escapes y Más`;
-              const text = `Hola${customerName ? ` ${customerName}` : ''},\n\nTu pedido #${orderId} por ${totalEur}€ ha sido confirmado correctamente. Adjuntamos tu factura en PDF.\n\nEn los próximos días recibirás un email con el código de seguimiento cuando tu pedido salga de nuestro almacén.\n\nGracias por confiar en Escapes y Más.\n\nEl equipo de Escapes y Más.`;
-              const html = `<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px">
-  <h2 style="color:#FF6B00;margin-bottom:8px">¡Pedido confirmado!</h2>
-  <p>Hola${customerName ? ` <strong>${customerName}</strong>` : ''},</p>
-  <p>Tu pedido <strong>#${orderId}</strong> por <strong style="color:#FF6B00">${totalEur}€</strong> ha sido confirmado correctamente.</p>
-  ${invoiceNum ? `<p>Factura: <strong>${invoiceNum}</strong> (adjunta en este email).</p>` : ''}
-  <p>En los próximos días recibirás un email con el código de seguimiento cuando tu pedido salga de nuestro almacén.</p>
-  <p style="margin-top:24px">Gracias por confiar en nosotros.</p>
-  <p style="color:#888;font-size:12px;margin-top:24px">Escapes y Más · <a href="https://escapesymas.com">escapesymas.com</a></p>
-</div>`;
-
-              const attachments: any[] = [];
-              if (invoiceRecord && invoiceRecord.pdf_path && fs.existsSync(invoiceRecord.pdf_path)) {
-                attachments.push({
-                  filename: `${invoiceRecord.invoice_number}.pdf`,
-                  path: invoiceRecord.pdf_path,
-                  contentType: 'application/pdf',
-                });
-              }
-
-              const transporter = nodemailer.createTransport({
-                host: process.env.SMTP_HOST || "smtp.buzondecorreo.com",
-                port: parseInt(process.env.SMTP_PORT || "465"),
-                secure: true,
-                auth: { user: process.env.SMTP_USER || "web@escapesymas.com", pass: process.env.SMTP_PASSWORD },
-                tls: { rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true' },
-              });
-              await transporter.sendMail({
-                from: '"Escapes y Más" <web@escapesymas.com>',
-                to: customerEmail,
-                subject,
-                text,
-                html,
-                attachments,
-              });
-              console.log(`[STRIPE WEBHOOK] Confirmation email sent to ${customerEmail} for Order ${orderId}`);
-            } else {
-              console.warn(`[STRIPE WEBHOOK] No customer email found for Order ${orderId}; skipping confirmation email`);
-            }
-          } catch (emailErr: any) {
-            console.error(`[STRIPE WEBHOOK] Failed to send confirmation email for Order ${orderId}:`, emailErr.message);
-          }
-
-          try {
-            const { sendServerSideEvent } = await import('./lib/server-tracking.js');
-            const orderForTrack = await db.execute(sql`
-              SELECT total, shipping_cost, shipping_data FROM orders WHERE id = ${parseInt(orderId)}
-            `);
-            const itemsForTrack = await db.execute(sql`
-              SELECT oi.product_id, oi.price, oi.quantity, p.sku, p.name, p.brand
-              FROM order_items oi
-              LEFT JOIN products p ON p.id = oi.product_id
-              WHERE oi.order_id = ${parseInt(orderId)}
-            `);
-            if (orderForTrack.rows.length > 0) {
-              const orderRow = orderForTrack.rows[0] as any;
-              const totalCents = parseInt(orderRow.total) || 0;
-              const eventId =
-                (paymentIntent.metadata?.event_id as string) ||
-                (paymentIntent.metadata?.eventId as string) ||
-                `purchase_${orderId}_${paymentIntent.id}`;
-              const customerEmail =
-                paymentIntent.receipt_email ||
-                paymentIntent.shipping?.email ||
-                (paymentIntent.metadata?.customer_email as string) ||
-                undefined;
-              const items = (itemsForTrack.rows as any[]).map((it) => ({
-                id: it.product_id?.toString(),
-                sku: it.sku,
-                name: it.name,
-                brand: it.brand,
-                price: parseFloat((parseInt(it.price) / 100).toFixed(2)),
-                quantity: parseInt(it.quantity) || 1,
-              }));
-              const shippingCents = parseInt(orderRow.shipping_cost) || 0;
-              const taxCents = Math.floor(totalCents * 0.21);
-              await sendServerSideEvent({
-                eventName: 'purchase',
-                eventId,
-                userEmail: customerEmail,
-                userAgent: req.headers['user-agent'] as string,
-                clientIp: req.ip,
-                payload: {
-                  currency: 'EUR',
-                  value: totalCents / 100,
-                  shipping: shippingCents / 100,
-                  tax: taxCents / 100,
-                  items,
-                  content_ids: items.map(i => i.id),
-                  content_type: 'product',
-                  num_items: items.length,
-                  transaction_id: paymentIntent.id,
-                },
-              });
-            }
-          } catch (trackErr: any) {
-            console.error(`[STRIPE WEBHOOK] Server-side tracking failed for Order ${orderId}:`, trackErr.message);
-          }
-
-          console.log(`[STRIPE WEBHOOK] Order ${orderId} finalized via payment_intent.succeeded`);
-        } catch (err: any) {
-          console.error(`[STRIPE WEBHOOK] Error finalizing order ${orderId}:`, err);
-        }
-      }
-    }
-
-    if (event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') {
-      const paymentIntent = event.data.object as any;
-      const orderId = paymentIntent.metadata?.orderId;
-      if (orderId) {
-        await db.execute(sql`
-          UPDATE orders SET status = 'cancelled' WHERE id = ${parseInt(orderId)} AND status = 'pending'
-        `);
-        console.log(`[STRIPE WEBHOOK] Order ${orderId} marked as cancelled (${event.type})`);
-      }
-    }
-  });
-
-  res.json({ received: true, status: result.status });
-});
-
-// Daemon de Tracking (cada 15 minutos)
-setInterval(() => {
-  checkPendingDropshippingOrders().catch(e => console.error('[DROPSHIPPING DAEMON INTERVAL ERROR]:', e));
-}, 15 * 60 * 1000);
-
-// Ejecución al iniciar
-checkPendingDropshippingOrders().catch(e => console.error('[DROPSHIPPING DAEMON INITIAL RUN ERROR]:', e));
-
 // Stripe webhook retry queue (cada 5 minutos). Replays events that
-// failed during the original /api/stripe/webhook delivery. Same handler
-// closure as the webhook endpoint, so behavior is identical.
+// failed during the original /api/webhooks/stripe delivery.
 const stripeWebhookRetryHandler = async (ctx: { event: any; receivedAt: Date; attempt: number }) => {
-  // Mirror the relevant business logic from the webhook endpoint. We
-  // recreate the order-finalization + cancellation flows here so retried
-  // events hit the same code paths. The idempotency check inside
-  // processStripeEvent already prevents double-finalization, so this
-  // body can run safely on every retry.
-  const event = ctx.event;
-  if (event.type === 'payment_intent.succeeded') {
-    const paymentIntent = event.data.object as any;
-    const orderId = paymentIntent.metadata?.orderId;
-    if (orderId) {
-      // Update state if not already done — the idempotency check on
-      // stripe_webhook_events will skip this run if the event was
-      // already applied. We still re-run the body to keep behaviour
-      // aligned with the live webhook.
-      await db.execute(sql`
-        UPDATE orders SET status = 'processing', payment_id = ${paymentIntent.id}
-        WHERE id = ${parseInt(orderId)} AND status = 'pending'
-      `);
-    }
-  } else if (event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') {
-    const paymentIntent = event.data.object as any;
-    const orderId = paymentIntent.metadata?.orderId;
-    if (orderId) {
-      await db.execute(sql`
-        UPDATE orders SET status = 'cancelled' WHERE id = ${parseInt(orderId)} AND status = 'pending'
-      `);
-    }
-  }
+  await handleStripeWebhookEvent(ctx.event);
 };
 
 setInterval(() => {
