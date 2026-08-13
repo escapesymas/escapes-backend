@@ -1,4 +1,5 @@
-import { db } from '../index.js';
+import { db } from '../db.js';
+import { sql } from 'drizzle-orm';
 
 interface Migration {
   id: number;
@@ -19,7 +20,7 @@ export async function runMigrations() {
     `);
     
     const result = await db.execute(sql`SELECT id, name FROM migrations ORDER BY id`);
-    const executedMigrations: Migration[] = result.rows as Migration[];
+    const executedMigrations: Migration[] = (result.rows as unknown) as Migration[];
     
     const lastId = executedMigrations.length > 0 
       ? Math.max(...executedMigrations.map(m => m.id)) 

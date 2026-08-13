@@ -12,7 +12,7 @@ module.exports = {
       PORT: 3001,
       DATABASE_URL: 'postgresql://postgres:EscapesPostgres2026Vercel@localhost:5432/escapes_db',
       STRIPE_SECRET_KEY: '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',
-      STRIPE_WEBHOOK_SECRET: 'whsec_bGl2ZV9uVENyTmZ1UFkzUWdOOWlhUjVTdGJtQXlPd2ZOSXRqYVozd2NsQ3BWQTVEQVhtM2gzclhxN0VFbjFQNnFhcg',
+      STRIPE_WEBHOOK_SECRET: 'whsec_We4JFdyXcmbHm8NMWUuO7cjYw5hoPwEX',
       WP_URL: 'https://backendescapes.com',
       BIHR_USERNAME: 'info@escapesymas.com',
       BIHR_MACKEY: '3799B392-3934-4514-ABF0-9EF7F544A117',
