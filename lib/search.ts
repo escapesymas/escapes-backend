@@ -17,6 +17,8 @@
  * restarts must NEVER break the catalog endpoint.
  */
 
+import { pool } from '../db.js';
+
 const MEILI_HOST = (process.env.MEILISEARCH_HOST || '').replace(/\/+$/, '');
 const MEILI_API_KEY = process.env.MEILISEARCH_API_KEY || '';
 const INDEX_NAME = process.env.MEILISEARCH_INDEX || 'products';
@@ -207,9 +209,3 @@ export async function reindexMeilisearch(): Promise<ReindexSummary> {
   console.log(`[SEARCH] reindex done totalDocs=${summary.totalDocs} errors=${summary.errors} durationMs=${summary.durationMs}`);
   return summary;
 }
-
-// Pool is imported lazily so this module can be loaded in test environments
-// without a real database (the only DB-using entry points above are guarded
-// by MEILI_HOST checks). When MEILISEARCH_HOST is unset, the search path
-// never touches the pool.
-import { pool } from '../db.js';

@@ -88,7 +88,8 @@ async function getOrCreateInvoice(orderId: number): Promise<any> {
 
   const year = new Date().getFullYear();
   const countRes = await db.execute(sql`SELECT COUNT(*) as cnt FROM invoices WHERE issued_at >= date_trunc('year', NOW())`);
-  const seqNum = String(Number((countRes.rows[0] as any).cnt) + 1).padStart(6, '0');
+  const cntVal = countRes?.rows?.[0] ? Number((countRes.rows[0] as any).cnt || (countRes.rows[0] as any).count || 0) : 0;
+  const seqNum = String(cntVal + 1).padStart(6, '0');
   const invoiceNumber = `EYMAS-${year}-${seqNum}`;
 
   const itemsRes = await db.execute(sql`
@@ -111,14 +112,14 @@ async function getOrCreateInvoice(orderId: number): Promise<any> {
   }
 
   const subtotal = order.subtotal || order.total || 0;
-  const taxAmount = Math.floor((order.total || 0) * 0.21);
+  const taxAmount = Math.round((order.total || 0) * 21 / 121);
   const invIns = await db.execute(sql`
     INSERT INTO invoices (order_id, invoice_number, subtotal, tax_amount, shipping_cost, discount_amount, total)
     VALUES (${orderId}, ${invoiceNumber}, ${subtotal}, ${taxAmount}, ${order.shipping_cost || 0}, ${order.discount_amount || 0}, ${order.total || 0})
     RETURNING *
   `);
 
-  return invIns.rows[0];
+  return invIns?.rows?.[0] || { invoice_number: invoiceNumber };
 }
 
 /**
