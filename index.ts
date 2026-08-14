@@ -36,6 +36,11 @@ import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-web
 import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
+import { catalogRouter } from './routes/catalog.js';
+import { ordersRouter } from './routes/orders.js';
+import { authRouter } from './routes/auth.js';
+import { bihrRouter } from './routes/bihr.js';
+import { adminRouter } from './routes/admin.js';
 
 // Initialize Sentry as early as possible so subsequent unhandled errors are
 // captured. No-op when SENTRY_DSN is unset (local dev).
@@ -399,15 +404,23 @@ const app: any = express();
 app.set('trust proxy', 1);
 
 const allowedOrigins = isProduction
-  ? ['https://escapesymas.com', 'https://www.escapesymas.com']
+  ? [
+      'https://escapesymas.com',
+      'https://www.escapesymas.com',
+      'https://admin.escapesymas.com',
+      'https://backendescapes.com',
+    ]
   : [
       'https://escapesymas.com',
       'https://www.escapesymas.com',
+      'https://admin.escapesymas.com',
+      'https://backendescapes.com',
       'https://test.escapesymas.com',
       'http://localhost:5173',
       'http://localhost:5174',
       'http://localhost:5175',
       'http://localhost:3000',
+      'http://localhost:3001',
       'http://localhost:3002',
     ];
 
@@ -560,6 +573,12 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), stri
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookEndpointHandler);
 
 app.use(express.json({ limit: '10mb' }));
+
+app.use('/api', catalogRouter);
+app.use('/api', ordersRouter);
+app.use('/api', authRouter);
+app.use('/api', bihrRouter);
+app.use('/api', adminRouter);
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -1075,7 +1094,12 @@ app.get('/api/admin/disk-usage', async (_req: any, res: any) => {
   try {
     // 1. `df -h` overall
     let dfOutput = '';
-    try { dfOutput = execSync('df -h', { encoding: 'utf-8' }); } catch (e: any) { dfOutput = 'df failed: ' + (e?.message || String(e)); }
+    try {
+      const { stdout } = await execPromise('df -h', { timeout: 10_000 });
+      dfOutput = stdout;
+    } catch (e: any) {
+      dfOutput = 'df failed: ' + (e?.message || String(e));
+    }
     // 2. `du` of every top-level item we care about
     const targets = [
       '/app/server',
@@ -1092,31 +1116,35 @@ app.get('/api/admin/disk-usage', async (_req: any, res: any) => {
     const duResults: { path: string; size: string; raw: string }[] = [];
     for (const p of targets) {
       try {
-        const out = execSync(`du -sh ${p} 2>/dev/null || echo "0\t${p}"`, { encoding: 'utf-8' }).trim();
+        const { stdout } = await execPromise(`du -sh ${p} 2>/dev/null || echo "0\t${p}"`, { timeout: 10_000 });
+        const out = stdout.trim();
         const parts = out.split(/\s+/);
         duResults.push({ path: p, size: parts[0] || '0', raw: out });
       } catch (e: any) {
         duResults.push({ path: p, size: 'err', raw: e?.message || String(e) });
       }
     }
-    // 3. Docker image sizes (coolify often retains N+1 images)
+    // 3. Docker image sizes
     let dockerImages = '';
     try {
-      dockerImages = execSync('docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" 2>/dev/null', { encoding: 'utf-8' });
+      const { stdout } = await execPromise('docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" 2>/dev/null', { timeout: 10_000 });
+      dockerImages = stdout;
     } catch (e: any) {
       dockerImages = 'docker not available: ' + (e?.message || String(e));
     }
     // 4. Docker container sizes
     let dockerContainers = '';
     try {
-      dockerContainers = execSync('docker ps -a --format "{{.Names}} {{.Size}}" 2>/dev/null', { encoding: 'utf-8' });
+      const { stdout } = await execPromise('docker ps -a --format "{{.Names}} {{.Size}}" 2>/dev/null', { timeout: 10_000 });
+      dockerContainers = stdout;
     } catch (e: any) {
       dockerContainers = 'docker not available: ' + (e?.message || String(e));
     }
-    // 5. Docker dangling images count via `docker image ls -f dangling=true`
+    // 5. Docker dangling images count
     let danglingImages = '';
     try {
-      danglingImages = execSync('docker images -f "dangling=true" --format "{{.ID}} {{.Size}}" 2>/dev/null', { encoding: 'utf-8' });
+      const { stdout } = await execPromise('docker images -f "dangling=true" --format "{{.ID}} {{.Size}}" 2>/dev/null', { timeout: 10_000 });
+      danglingImages = stdout;
     } catch (e: any) {
       danglingImages = 'docker not available: ' + (e?.message || String(e));
     }
@@ -1150,9 +1178,12 @@ app.post('/api/admin/docker-prune', async (req: any, res: any) => {
     } else {
       return res.status(400).json({ error: 'action must be one of: images, all, containers, builder' });
     }
-    const output = execSync(cmd, { encoding: 'utf-8', timeout: 120_000 });
+    const { stdout: output } = await execPromise(cmd, { timeout: 120_000 });
     let dfAfter = '';
-    try { dfAfter = execSync('df -h /', { encoding: 'utf-8' }); } catch {}
+    try {
+      const { stdout } = await execPromise('df -h /', { timeout: 10_000 });
+      dfAfter = stdout;
+    } catch {}
     res.json({ ok: true, action, cmd, output: output || '(no output)', dfAfter });
   } catch (err: any) {
     res.status(500).json({ error: err.message, code: err.code, stderr: err?.stderr?.toString() });
@@ -1166,9 +1197,12 @@ app.post('/api/admin/docker-image-rm', async (req: any, res: any) => {
     const id = String(req.body?.id || '').trim();
     if (!id) return res.status(400).json({ error: 'id is required' });
     if (!/^[a-f0-9]{6,64}$/.test(id)) return res.status(400).json({ error: 'invalid id format' });
-    const output = execSync(`docker rmi -f ${id}`, { encoding: 'utf-8', timeout: 60_000 });
+    const { stdout: output } = await execPromise(`docker rmi -f ${id}`, { timeout: 60_000 });
     let dfAfter = '';
-    try { dfAfter = execSync('df -h /', { encoding: 'utf-8' }); } catch {}
+    try {
+      const { stdout } = await execPromise('df -h /', { timeout: 10_000 });
+      dfAfter = stdout;
+    } catch {}
     res.json({ ok: true, id, output: output || '(no output)', dfAfter });
   } catch (err: any) {
     res.status(500).json({ error: err.message, code: err.code, stderr: err?.stderr?.toString() });
@@ -2583,212 +2617,6 @@ app.get('/api/search/suggestions', async (req, res) => {
   }
 });
 
-app.get('/api/catalog/products', catalogLimiter, async (req, res) => {
-  try {
-    const { search, category_id, category_slug, page = '1', per_page = '20', universal, brand, min_price, max_price, in_stock, attrs } = req.query as any;
-    const pageNum = parseInt(page) || 1;
-    const perPage = Math.min(parseInt(per_page) || 20, 50);
-    const offset = (pageNum - 1) * perPage;
-
-    // Redis-backed cache layer: short TTL (60s) shared across all server instances,
-    // on top of the per-process SWR cache. On hit we short-circuit and return
-    // immediately without touching Postgres or Drizzle.
-    const queryStr = JSON.stringify(req.query);
-    const redisKey = queryStr.length > 200
-      ? `cache:products:${crypto.createHash('sha256').update(queryStr).digest('hex')}`
-      : `cache:products:${queryStr}`;
-    const cached = await cacheGet<{ products: any[]; total: number; totalPages: number }>(redisKey);
-    if (cached) {
-      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages');
-      res.setHeader('X-WP-Total', cached.total.toString());
-      res.setHeader('X-WP-TotalPages', cached.totalPages.toString());
-      return res.json(cached.products);
-    }
-
-    const cacheKey = `/api/catalog/products?search=${search || ''}&category_id=${category_id || ''}&page=${page}&per_page=${per_page}&universal=${universal || ''}&brand=${brand || ''}&min_price=${min_price || ''}&max_price=${max_price || ''}&in_stock=${in_stock || ''}&attrs=${attrs || ''}`;
-
-    const result = await executeSWR(cacheKey, async () => {
-      const conditions = sql`WHERE status IN ('published', 'active') AND name NOT LIKE 'Aplicaciones:%' AND name NOT LIKE 'Applications:%' AND sku NOT LIKE 'Aplicaciones:%' AND sku NOT LIKE 'Applications:%'`;
-
-      if (universal === 'true') {
-        conditions.append(sql` AND (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')`);
-      }
-
-      // Meilisearch fast path: when search= is set and Meili is reachable,
-      // we get a fuzzy/typo-tolerant ID list and use it as a structural
-      // filter so the catalog query still applies brand/price/category
-      // narrowing. Fall back to ILIKE if Meili is unreachable or returns no
-      // hits so search never breaks the catalog endpoint.
-      let meiliIds: number[] | null = null;
-      if (search && isMeilisearchEnabled()) {
-        // Ask for a generous slice so category/brand narrowing still has
-        // something to filter through.
-        const m = await meiliSearchProducts(String(search), Math.max(perPage * 5, 200), 0);
-        if (m && m.ids.length > 0) {
-          meiliIds = m.ids;
-        }
-      }
-
-      if (search) {
-        if (meiliIds) {
-          // Use the Meili IDs as the source of truth. Empty list means
-          // "Meili said nothing matches" — short-circuit to an empty page.
-          if (meiliIds.length === 0) {
-            return { products: [], total: 0, totalPages: 0 };
-          }
-          conditions.append(sql` AND p.id = ANY(${meiliIds}::int[])`);
-        } else {
-          // Fallback: ILIKE across name/sku/description/supplier_code/etc.
-          const searchPattern = `%${sanitizeLike(search)}%`;
-          conditions.append(sql`
-            AND (
-              LOWER(name) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-              OR LOWER(sku) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-              OR LOWER(description) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-              OR LOWER(supplier_code) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-              OR LOWER(barcode) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-              OR LOWER(old_part_number) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-            )`);
-        }
-      }
-
-      // Filter params
-      if (brand) {
-        // Accept either a single brand ("RST") or a comma-separated list
-        // ("RST,SHARK,Held"). The carousel for the homepage "Equipamiento
-        // destacado" section pulls from several pilot-gear brands so it
-        // shows a mix of categories rather than one brand's dominant type.
-        const brandList = String(brand)
-          .split(',')
-          .map((b) => b.trim())
-          .filter(Boolean);
-        if (brandList.length === 1) {
-          conditions.append(sql` AND LOWER(brand) = LOWER(${brandList[0]})`);
-        } else if (brandList.length > 1) {
-          // Build OR chain with parameterized values to avoid SQL injection
-          const orChain = brandList
-            .map((b) => sql`LOWER(brand) = LOWER(${b})`)
-            .reduce((acc, frag, i) => (i === 0 ? frag : sql`${acc} OR ${frag}`));
-          conditions.append(sql` AND (${orChain})`);
-        }
-      }
-      if (min_price) {
-        const mp = parseInt(min_price);
-        if (!isNaN(mp)) conditions.append(sql` AND price >= ${mp * 100}`);
-      }
-      if (max_price) {
-        const mp = parseInt(max_price);
-        if (!isNaN(mp)) conditions.append(sql` AND price <= ${mp * 100}`);
-      }
-      if (in_stock === 'true') {
-        conditions.append(sql` AND stock > 0`);
-      }
-      if (req.query.has_image === 'true') {
-        // Excludes the no-image:* placeholders the downloader leaves behind
-        // for brands/products where Bihr doesn't have an image. Matches
-        // "real" images by the .webp extension on src fields.
-        conditions.append(sql` AND images IS NOT NULL AND images::text NOT LIKE '%no-image%' AND images::text LIKE '%.webp%'`);
-      }
-      if (attrs) {
-        try {
-          const attrsObj = JSON.parse(attrs);
-          if (typeof attrsObj === 'object' && !Array.isArray(attrsObj)) {
-            conditions.append(sql` AND attributes @> ${attrsObj}::jsonb`);
-          }
-        } catch {}
-      }
-
-      if (category_id) {
-        const catId = parseInt(category_id);
-        if (!isNaN(catId)) {
-          const parentId = Math.floor(catId / 100);
-          conditions.append(sql`
-            AND (
-              category_id IN (
-                WITH RECURSIVE descendants AS (
-                  SELECT id FROM categories WHERE id = ${catId}
-                  UNION ALL
-                  SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-                )
-                SELECT id FROM descendants
-              )
-              OR (category_id = ${parentId})
-            )`);
-        }
-      }
-      if (category_slug && !category_id) {
-        const slugLower = String(category_slug).toLowerCase();
-        conditions.append(sql`
-          AND category_id IN (
-            WITH RECURSIVE descendants AS (
-              SELECT id FROM categories WHERE LOWER(slug) LIKE ${'%' + slugLower + '%'} OR LOWER(name) LIKE ${'%' + slugLower + '%'}
-              UNION ALL
-              SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-            )
-            SELECT id FROM descendants
-          )`);
-      }
-
-      const countRes = await db.execute(sql`SELECT count(*) as total FROM (SELECT 1 FROM products ${conditions} LIMIT 10000) sub`);
-      const total = Number(countRes.rows[0]?.total || 0);
-      const totalPages = total > 10000 ? Math.ceil(10000 / perPage) : Math.ceil(total / perPage) || 1;
-
-      // When Meili gave us an ID list, the relevance order is in that
-      // array — so we fetch ALL matching rows from Postgres, sort by the
-      // Meili index in JS, and paginate in memory. The slice is bounded
-      // by `perPage * 5 = 100-250 rows` so this stays cheap.
-      if (meiliIds && meiliIds.length > 0) {
-        const allRes = await db.execute(sql`
-          SELECT p.*,
-                 COALESCE((SELECT avg_rating FROM product_rating_stats WHERE product_id = p.id), 0) AS avg_rating,
-                 COALESCE((SELECT review_count FROM product_rating_stats WHERE product_id = p.id), 0) AS review_count
-          FROM products p
-          ${conditions}
-        `);
-        const byId = new Map<number, any>();
-        for (const row of allRes.rows as any[]) byId.set(row.id, row);
-        const ordered = meiliIds
-          .map((id) => byId.get(id))
-          .filter((r): r is any => Boolean(r));
-        const total = ordered.length;
-        const totalPages = Math.max(1, Math.ceil(total / perPage));
-        const slice = ordered.slice(offset, offset + perPage);
-        const products = slice.map(mapProductToFrontend);
-        return { products, total, totalPages };
-      }
-
-      const productsRes = await db.execute(sql`
-        SELECT * FROM (
-          SELECT DISTINCT ON (split_part(p.name, ',', 1))
-            p.*,
-            COALESCE((SELECT avg_rating FROM product_rating_stats WHERE product_id = p.id), 0) AS avg_rating,
-            COALESCE((SELECT review_count FROM product_rating_stats WHERE product_id = p.id), 0) AS review_count
-          FROM products p
-          ${conditions}
-          ORDER BY split_part(p.name, ',', 1), p.stock DESC, p.id ASC
-        ) distinct_products
-        ORDER BY ${req.query.sort === 'random' ? sql`RANDOM()` : sql`created_at DESC`}
-        LIMIT ${perPage} OFFSET ${offset}
-      `);
-      const products = productsRes.rows.map(mapProductToFrontend);
-
-      return { products, total, totalPages };
-    }, 60, 600);
-
-    res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages');
-    res.setHeader('X-WP-Total', result.total.toString());
-    res.setHeader('X-WP-TotalPages', result.totalPages.toString());
-
-    // Populate the shared Redis cache (60s TTL) so subsequent requests — including
-    // those landing on other server replicas — can skip Postgres entirely.
-    await cacheSet(redisKey, result, 60);
-
-    res.json(result.products);
-  } catch (err: any) {
-    console.error('[CATALOG ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ================================================================
 // FILTER OPTIONS
@@ -3601,8 +3429,8 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         let diskStats = { total: "115G", used: "20.5G", free: "94.5G", percent: "18%" };
         try {
-          const dfOutput = execSync("df -h / | tail -n 1").toString();
-          const parts = dfOutput.split(/\s+/);
+          const { stdout: dfOutput } = await execPromise("df -h / | tail -n 1", { timeout: 5000 });
+          const parts = dfOutput.trim().split(/\s+/);
           if (parts.length >= 5) {
             diskStats = {
               total: parts[1],

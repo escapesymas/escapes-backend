@@ -41,6 +41,26 @@ export function verifyJWT(token: string): any | null {
   }
 }
 
+export function authenticateRequest(req: any): any | null {
+  const authHeader = req.headers?.authorization;
+  if (authHeader?.startsWith?.('Bearer ')) {
+    const user = verifyJWT(authHeader.substring(7));
+    if (user) return user;
+  }
+
+  const cookieHeader = req.headers?.cookie || '';
+  const cookies: Record<string, string> = {};
+  cookieHeader.split(';').forEach((part: string) => {
+    const [k, ...v] = part.trim().split('=');
+    if (k) cookies[k] = decodeURIComponent(v.join('='));
+  });
+  if (cookies.eym_jwt) {
+    const user = verifyJWT(cookies.eym_jwt);
+    if (user) return user;
+  }
+  return null;
+}
+
 export function hashPasswordSHA256(password: string): string {
   return crypto.createHash('sha256').update(password).digest('hex');
 }

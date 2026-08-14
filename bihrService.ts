@@ -2,6 +2,7 @@ import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { pool } from './db.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -473,9 +474,6 @@ async function downloadAndProcessCatalog(downloadId: string, catalogType: string
 /**
  * Analiza el JSON importado e inserta/actualiza los productos en PostgreSQL
  */
-import pkg from 'pg';
-const { Pool } = pkg;
-
 const BATCH_SIZE = 100;
 
 async function processCatalogJson(filePath: string, catalogType: string, startTime: string) {
@@ -495,12 +493,6 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
     totalItems: references.length,
     inserted: 0,
     updated: 0
-  });
-
-  const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: false,
-    max: 5
   });
 
   console.log('[BIHR SERVICE]: Comenzando upsert masivo en PostgreSQL...');
@@ -570,7 +562,7 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
         
         // Si no tenemos cost ni price, no procesamos este producto
         if (cost === 0 && price === 0) {
-          return null;
+          continue;
         }
         
         // Si tenemos price pero no cost, calculamos cost desde price (IVA20%)
@@ -715,7 +707,6 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
     }
   }
   
-  await pool.end();
   console.log(`[BIHR SERVICE]: Importación completada. Nuevos: ${totalInserted}, Actualizados: ${totalUpdated}`);
   
   updateCatalogSyncState({
