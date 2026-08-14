@@ -144,9 +144,117 @@ authRouter.get('/auth', async (req, res) => {
 // POST /api/auth
 authRouter.post('/auth', async (req, res) => {
   const { action } = req.query as any;
-  const body = req.body;
+  const body = req.body || {};
 
   try {
+    if (action === 'get-profile') {
+      const email = body?.email || req.query?.email;
+      const id = body?.id || body?.userId || req.query?.id;
+      if (!email && !id) return res.status(400).json({ error: 'Falta email o id' });
+
+      const conditions = sql`WHERE 1=1`;
+      if (email) {
+        conditions.append(sql` AND LOWER(email) = LOWER(${email})`);
+      } else if (id) {
+        const safeId = parseIntSafe(id);
+        if (!safeId) return res.status(400).json({ error: 'ID inválido' });
+        conditions.append(sql` AND id = ${safeId}`);
+      }
+
+      const userRes = await db.execute(sql`SELECT * FROM users ${conditions}`);
+      if (userRes.rows.length === 0) {
+        return res.status(404).json({ error: 'Usuario no encontrado' });
+      }
+
+      const user = userRes.rows[0] as any;
+      let billing = { address_1: '', city: '', postcode: '', phone: '' };
+      try {
+        if (user.billing) {
+          billing = typeof user.billing === 'string' ? JSON.parse(user.billing) : user.billing;
+        }
+      } catch (e) {}
+
+      let garage: any[] = [];
+      try {
+        if (user.garage) {
+          garage = typeof user.garage === 'string' ? JSON.parse(user.garage) : user.garage;
+        }
+      } catch (e) {}
+
+      let cart: any[] = [];
+      try {
+        if (user.cart) {
+          cart = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
+        }
+      } catch (e) {}
+
+      return res.json({
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        firstName: user.first_name || '',
+        lastName: user.last_name || '',
+        avatarUrl: user.avatar_url || '',
+        role: user.role || 'customer',
+        rank: user.rank || 'Novato',
+        xp: user.xp || 0,
+        billing,
+        garage,
+        cart
+      });
+    }
+
+    if (action === 'update-profile') {
+      const userId = body.userId || body.id;
+      if (!userId) return res.status(400).json({ error: 'Falta ID de usuario' });
+
+      const updates: string[] = [];
+      if (body.firstName !== undefined) updates.push(`first_name = ${sql`${body.firstName}`}`);
+      if (body.lastName !== undefined) updates.push(`last_name = ${sql`${body.lastName}`}`);
+      if (body.avatarUrl !== undefined) updates.push(`avatar_url = ${sql`${body.avatarUrl}`}`);
+      if (body.billing !== undefined) updates.push(`billing = ${sql`${JSON.stringify(body.billing)}`}`);
+      if (body.garage !== undefined) updates.push(`garage = ${sql`${JSON.stringify(body.garage)}`}`);
+
+      await db.execute(sql`
+        UPDATE users SET
+          first_name = COALESCE(${body.firstName ?? null}, first_name),
+          last_name = COALESCE(${body.lastName ?? null}, last_name),
+          avatar_url = COALESCE(${body.avatarUrl ?? null}, avatar_url),
+          billing = CASE WHEN ${body.billing ? true : false} THEN ${JSON.stringify(body.billing || {})}::jsonb ELSE billing END,
+          garage = CASE WHEN ${body.garage ? true : false} THEN ${JSON.stringify(body.garage || [])}::jsonb ELSE garage END
+        WHERE id = ${parseIntSafe(userId)}
+      `);
+
+      return res.json({ success: true });
+    }
+
+    if (action === 'change-password') {
+      const { userId, currentPassword, newPassword } = body;
+      if (!userId || !currentPassword || !newPassword) {
+        return res.status(400).json({ error: 'Faltan datos obligatorios' });
+      }
+
+      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${parseIntSafe(userId)}`);
+      if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+      const user = userRes.rows[0] as any;
+      const isValid = await verifyPassword(currentPassword, user.password_hash);
+      if (!isValid) return res.status(400).json({ error: 'La contraseña actual es incorrecta' });
+
+      const newHash = await hashPassword(newPassword);
+      await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${user.id}`);
+      return res.json({ success: true });
+    }
+
+    if (action === 'delete-account') {
+      const { userId } = body;
+      if (!userId) return res.status(400).json({ error: 'Falta ID de usuario' });
+
+      await db.execute(sql`DELETE FROM users WHERE id = ${parseIntSafe(userId)}`);
+      clearAuthCookie(res);
+      return res.json({ success: true });
+    }
+
     if (action === 'login' || action === 'social-login') {
       const { username, password } = body;
       if (!username) return res.status(400).json({ error: 'Falta email o usuario' });
