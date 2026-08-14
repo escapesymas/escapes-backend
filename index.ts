@@ -4472,6 +4472,166 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         return res.json({ success: true });
       }
 
+      // ==========================================
+      // REVIEWS ADMIN MANAGEMENT
+      // ==========================================
+      case 'reviews-list': {
+        const { search = '', status = 'all', rating = 'all', page = '1', limit = '20' } = req.query as any;
+        const pageNum = Math.max(1, parseInt(page) || 1);
+        const limitNum = Math.max(1, Math.min(100, parseInt(limit) || 20));
+        const offsetNum = (pageNum - 1) * limitNum;
+
+        let whereConditions = [];
+        if (status && status !== 'all') {
+          whereConditions.push(sql`r.status = ${status}`);
+        }
+        if (rating && rating !== 'all' && !isNaN(parseInt(rating))) {
+          whereConditions.push(sql`r.rating = ${parseInt(rating)}`);
+        }
+        if (search && search.trim() !== '') {
+          const s = `%${search.trim()}%`;
+          whereConditions.push(sql`(
+            r.title ILIKE ${s} OR 
+            r.content ILIKE ${s} OR 
+            p.name ILIKE ${s} OR 
+            p.sku ILIKE ${s} OR 
+            u.email ILIKE ${s} OR 
+            u.first_name ILIKE ${s} OR 
+            u.last_name ILIKE ${s}
+          )`);
+        }
+
+        const whereClause = whereConditions.length > 0
+          ? sql`WHERE ${sql.join(whereConditions, sql` AND `)}`
+          : sql``;
+
+        const reviewsRes = await db.execute(sql`
+          SELECT 
+            r.id, r.product_id, r.user_id, r.order_id, r.rating, r.title, r.content,
+            r.verified_purchase, r.status, r.created_at, r.updated_at,
+            p.name as product_name, p.sku as product_sku, p.images as product_images,
+            u.email as user_email, COALESCE(u.username, CONCAT(u.first_name, ' ', u.last_name), 'Usuario') as username
+          FROM product_reviews r
+          LEFT JOIN products p ON r.product_id = p.id
+          LEFT JOIN users u ON r.user_id = u.id
+          ${whereClause}
+          ORDER BY r.created_at DESC
+          LIMIT ${limitNum} OFFSET ${offsetNum}
+        `);
+
+        const countRes = await db.execute(sql`
+          SELECT COUNT(*) as total FROM product_reviews r
+          LEFT JOIN products p ON r.product_id = p.id
+          LEFT JOIN users u ON r.user_id = u.id
+          ${whereClause}
+        `);
+
+        const statsRes = await db.execute(sql`
+          SELECT 
+            COUNT(*) as total,
+            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+            COUNT(CASE WHEN status = 'approved' THEN 1 END) as approved,
+            COUNT(CASE WHEN status = 'rejected' THEN 1 END) as rejected,
+            COALESCE(AVG(rating)::numeric(2,1), 0) as average
+          FROM product_reviews
+        `);
+
+        const statsRow = statsRes.rows[0] as any;
+
+        return res.json({
+          reviews: reviewsRes.rows,
+          total: parseInt((countRes.rows[0] as any)?.total || '0'),
+          stats: {
+            total: parseInt(statsRow?.total || '0'),
+            pending: parseInt(statsRow?.pending || '0'),
+            approved: parseInt(statsRow?.approved || '0'),
+            rejected: parseInt(statsRow?.rejected || '0'),
+            average: parseFloat(statsRow?.average || '0')
+          }
+        });
+      }
+
+      case 'update-review-status': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { reviewId, status } = req.body;
+        if (!reviewId || !['pending', 'approved', 'rejected'].includes(status)) {
+          return res.status(400).json({ error: 'reviewId y status válidos son requeridos' });
+        }
+
+        const updateRes = await db.execute(sql`
+          UPDATE product_reviews 
+          SET status = ${status}, updated_at = NOW()
+          WHERE id = ${parseInt(reviewId)}
+          RETURNING product_id
+        `);
+
+        if (updateRes.rows.length === 0) {
+          return res.status(404).json({ error: 'Reseña no encontrada' });
+        }
+
+        const productId = (updateRes.rows[0] as any).product_id;
+
+        // Recalcular estadísticas del producto afectado
+        const pStats = await db.execute(sql`
+          SELECT 
+            COALESCE(AVG(rating)::numeric(2,1), 0) as avg_rating,
+            COUNT(*) as review_count
+          FROM product_reviews
+          WHERE product_id = ${productId} AND status = 'approved'
+        `);
+
+        const avg = parseFloat((pStats.rows[0] as any)?.avg_rating || '0');
+        const count = parseInt((pStats.rows[0] as any)?.review_count || '0');
+
+        await db.execute(sql`
+          INSERT INTO product_rating_stats (product_id, avg_rating, review_count, updated_at)
+          VALUES (${productId}, ${avg}, ${count}, NOW())
+          ON CONFLICT (product_id) 
+          DO UPDATE SET avg_rating = EXCLUDED.avg_rating, review_count = EXCLUDED.review_count, updated_at = NOW()
+        `);
+
+        return res.json({ success: true, productId, avg_rating: avg, review_count: count });
+      }
+
+      case 'delete-review': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { reviewId } = req.body;
+        if (!reviewId) return res.status(400).json({ error: 'reviewId es requerido' });
+
+        const reviewRes = await db.execute(sql`
+          SELECT product_id FROM product_reviews WHERE id = ${parseInt(reviewId)}
+        `);
+
+        if (reviewRes.rows.length === 0) {
+          return res.status(404).json({ error: 'Reseña no encontrada' });
+        }
+
+        const productId = (reviewRes.rows[0] as any).product_id;
+
+        await db.execute(sql`DELETE FROM product_reviews WHERE id = ${parseInt(reviewId)}`);
+
+        // Recalcular estadísticas
+        const pStats = await db.execute(sql`
+          SELECT 
+            COALESCE(AVG(rating)::numeric(2,1), 0) as avg_rating,
+            COUNT(*) as review_count
+          FROM product_reviews
+          WHERE product_id = ${productId} AND status = 'approved'
+        `);
+
+        const avg = parseFloat((pStats.rows[0] as any)?.avg_rating || '0');
+        const count = parseInt((pStats.rows[0] as any)?.review_count || '0');
+
+        await db.execute(sql`
+          INSERT INTO product_rating_stats (product_id, avg_rating, review_count, updated_at)
+          VALUES (${productId}, ${avg}, ${count}, NOW())
+          ON CONFLICT (product_id) 
+          DO UPDATE SET avg_rating = EXCLUDED.avg_rating, review_count = EXCLUDED.review_count, updated_at = NOW()
+        `);
+
+        return res.json({ success: true, productId });
+      }
+
       case 'send-dropshipping-order': {
         if (req.method !== 'POST') return res.status(405).end();
         const { orderId } = req.body;
