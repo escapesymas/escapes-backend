@@ -295,12 +295,6 @@ authRouter.post('/auth', async (req, res) => {
 
       return res.json({
         token,
-        user_id: user.id,
-        user_email: user.email,
-        user_nicename: user.username,
-        user_display_name: user.first_name || user.username,
-        avatarUrl: user.avatar_url || '',
-        role: user.role || 'customer',
         user: {
           id: user.id,
           username: user.username,
@@ -342,12 +336,6 @@ authRouter.post('/auth', async (req, res) => {
 
       return res.json({
         token,
-        user_id: user.id,
-        user_email: user.email,
-        user_nicename: user.username,
-        user_display_name: user.first_name || user.username,
-        avatarUrl: user.avatar_url || '',
-        role: user.role || 'customer',
         user: {
           id: user.id,
           username: user.username,
