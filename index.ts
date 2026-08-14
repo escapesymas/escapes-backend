@@ -6734,8 +6734,8 @@ processAbandonedCartEmails().catch(e => console.error('[ABANDONED CART CRON INIT
 // ================================================================
 app.post('/api/cart', async (req: any, res: any) => {
   try {
-    const { userId, sessionToken, items, userEmail, userFirstName, userLastName, userUsername } = req.body || {};
-    if (!sessionToken) return res.json({ items: [] });
+    const { userId, sessionToken, items, userEmail, userFirstName, userLastName, userUsername } = req.body;
+    if (!sessionToken) return res.status(400).json({ error: 'Falta sessionToken' });
     const itemsStr = JSON.stringify(items || []);
 
     const safeUserId = userId && userId !== 'undefined' ? parseInt(userId) : null;
@@ -6944,7 +6944,7 @@ app.post('/api/cart/recover/:token', async (req: any, res: any) => {
 app.get('/api/cart', async (req: any, res: any) => {
   try {
     const { sessionToken, userId } = req.query as any;
-    if (!sessionToken) return res.json({ items: [] });
+    if (!sessionToken) return res.status(400).json({ error: 'Falta sessionToken' });
 
     let cartRes;
     if (userId && userId !== 'undefined') {
@@ -7580,14 +7580,7 @@ app.get('/api/checkout-session', async (req: any, res: any) => {
 // ================================================================
 app.get('/api/reviews/:productId', async (req, res) => {
   try {
-    const productId = parseInt(req.params.productId, 10);
-    if (isNaN(productId)) {
-      return res.json({
-        reviews: [],
-        total: 0,
-        stats: { average: 0, total: 0, distribution: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 } }
-      });
-    }
+    const productId = parseInt(req.params.productId);
     const { limit = '10', offset = '0' } = req.query as any;
     
     const reviewsRes = await db.execute(sql`
