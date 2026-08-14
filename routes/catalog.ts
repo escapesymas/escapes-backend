@@ -149,21 +149,46 @@ export function mapProductToFrontend(row: any) {
   };
 }
 
+let catalogDataCache: any = null;
+function getCatalogData() {
+  if (!catalogDataCache) {
+    const p = path.join(process.cwd(), 'moto_catalog.json');
+    if (fs.existsSync(p)) {
+      catalogDataCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    } else {
+      const p2 = path.join(__dirname, '..', 'moto_catalog.json');
+      if (fs.existsSync(p2)) {
+        catalogDataCache = JSON.parse(fs.readFileSync(p2, 'utf-8'));
+      }
+    }
+  }
+  return catalogDataCache;
+}
+
 // GET /api/vehicles
-catalogRouter.get('/vehicles', async (_req, res) => {
+catalogRouter.get('/vehicles', async (req, res) => {
+  const { action, brand, model } = req.query as any;
   try {
-    const redisKey = 'cache:vehicles';
+    const redisKey = `cache:vehicles:${action || ''}:${brand || ''}:${model || ''}`;
     const cached = await cacheGet<any>(redisKey);
     if (cached) return res.json(cached);
 
-    const result = await db.execute(sql`
-      SELECT brand, model, year_from, year_to
-      FROM vehicle_fitments
-      ORDER BY brand ASC, model ASC
-    `);
+    const catalog = getCatalogData();
+    const hierarchy = catalog?.hierarchy || {};
 
-    await cacheSet(redisKey, result.rows, 3600);
-    res.json(result.rows);
+    let responseData: any = [];
+    if (action === 'brands') {
+      responseData = Object.keys(hierarchy).sort();
+    } else if (action === 'models') {
+      responseData = Object.keys(hierarchy[brand] || {}).sort();
+    } else if (action === 'years') {
+      responseData = Object.keys(hierarchy[brand]?.[model] || {}).sort((a: any, b: any) => b - a);
+    } else {
+      responseData = Object.keys(hierarchy).sort();
+    }
+
+    await cacheSet(redisKey, responseData, 3600);
+    res.json(responseData);
   } catch (err: any) {
     console.error('[VEHICLES ROUTE ERROR]:', err);
     res.status(500).json({ error: err.message });
