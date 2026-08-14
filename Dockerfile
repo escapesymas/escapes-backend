@@ -44,8 +44,8 @@ RUN --mount=type=cache,target=/root/.npm (npm ci --legacy-peer-deps --omit=dev -
 # Copy compiled JavaScript dist & assets from builder stage
 COPY --chown=backend:nodejs --from=builder /app/server/dist ./dist
 COPY --chown=backend:nodejs templates/ ./templates/
-COPY --chown=backend:nodejs moto_catalog.json ./
-COPY --chown=backend:nodejs catalog-csv.zip ./catalog-csv.zip
+COPY --chown=backend:nodejs moto_catalog.jso[n] ./
+COPY --chown=backend:nodejs catalog-csv.zi[p] ./
 
 # Infra post-deploy hook
 COPY --chown=root:root infra/escapes-post-deploy.sh /usr/local/bin/escapes-post-deploy.sh
