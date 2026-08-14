@@ -119,22 +119,33 @@ export function mapProductToFrontend(row: any) {
     return img;
   });
 
+  const slug = row.slug || row.sku || String(row.id);
+
   return {
     id: row.id,
     sku: row.sku,
+    slug,
     name: row.name,
+    title: row.name,
     description: row.description || '',
     price: priceEur,
+    regularPrice: priceEur,
     sale_price: salePriceEur,
+    salePrice: salePriceEur,
     stock: typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0),
+    inStock: (typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0)) > 0,
     brand: row.brand || '',
     category_id: row.category_id,
+    categoryId: row.category_id,
     images,
+    image: images[0]?.src || '',
     compatibility: row.compatibility || [],
     attributes: row.attributes || {},
     status: row.status || 'published',
     avg_rating: row.avg_rating ? parseFloat(row.avg_rating) : 0,
-    review_count: row.review_count ? parseInt(row.review_count, 10) : 0
+    averageRating: row.avg_rating ? parseFloat(row.avg_rating) : 0,
+    review_count: row.review_count ? parseInt(row.review_count, 10) : 0,
+    ratingCount: row.review_count ? parseInt(row.review_count, 10) : 0
   };
 }
 
@@ -560,13 +571,14 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
   try {
     const slug = req.params.slug;
     const sku = slug.replace(/-/g, '');
+    const numId = parseInt(slug, 10);
     const result = await db.execute(sql`
       SELECT p.*,
              COALESCE(rs.avg_rating, 0) AS avg_rating,
              COALESCE(rs.review_count, 0) AS review_count
       FROM products p
       LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
-      WHERE p.sku = ${sku} AND p.status = 'published'
+      WHERE (p.sku = ${slug} OR p.sku = ${sku} ${!isNaN(numId) ? sql`OR p.id = ${numId}` : sql``}) AND p.status = 'published'
       LIMIT 1
     `);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
