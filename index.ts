@@ -7587,17 +7587,18 @@ app.get('/api/reviews/:productId', async (req, res) => {
     const { limit = '10', offset = '0' } = req.query as any;
     
     const reviewsRes = await db.execute(sql`
-      SELECT r.id, r.product_id, r.user_email, r.username, r.rating, r.title, r.content,
-             r.verified_purchase, r.created_at
+      SELECT r.id, r.product_id, r.user_id, u.email as user_email, COALESCE(u.username, u.first_name, 'Usuario') as username,
+             r.rating, r.title, r.content, r.verified_purchase, r.created_at
       FROM product_reviews r
-      WHERE r.product_id = ${productId}
+      LEFT JOIN users u ON r.user_id = u.id
+      WHERE r.product_id = ${productId} AND r.status = 'approved'
       ORDER BY r.created_at DESC
       LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}
     `);
     
     const countRes = await db.execute(sql`
       SELECT COUNT(*) as total FROM product_reviews 
-      WHERE product_id = ${productId}
+      WHERE product_id = ${productId} AND status = 'approved'
     `);
     
     const statsRes = await db.execute(sql`
@@ -7610,7 +7611,7 @@ app.get('/api/reviews/:productId', async (req, res) => {
         COUNT(CASE WHEN rating = 2 THEN 1 END) as two,
         COUNT(CASE WHEN rating = 1 THEN 1 END) as one
       FROM product_reviews 
-      WHERE product_id = ${productId}
+      WHERE product_id = ${productId} AND status = 'approved'
     `);
     
     const countRow = countRes.rows[0] as { total: string } | undefined;
@@ -7652,18 +7653,8 @@ app.post('/api/reviews', async (req, res) => {
 
     const userId = (req as any).userId || null;
     let verified_purchase = false;
-    let userEmail: string | null = null;
-    let username: string | null = null;
 
     if (userId) {
-      const userRes = await db.execute(sql`
-        SELECT email, username FROM users WHERE id = ${userId} LIMIT 1
-      `);
-      if (userRes.rows.length > 0) {
-        userEmail = (userRes.rows[0] as any).email;
-        username = (userRes.rows[0] as any).username;
-      }
-
       const orderRes = await db.execute(sql`
         SELECT o.id FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
@@ -7676,8 +7667,8 @@ app.post('/api/reviews', async (req, res) => {
     }
 
     const result = await db.execute(sql`
-      INSERT INTO product_reviews (product_id, user_email, username, rating, title, content, verified_purchase)
-      VALUES (${parseInt(product_id)}, ${userEmail}, ${username}, ${parseInt(rating)}, ${title || null}, ${content || null}, ${verified_purchase})
+      INSERT INTO product_reviews (product_id, user_id, rating, title, content, verified_purchase)
+      VALUES (${parseInt(product_id)}, ${userId}, ${parseInt(rating)}, ${title || null}, ${content || null}, ${verified_purchase})
       RETURNING *
     `);
 
