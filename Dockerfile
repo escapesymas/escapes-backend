@@ -11,11 +11,13 @@ RUN --mount=type=cache,target=/root/.npm (npm ci --legacy-peer-deps --prefer-off
 # Copy source files for compilation
 COPY tsconfig.json ./
 COPY index.ts db.ts redis.ts utils.ts bihrService.ts ./
+COPY routes/ ./routes/
 COPY lib/ ./lib/
 COPY chatbot/ ./chatbot/
 COPY templates/ ./templates/
 COPY schemas/ ./schemas/
 COPY migrations/ ./migrations/
+COPY scripts/ ./scripts/
 
 # Compile TypeScript to ./dist
 RUN npm run build
