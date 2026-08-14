@@ -228,12 +228,10 @@ catalogRouter.get('/catalog/products', async (req, res) => {
             OR compatibility::text = '[]'
             OR compatibility::text ILIKE '%universal%'
             OR category_id IN (
-              WITH RECURSIVE universal_cats AS (
-                SELECT id FROM categories WHERE id IN (6, 7, 8, 9, 10) OR parent_id IN (6, 7, 8, 9, 10)
-                UNION ALL
-                SELECT c.id FROM categories c JOIN universal_cats u ON c.parent_id = u.id
-              )
-              SELECT id FROM universal_cats
+              SELECT id FROM categories
+              WHERE id IN (6, 7, 8, 9, 10)
+                 OR parent_id IN (6, 7, 8, 9, 10)
+                 OR parent_id IN (SELECT id FROM categories WHERE parent_id IN (6, 7, 8, 9, 10))
             )
           )`);
       }
@@ -279,27 +277,27 @@ catalogRouter.get('/catalog/products', async (req, res) => {
         const parentId = Math.floor(catId / 100);
         conditions.append(sql`
           AND (
-            category_id IN (
-              WITH RECURSIVE descendants AS (
-                SELECT id FROM categories WHERE id = ${catId}
-                UNION ALL
-                SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-              )
-              SELECT id FROM descendants
+            category_id = ${catId}
+            OR category_id IN (
+              SELECT id FROM categories
+              WHERE parent_id = ${catId}
+                 OR parent_id IN (SELECT id FROM categories WHERE parent_id = ${catId})
             )
-            OR (category_id = ${parentId})
+            OR category_id = ${parentId}
           )`);
       }
     } else if (category_slug) {
       const slugLower = String(category_slug).toLowerCase();
       conditions.append(sql`
         AND category_id IN (
-          WITH RECURSIVE descendants AS (
-            SELECT id FROM categories WHERE LOWER(slug) LIKE ${'%' + slugLower + '%'} OR LOWER(name) LIKE ${'%' + slugLower + '%'}
-            UNION ALL
-            SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-          )
-          SELECT id FROM descendants
+          SELECT id FROM categories
+          WHERE LOWER(slug) LIKE ${'%' + slugLower + '%'}
+             OR LOWER(name) LIKE ${'%' + slugLower + '%'}
+             OR parent_id IN (
+               SELECT id FROM categories
+               WHERE LOWER(slug) LIKE ${'%' + slugLower + '%'}
+                  OR LOWER(name) LIKE ${'%' + slugLower + '%'}
+             )
         )`);
     }
 
@@ -355,12 +353,10 @@ catalogRouter.get('/catalog/filters', async (req, res) => {
             OR compatibility::text = '[]'
             OR compatibility::text ILIKE '%universal%'
             OR category_id IN (
-              WITH RECURSIVE universal_cats AS (
-                SELECT id FROM categories WHERE id IN (6, 7, 8, 9, 10) OR parent_id IN (6, 7, 8, 9, 10)
-                UNION ALL
-                SELECT c.id FROM categories c JOIN universal_cats u ON c.parent_id = u.id
-              )
-              SELECT id FROM universal_cats
+              SELECT id FROM categories
+              WHERE id IN (6, 7, 8, 9, 10)
+                 OR parent_id IN (6, 7, 8, 9, 10)
+                 OR parent_id IN (SELECT id FROM categories WHERE parent_id IN (6, 7, 8, 9, 10))
             )
           )`);
       }
@@ -375,12 +371,10 @@ catalogRouter.get('/catalog/filters', async (req, res) => {
       const catId = parseInt(category_id, 10);
       if (!isNaN(catId)) {
         conditions.append(sql` AND category_id IN (
-          WITH RECURSIVE descendants AS (
-            SELECT id FROM categories WHERE id = ${catId}
-            UNION ALL
-            SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-          )
-          SELECT id FROM descendants
+          SELECT id FROM categories
+          WHERE id = ${catId}
+             OR parent_id = ${catId}
+             OR parent_id IN (SELECT id FROM categories WHERE parent_id = ${catId})
         )`);
       }
     }
@@ -746,13 +740,11 @@ catalogRouter.get('/catalog/products-by-skus', async (req, res) => {
         const parentId = Math.floor(catId / 100);
         conditions.append(sql`
           AND (
-            category_id IN (
-              WITH RECURSIVE descendants AS (
-                SELECT id FROM categories WHERE id = ${catId}
-                UNION ALL
-                SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-              )
-              SELECT id FROM descendants
+            category_id = ${catId}
+            OR category_id IN (
+              SELECT id FROM categories
+              WHERE parent_id = ${catId}
+                 OR parent_id IN (SELECT id FROM categories WHERE parent_id = ${catId})
             )
             OR category_id = ${parentId}
           )`);
