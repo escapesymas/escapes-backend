@@ -6017,7 +6017,7 @@ app.post('/api/auth', authLimiter, async (req, res) => {
 
       return res.json(session);
     } else if (action === 'update-profile') {
-      const { userId, firstName, lastName, email, billing, garage, avatarUrl } = body;
+      const { userId, username, firstName, lastName, email, billing, garage, avatarUrl } = body;
       if (!userId) return res.status(400).json({ error: 'Falta userId' });
 
       // Cargar el usuario actual
@@ -6025,6 +6025,21 @@ app.post('/api/auth', authLimiter, async (req, res) => {
       if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
       const user = userRes.rows[0] as any;
+
+      // Validar unicidad del nombre de usuario (@username)
+      if (username && username.trim().toLowerCase() !== user.username.toLowerCase()) {
+        const cleanUsername = username.trim().toLowerCase().replace(/[^a-z0-9_.]/gi, '');
+        if (cleanUsername.length < 3) {
+          return res.status(400).json({ error: 'El nombre de usuario (@username) debe tener al menos 3 caracteres.' });
+        }
+        const existUsernameRes = await db.execute(sql`
+          SELECT id FROM users
+          WHERE LOWER(username) = LOWER(${cleanUsername}) AND id != ${parseInt(userId)}
+        `);
+        if (existUsernameRes.rows.length > 0) {
+          return res.status(400).json({ error: `El nombre de usuario (@${cleanUsername}) ya está reservado por otro piloto.` });
+        }
+      }
 
       if (email && email.toLowerCase() !== user.email.toLowerCase()) {
         const existRes = await db.execute(sql`
@@ -6036,24 +6051,31 @@ app.post('/api/auth', authLimiter, async (req, res) => {
         }
       }
 
-      let billingJson = user.billing;
+      let billingJson: string | null = null;
       if (billing !== undefined) {
         billingJson = typeof billing === 'string' ? billing : JSON.stringify(billing);
+      } else if (user.billing) {
+        billingJson = typeof user.billing === 'string' ? user.billing : JSON.stringify(user.billing);
       }
 
-      let garageJson = user.garage;
+      let garageJson: string | null = null;
       if (garage !== undefined) {
         garageJson = typeof garage === 'string' ? garage : JSON.stringify(garage);
+      } else if (user.garage) {
+        garageJson = typeof user.garage === 'string' ? user.garage : JSON.stringify(user.garage);
       }
+
+      const cleanUsernameToSave = username ? username.trim().toLowerCase().replace(/[^a-z0-9_.]/gi, '') : null;
 
       await db.execute(sql`
         UPDATE users
         SET 
+          username = COALESCE(${cleanUsernameToSave || null}, username),
           first_name = COALESCE(${firstName || null}, first_name),
           last_name = COALESCE(${lastName || null}, last_name),
           email = COALESCE(${email || null}, email),
-          billing = ${billingJson || null},
-          garage = ${garageJson || null},
+          billing = ${billingJson},
+          garage = ${garageJson},
           avatar_url = COALESCE(${avatarUrl || null}, avatar_url)
         WHERE id = ${parseInt(userId)}
       `);
