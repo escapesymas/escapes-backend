@@ -517,7 +517,7 @@ app.use('/uploads', express.static(uploadDir, {
 const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW_MS = 60000;
 
-const rateLimitSkipPaths = ['/uploads', '/api/health', '/api/catalog', '/api/image-proxy', '/api/auth', '/api/cart'];
+const rateLimitSkipPaths = ['/uploads', '/api/health', '/api/catalog', '/api/image-proxy'];
 
 app.use((req: any, res: any, next: any) => {
   const path = req.path || req.url || '';
@@ -2522,7 +2522,7 @@ const formsLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300,
+  max: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Demasiados intentos. Por favor, espera 15 minutos.' }
@@ -5741,13 +5741,6 @@ app.post('/api/auth', authLimiter, async (req, res) => {
       // Generar JWT y respuesta de sesión
       const token = generateJWT(user);
       setAuthCookie(res, token);
-      let billing = {};
-      try { billing = typeof user.billing === 'string' ? JSON.parse(user.billing) : user.billing; } catch {}
-      let garage: any[] = [];
-      try { garage = typeof user.garage === 'string' ? JSON.parse(user.garage) : user.garage; } catch {}
-      let cart: any[] = [];
-      try { cart = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart; } catch {}
-
       const session = {
         token,
         user_id: user.id,
@@ -5755,21 +5748,7 @@ app.post('/api/auth', authLimiter, async (req, res) => {
         user_nicename: user.username,
         user_display_name: user.first_name || user.username,
         avatarUrl: user.avatar_url || '',
-        role: user.role || 'customer',
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          firstName: user.first_name || '',
-          lastName: user.last_name || '',
-          avatarUrl: user.avatar_url || '',
-          role: user.role || 'customer',
-          rank: user.rank || 'Novato',
-          xp: user.xp || 0,
-          billing,
-          garage,
-          cart,
-        }
+        role: user.role || 'customer'
       };
 
       return res.json(session);
