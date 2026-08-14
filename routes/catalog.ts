@@ -217,26 +217,6 @@ catalogRouter.get('/catalog/products', async (req, res) => {
 
     const conditions = sql`WHERE status IN ('published', 'active') AND name NOT LIKE 'Aplicaciones:%' AND name NOT LIKE 'Applications:%' AND sku NOT LIKE 'Aplicaciones:%' AND sku NOT LIKE 'Applications:%'`;
 
-    if (universal === 'true') {
-      if (category_id || category_slug) {
-        // Category specified: include all products in category regardless of compatibility column
-      } else {
-        conditions.append(sql`
-          AND (
-            compatibility IS NULL
-            OR compatibility = '[]'::jsonb
-            OR compatibility::text = '[]'
-            OR compatibility::text ILIKE '%universal%'
-            OR category_id IN (
-              SELECT id FROM categories
-              WHERE id IN (6, 7, 8, 9, 10)
-                 OR parent_id IN (6, 7, 8, 9, 10)
-                 OR parent_id IN (SELECT id FROM categories WHERE parent_id IN (6, 7, 8, 9, 10))
-            )
-          )`);
-      }
-    }
-
     if (search) {
       const searchPattern = `%${sanitizeLike(search)}%`;
       conditions.append(sql`
@@ -341,26 +321,6 @@ catalogRouter.get('/catalog/filters', async (req, res) => {
     if (cached) return res.json(cached);
 
     const conditions = sql`WHERE status = 'published'`;
-
-    if (universal === 'true') {
-      if (category_id) {
-        // Category specified: include all products in category regardless of compatibility column
-      } else {
-        conditions.append(sql`
-          AND (
-            compatibility IS NULL
-            OR compatibility = '[]'::jsonb
-            OR compatibility::text = '[]'
-            OR compatibility::text ILIKE '%universal%'
-            OR category_id IN (
-              SELECT id FROM categories
-              WHERE id IN (6, 7, 8, 9, 10)
-                 OR parent_id IN (6, 7, 8, 9, 10)
-                 OR parent_id IN (SELECT id FROM categories WHERE parent_id IN (6, 7, 8, 9, 10))
-            )
-          )`);
-      }
-    }
 
     if (search) {
       const searchPattern = `%${sanitizeLike(search)}%`;
