@@ -5754,7 +5754,24 @@ app.post('/api/auth', authLimiter, async (req, res) => {
       return res.json(session);
 
     } else if (action === 'get-profile') {
-      const { email, id } = body;
+      let email = body?.email || body?.userEmail || req.query?.email;
+      let id = body?.id || body?.userId || req.query?.id;
+
+      if (!email && !id) {
+        const authHeader = req.headers.authorization;
+        const token = (authHeader && authHeader.startsWith('Bearer '))
+          ? authHeader.split(' ')[1]
+          : req.cookies?.eym_jwt;
+        if (token) {
+          try {
+            const secret = process.env.JWT_SECRET || 'eym-secret-key-2025';
+            const decoded: any = jwt.verify(token, secret);
+            if (decoded?.id) id = decoded.id;
+            else if (decoded?.email) email = decoded.email;
+          } catch {}
+        }
+      }
+
       if (!email && !id) return res.status(400).json({ error: 'Falta email o id' });
 
       let conditions = sql`WHERE 1=1`;
