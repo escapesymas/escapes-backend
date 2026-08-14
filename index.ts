@@ -2946,15 +2946,18 @@ app.get('/api/catalog/frequently-bought-together/:productId', async (req, res) =
 
 app.get('/api/catalog/product-by-slug/:slug', async (req, res) => {
   try {
-    const slug = req.params.slug;
-    const sku = slug.replace(/-/g, '');
+    const slugStr = String(req.params.slug || '');
+    const skuStr = slugStr.replace(/-/g, '');
+    const rawId = parseInt(slugStr, 10);
+    const validId = (!isNaN(rawId) && rawId >= 1 && rawId <= 2147483647 && String(rawId) === slugStr) ? rawId : null;
+
     const result = await db.execute(sql`
       SELECT p.*,
              COALESCE(rs.avg_rating, 0) AS avg_rating,
              COALESCE(rs.review_count, 0) AS review_count
       FROM products p
       LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
-      WHERE p.sku = ${sku} AND p.status = 'published'
+      WHERE (p.sku = ${slugStr} OR p.sku = ${skuStr} ${validId !== null ? sql`OR p.id = ${validId}` : sql``}) AND p.status = 'published'
       LIMIT 1
     `);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
