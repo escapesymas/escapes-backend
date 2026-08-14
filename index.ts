@@ -4584,10 +4584,10 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         const count = parseInt((pStats.rows[0] as any)?.review_count || '0');
 
         await db.execute(sql`
-          INSERT INTO product_rating_stats (product_id, avg_rating, review_count, updated_at)
-          VALUES (${productId}, ${avg}, ${count}, NOW())
+          INSERT INTO product_rating_stats (product_id, avg_rating, review_count)
+          VALUES (${productId}, ${avg}, ${count})
           ON CONFLICT (product_id) 
-          DO UPDATE SET avg_rating = EXCLUDED.avg_rating, review_count = EXCLUDED.review_count, updated_at = NOW()
+          DO UPDATE SET avg_rating = EXCLUDED.avg_rating, review_count = EXCLUDED.review_count
         `);
 
         return res.json({ success: true, productId, avg_rating: avg, review_count: count });
@@ -4623,10 +4623,10 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         const count = parseInt((pStats.rows[0] as any)?.review_count || '0');
 
         await db.execute(sql`
-          INSERT INTO product_rating_stats (product_id, avg_rating, review_count, updated_at)
-          VALUES (${productId}, ${avg}, ${count}, NOW())
+          INSERT INTO product_rating_stats (product_id, avg_rating, review_count)
+          VALUES (${productId}, ${avg}, ${count})
           ON CONFLICT (product_id) 
-          DO UPDATE SET avg_rating = EXCLUDED.avg_rating, review_count = EXCLUDED.review_count, updated_at = NOW()
+          DO UPDATE SET avg_rating = EXCLUDED.avg_rating, review_count = EXCLUDED.review_count
         `);
 
         return res.json({ success: true, productId });
