@@ -571,15 +571,14 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
   try {
     const slug = req.params.slug;
     const sku = slug.replace(/-/g, '');
-    const rawId = parseInt(slug, 10);
-    const numId = (!isNaN(rawId) && rawId >= -2147483648 && rawId <= 2147483647) ? rawId : null;
+    const numId = parseInt(slug, 10);
     const result = await db.execute(sql`
       SELECT p.*,
              COALESCE(rs.avg_rating, 0) AS avg_rating,
              COALESCE(rs.review_count, 0) AS review_count
       FROM products p
       LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
-      WHERE (p.slug = ${slug} OR p.sku = ${slug} OR p.sku = ${sku} ${numId !== null ? sql`OR p.id = ${numId}` : sql``}) AND p.status = 'published'
+      WHERE (p.sku = ${slug} OR p.sku = ${sku} ${!isNaN(numId) ? sql`OR p.id = ${numId}` : sql``}) AND p.status = 'published'
       LIMIT 1
     `);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
