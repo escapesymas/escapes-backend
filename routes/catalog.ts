@@ -196,10 +196,14 @@ catalogRouter.get('/vehicles', async (req, res) => {
 });
 
 // GET /api/catalog/sitemap-skus
-catalogRouter.get('/catalog/sitemap-skus', async (_req, res) => {
+catalogRouter.get('/catalog/sitemap-skus', async (req, res) => {
   try {
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(10000, Math.max(1, parseInt(req.query.limit as string) || 5000));
+    const offset = (page - 1) * limit;
+
     const result = await db.execute(sql`
-      SELECT sku, updated_at FROM products WHERE status = 'published' ORDER BY id ASC
+      SELECT sku, updated_at FROM products WHERE status = 'published' ORDER BY id ASC LIMIT ${limit} OFFSET ${offset}
     `);
     res.json(result.rows);
   } catch (err: any) {
