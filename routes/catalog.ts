@@ -186,12 +186,34 @@ catalogRouter.get('/vehicles', async (req, res) => {
     } else if (action === 'compatible-skus') {
       const skusSet = new Set<string>();
 
-      // 1. SKUs desde moto_catalog.json
-      if (brand && model && year && hierarchy[brand]?.[model]?.[year]) {
-        const list = hierarchy[brand][model][year];
-        if (Array.isArray(list)) {
-          list.forEach((s: string) => skusSet.add(s));
+      // 1. SKUs desde moto_catalog.json (jerarquía y mapeo de compatibilidad)
+      if (brand && hierarchy[brand]) {
+        const compatibilityMap = catalog?.compatibility || {};
+        let codes: string[] = [];
+
+        if (model) {
+          if (year && year !== 'General' && year !== '') {
+            codes = hierarchy[brand][model]?.[year] || [];
+          } else if (hierarchy[brand][model]) {
+            Object.values(hierarchy[brand][model]).forEach((cList: any) => {
+              if (Array.isArray(cList)) codes.push(...cList);
+            });
+          }
+        } else {
+          Object.values(hierarchy[brand]).forEach((modelsObj: any) => {
+            if (modelsObj) {
+              Object.values(modelsObj).forEach((cList: any) => {
+                if (Array.isArray(cList)) codes.push(...cList);
+              });
+            }
+          });
         }
+
+        codes.forEach(code => {
+          const vehicleSkus = compatibilityMap[code] || [];
+          vehicleSkus.forEach((sku: string) => skusSet.add(sku));
+          skusSet.add(code);
+        });
       }
 
       // 2. SKUs desde bihr_compatibility_cache.json
@@ -220,33 +242,35 @@ catalogRouter.get('/vehicles', async (req, res) => {
         } catch (e) {}
       }
 
-      // 3. SKUs desde la columna compatibility JSONB de PostgreSQL
-      try {
-        const bLower = (brand || '').toLowerCase();
-        const mLower = (model || '').toLowerCase();
-        const yStr = year ? String(year) : '';
+      // 3. SKUs desde la columna compatibility JSONB de PostgreSQL (usando jsonb_array_elements rápido)
+      if (brand) {
+        try {
+          const bLower = brand.toLowerCase();
+          const mLower = model ? model.toLowerCase() : '';
+          const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
 
-        const dbRes = await db.execute(sql`
-          SELECT sku, compatibility FROM products 
-          WHERE compatibility IS NOT NULL AND status = 'published'
-        `);
+          let sqlQuery = sql`
+            SELECT DISTINCT sku FROM products 
+            WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'::jsonb
+              AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements(compatibility) elem
+                WHERE LOWER(elem->>'brand') = ${bLower}
+          `;
 
-        for (const row of dbRes.rows as any[]) {
-          const list = row.compatibility;
-          if (!Array.isArray(list)) continue;
-          for (const item of list) {
-            if (!item.brand) continue;
-            const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
-            const matchModel = !mLower || (item.model && (item.model.toLowerCase().includes(mLower) || mLower.includes(item.model.toLowerCase())));
-            const matchYear = !yStr || (item.year && String(item.year) === yStr);
-
-            if (matchBrand && matchModel && matchYear) {
-              skusSet.add(row.sku);
-              break;
-            }
+          if (yNum) {
+            sqlQuery = sql`${sqlQuery} AND (elem->>'year')::int = ${yNum}`;
           }
-        }
-      } catch (e) {}
+          if (mLower) {
+            sqlQuery = sql`${sqlQuery} AND LOWER(elem->>'model') LIKE ${`%${mLower}%`}`;
+          }
+          sqlQuery = sql`${sqlQuery} )`;
+
+          const dbRes = await db.execute(sqlQuery);
+          for (const row of dbRes.rows as any[]) {
+            if (row.sku) skusSet.add(row.sku);
+          }
+        } catch (e) {}
+      }
 
       responseData = Array.from(skusSet);
     } else {
