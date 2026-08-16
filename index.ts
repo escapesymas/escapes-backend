@@ -66,16 +66,42 @@ const stripeTest = stripeTestKey
 
 const adminKey = process.env.ADMIN_KEY;
 if (!adminKey) {
-  console.warn('[WARNING] ADMIN_KEY not set — Bihr sync endpoints are unprotected!');
+  console.warn('[WARNING] ADMIN_KEY not set — Bihr sync endpoints rely on admin JWT only.');
 }
 
+// Audit 2026-08-15, finding #52: VITE_ADMIN_KEY was bundled into the admin
+// frontend. The admin UI now authenticates as a real admin user and passes
+// the JWT in `Authorization: Bearer ...`. We KEEP the X-Admin-Key path so
+// cron / out-of-band scripts that already speak it don't break, but the
+// frontend bundle no longer needs the value.
+//
+// Migration rule for new endpoints: prefer `requireAdmin` (JWT only) and
+// reserve this helper for the legacy Bihr/inventory cron surface.
 function requireAdminKey(req: any, res: any): boolean {
-  const key = req.headers['x-admin-key'];
-  if (!key || key !== adminKey) {
-    res.status(401).json({ error: 'No autorizado' });
-    return false;
+  // 1) Admin JWT (preferred path).
+  const authHeader = req.headers?.authorization;
+  if (authHeader?.startsWith?.('Bearer ')) {
+    const token = authHeader.substring(7);
+    const user = verifyJWT(token);
+    if (user && user.role === 'admin') return true;
   }
-  return true;
+  const cookieHeader = req.headers?.cookie || '';
+  const cookies: Record<string, string> = {};
+  cookieHeader.split(';').forEach((part: string) => {
+    const [k, ...v] = part.trim().split('=');
+    if (k) cookies[k] = decodeURIComponent(v.join('='));
+  });
+  if (cookies.eym_jwt) {
+    const user = verifyJWT(cookies.eym_jwt);
+    if (user && user.role === 'admin') return true;
+  }
+
+  // 2) Legacy service-to-service header.
+  const key = req.headers['x-admin-key'];
+  if (adminKey && key && key === adminKey) return true;
+
+  res.status(401).json({ error: 'No autorizado' });
+  return false;
 }
 
 function getStripeClient(req: any): any {
@@ -1337,19 +1363,15 @@ async function verifyPassword(password: string, hash: string): Promise<boolean> 
   return bcrypt.compare(password, hash);
 }
 
-function generateJWT(user: any): string {
-  const secret = process.env.JWT_SECRET || 'insecure-default-secret-change-me';
-  return jwt.sign(
-    {
-      user_id: user.id,
-      email: user.email,
-      role: user.role || 'customer',
-      username: user.username
-    },
-    secret,
-    { expiresIn: '7d' }
-  );
-}
+// JWT helpers (generateJWT, verifyJWT, authenticateRequest) live in utils.ts
+// as the single source of truth. This file used to ship its own copies with
+// hardcoded fallback secrets — they have been removed to eliminate a critical
+// auth-bypass class (see audit 2026-08-15, finding #4).
+import {
+  generateJWT,
+  verifyJWT,
+  authenticateRequest,
+} from './utils.js';
 
 function setAuthCookie(res: any, token: string) {
   res.cookie('eym_jwt', token, {
@@ -1369,35 +1391,6 @@ function clearAuthCookie(res: any) {
     maxAge: 0,
     path: '/',
   });
-}
-
-function verifyJWT(token: string): any | null {
-  try {
-    const secret = process.env.JWT_SECRET || 'insecure-default-secret-change-me';
-    return jwt.verify(token, secret);
-  } catch {
-    return null;
-  }
-}
-
-function authenticateRequest(req: any): any | null {
-  const authHeader = req.headers?.authorization;
-  if (authHeader?.startsWith?.('Bearer ')) {
-    const user = verifyJWT(authHeader.substring(7));
-    if (user) return user;
-  }
-
-  const cookieHeader = req.headers?.cookie || '';
-  const cookies: Record<string, string> = {};
-  cookieHeader.split(';').forEach((part: string) => {
-    const [k, ...v] = part.trim().split('=');
-    if (k) cookies[k] = decodeURIComponent(v.join('='));
-  });
-  if (cookies.eym_jwt) {
-    const user = verifyJWT(cookies.eym_jwt);
-    if (user) return user;
-  }
-  return null;
 }
 
 // ================================================================
@@ -1427,15 +1420,18 @@ app.get('/api/health', async (_req, res) => {
 
 // Diagnostic endpoint: shows env state without exposing secrets.
 app.get('/api/health/diag', async (_req, res) => {
+  // Audit 2026-08-15, finding #52: this endpoint used to expose
+  // `ADMIN_KEY_starts`, `ADMIN_KEY_matches_expected`, etc. — which let an
+  // unauthenticated attacker confirm whether the bundled default
+  // `escapes-admin-sync-key-2026-change-me` was still in use. Now it returns
+  // only booleans, never the value or any prefix.
   res.json({
     ok: true,
     env: {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
       ADMIN_KEY_set: !!process.env.ADMIN_KEY,
-      ADMIN_KEY_len: process.env.ADMIN_KEY?.length ?? 0,
-      ADMIN_KEY_starts: process.env.ADMIN_KEY?.slice(0, 12),
-      ADMIN_KEY_matches_expected: process.env.ADMIN_KEY === 'escapes-admin-sync-key-2026-change-me',
+      ADMIN_KEY_matches_default: process.env.ADMIN_KEY === 'escapes-admin-sync-key-2026-change-me',
       REDIS_URL_set: !!process.env.REDIS_URL,
       DATABASE_URL_set: !!process.env.DATABASE_URL,
       BIHR_USERNAME_set: !!process.env.BIHR_USERNAME,
@@ -3120,21 +3116,30 @@ app.get('/api/catalog/products-by-skus', async (req, res) => {
 
 app.get('/api/orders', async (req, res) => {
   try {
-    const { userId, email, status } = req.query as any;
-    if (!userId && !email) return res.status(400).json({ error: 'Falta userId o email' });
+    // Auth required — caller must list their OWN orders. Admin role may list
+    // any user's orders by passing `userId`. Previously the endpoint accepted
+    // an arbitrary `userId`/`email` from the query string without auth, so any
+    // visitor could enumerate other customers' orders. See audit 2026-08-15,
+    // finding #17/#47.
+    const auth = authenticateRequest(req);
+    if (!auth) return res.status(401).json({ error: 'No autenticado' });
 
-    const conditions = sql`WHERE 1=1`;
+    const { userId, email, status } = req.query as any;
+    let targetUserId: number | null = null;
+    if (auth.role === 'admin' && userId) {
+      targetUserId = parseIntSafe(userId);
+    } else if (auth.role === 'admin' && email) {
+      const uRes = await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = LOWER(${email as string}) LIMIT 1`);
+      targetUserId = uRes.rows.length ? (uRes.rows[0] as any).id : null;
+    } else {
+      targetUserId = auth.user_id;
+    }
+    if (!targetUserId) return res.status(400).json({ error: 'Falta userId' });
+
+    const conditions = sql`WHERE user_id = ${targetUserId}`;
     if (status && status !== 'all') {
       conditions.append(sql` AND status = ${status}`);
     }
-    if (userId) {
-      const safeUserId = parseIntSafe(userId);
-      if (!safeUserId) return res.status(400).json({ error: 'userId inválido' });
-      conditions.append(sql` AND user_id = ${safeUserId}`);
-    } else if (email) {
-      conditions.append(sql` AND shipping_data->>'email' = ${email}`);
-    }
-
     conditions.append(sql` ORDER BY created_at DESC LIMIT 5`);
 
     const ordersRes = await db.execute(sql`SELECT * FROM orders ${conditions}`);
@@ -4038,17 +4043,23 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         const b = req.body;
         const safeName = (b.name || "Sin nombre").substring(0, 255);
         const safeSku = (b.sku || `SKU-${Date.now()}`).substring(0, 100);
-        const raw = parseFloat(b.price);
-        const priceInCents = isNaN(raw) ? 0 : Math.round(raw * 100);
-        const rawSale = parseFloat(b.salePrice);
-        const saleCents = isNaN(rawSale) ? null : Math.round(rawSale * 100);
+        // Audit 2026-08-15, finding #16: payload ahora llega en CENTS (no EUR).
+        // El form ya aplica la conversión con `toCents()`. Aceptamos números y
+        // strings numéricos para tolerancia con scripts legacy / curl.
+        const toCents = (v: any): number => {
+          if (typeof v === 'number' && Number.isFinite(v)) return Math.round(v);
+          const n = parseFloat(v);
+          return Number.isFinite(n) ? Math.round(n) : 0;
+        };
+        const priceInCents = toCents(b.price);
+        const saleCents = b.salePrice == null || b.salePrice === '' ? null : toCents(b.salePrice);
         const stock = parseInt(b.stock) || 0;
         const desc = b.description || null;
         const imgs = b.images?.length > 0 ? JSON.stringify(b.images) : null;
         const compat = b.compatibility?.length > 0 ? JSON.stringify(b.compatibility) : null;
         const status = b.status || 'published';
         const brand = b.brand || '';
-        const cost = b.cost ? Math.round(parseFloat(b.cost) * 100) : null;
+        const cost = b.cost ? toCents(b.cost) : null;
         const categoryId = b.categoryId ? parseInt(b.categoryId) : null;
         const category2Id = b.category2Id ? parseInt(b.category2Id) : null;
         const category3Id = b.category3Id ? parseInt(b.category3Id) : null;
@@ -4069,7 +4080,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             const resVar = await pool.query(`
               INSERT INTO product_variations (parent_product_id, sku, price, stock_status, stock_quantity)
               VALUES ($1, $2, $3, $4, $5) RETURNING id
-            `, [newId, v.sku || null, v.price ? Math.round(parseFloat(v.price) * 100) : 0, v.stock_status || 'instock', v.stock_quantity || 0]);
+            `, [newId, v.sku || null, v.price ? toCents(v.price) : 0, v.stock_status || 'instock', v.stock_quantity || 0]);
             
             const newVarId = resVar.rows[0].id;
             
@@ -5301,10 +5312,14 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         const safeName = (b.name || "Sin nombre").substring(0, 255);
         const safeSku = (b.sku || `SKU-${Date.now()}`).substring(0, 100);
-        const raw = parseFloat(b.price);
-        const priceInCents = isNaN(raw) ? 0 : Math.round(raw * 100);
-        const rawSale = parseFloat(b.salePrice);
-        const saleCents = isNaN(rawSale) ? null : Math.round(rawSale * 100);
+        // Misma regla que create-product: payload en CENTS (audit 2026-08-15, #16).
+        const toCents = (v: any): number => {
+          if (typeof v === 'number' && Number.isFinite(v)) return Math.round(v);
+          const n = parseFloat(v);
+          return Number.isFinite(n) ? Math.round(n) : 0;
+        };
+        const priceInCents = toCents(b.price);
+        const saleCents = b.salePrice == null || b.salePrice === '' ? null : toCents(b.salePrice);
         const stock = parseInt(b.stock) || 0;
         const desc = b.description || null;
         // Handle images: only update when content is provided; preserve existing if empty array sent
@@ -5324,7 +5339,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         const compat = b.compatibility?.length > 0 ? JSON.stringify(b.compatibility) : null;
         const status = b.status || 'published';
         const brand = b.brand || '';
-        const cost = b.cost ? Math.round(parseFloat(b.cost) * 100) : null;
+        const cost = b.cost ? toCents(b.cost) : null;
         const categoryId = b.categoryId ? parseInt(b.categoryId) : null;
         const category2Id = b.category2Id ? parseInt(b.category2Id) : null;
         const category3Id = b.category3Id ? parseInt(b.category3Id) : null;
@@ -5385,7 +5400,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             const resVar = await pool.query(`
               INSERT INTO product_variations (parent_product_id, sku, price, stock_status, stock_quantity)
               VALUES ($1, $2, $3, $4, $5) RETURNING id
-            `, [productId, v.sku || null, v.price ? Math.round(parseFloat(v.price) * 100) : 0, v.stock_status || 'instock', v.stock_quantity || 0]);
+            `, [productId, v.sku || null, v.price ? toCents(v.price) : 0, v.stock_status || 'instock', v.stock_quantity || 0]);
             
             const newVarId = resVar.rows[0].id;
             
@@ -5903,36 +5918,21 @@ app.post('/api/auth', authLimiter, async (req, res) => {
       return res.json(session);
 
     } else if (action === 'get-profile') {
-      let email = body?.email || body?.userEmail || req.query?.email;
-      let id = body?.id || body?.userId || req.query?.id;
+      // Auth required. Admin role may look up another user by passing `id` in
+      // the body or query. Previously any caller could fetch any profile by
+      // passing `?email=foo` — full PII leak. See audit 2026-08-15, #25.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
 
-      if (!email && !id) {
-        const authHeader = req.headers.authorization;
-        const token = (authHeader && authHeader.startsWith('Bearer '))
-          ? authHeader.split(' ')[1]
-          : req.cookies?.eym_jwt;
-        if (token) {
-          try {
-            const secret = process.env.JWT_SECRET || 'eym-secret-key-2025';
-            const decoded: any = jwt.verify(token, secret);
-            if (decoded?.id) id = decoded.id;
-            else if (decoded?.email) email = decoded.email;
-          } catch {}
-        }
+      let targetId: number | null = null;
+      if (auth.role === 'admin') {
+        const raw = body?.id || body?.userId || req.query?.id;
+        if (raw) targetId = parseIntSafe(raw);
       }
+      if (!targetId) targetId = auth.user_id;
+      if (!targetId) return res.status(400).json({ error: 'ID inválido' });
 
-      if (!email && !id) return res.status(400).json({ error: 'Falta email o id' });
-
-      let conditions = sql`WHERE 1=1`;
-      if (email) {
-        conditions.append(sql` AND LOWER(email) = LOWER(${email})`);
-      } else if (id) {
-        const safeId = parseIntSafe(id);
-        if (!safeId) return res.status(400).json({ error: 'ID inválido' });
-        conditions.append(sql` AND id = ${safeId}`);
-      }
-
-      const userRes = await db.execute(sql`SELECT * FROM users ${conditions}`);
+      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetId}`);
       if (userRes.rows.length === 0) {
         return res.status(404).json({ error: 'Usuario no encontrado' });
       }
@@ -6017,11 +6017,20 @@ app.post('/api/auth', authLimiter, async (req, res) => {
 
       return res.json(session);
     } else if (action === 'update-profile') {
-      const { userId, username, firstName, lastName, email, billing, garage, avatarUrl } = body;
-      if (!userId) return res.status(400).json({ error: 'Falta userId' });
+      // Auth required. The body `userId` is now IGNORED — the caller can only
+      // modify their own profile. Admins can pass a different userId. The
+      // previous implementation let anyone rewrite any user's profile by
+      // passing `userId` in the body. See audit 2026-08-15, finding #26.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+
+      const { username, firstName, lastName, email, billing, garage, avatarUrl } = body;
+      const requestedUserId = body.userId ? parseIntSafe(body.userId) : null;
+      const targetUserId = (auth.role === 'admin' && requestedUserId) ? requestedUserId : auth.user_id;
+      if (!targetUserId) return res.status(400).json({ error: 'ID inválido' });
 
       // Cargar el usuario actual
-      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${parseInt(userId)}`);
+      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetUserId}`);
       if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
       const user = userRes.rows[0] as any;
@@ -6034,7 +6043,7 @@ app.post('/api/auth', authLimiter, async (req, res) => {
         }
         const existUsernameRes = await db.execute(sql`
           SELECT id FROM users
-          WHERE LOWER(username) = LOWER(${cleanUsername}) AND id != ${parseInt(userId)}
+          WHERE LOWER(username) = LOWER(${cleanUsername}) AND id != ${targetUserId}
         `);
         if (existUsernameRes.rows.length > 0) {
           return res.status(400).json({ error: `El nombre de usuario (@${cleanUsername}) ya está reservado por otro piloto.` });
@@ -6044,7 +6053,7 @@ app.post('/api/auth', authLimiter, async (req, res) => {
       if (email && email.toLowerCase() !== user.email.toLowerCase()) {
         const existRes = await db.execute(sql`
           SELECT id FROM users
-          WHERE LOWER(email) = LOWER(${email}) AND id != ${parseInt(userId)}
+          WHERE LOWER(email) = LOWER(${email}) AND id != ${targetUserId}
         `);
         if (existRes.rows.length > 0) {
           return res.status(400).json({ error: 'El correo electrónico ya está registrado por otro usuario' });
@@ -6069,7 +6078,7 @@ app.post('/api/auth', authLimiter, async (req, res) => {
 
       await db.execute(sql`
         UPDATE users
-        SET 
+        SET
           username = COALESCE(${cleanUsernameToSave || null}, username),
           first_name = COALESCE(${firstName || null}, first_name),
           last_name = COALESCE(${lastName || null}, last_name),
@@ -6077,32 +6086,41 @@ app.post('/api/auth', authLimiter, async (req, res) => {
           billing = ${billingJson},
           garage = ${garageJson},
           avatar_url = COALESCE(${avatarUrl || null}, avatar_url)
-        WHERE id = ${parseInt(userId)}
+        WHERE id = ${targetUserId}
       `);
 
       return res.json({ success: true });
     } else if (action === 'save-cart') {
-      const { userId, cart } = body;
-      if (!userId) return res.status(400).json({ error: 'Falta userId' });
+      // Auth required; the cart being saved must belong to the caller.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const { cart } = body;
+      const requestedUserId = body.userId ? parseIntSafe(body.userId) : null;
+      const targetUserId = (auth.role === 'admin' && requestedUserId) ? requestedUserId : auth.user_id;
+      if (!targetUserId) return res.status(400).json({ error: 'Falta userId' });
       await db.execute(sql`
         UPDATE users
         SET cart = ${cart ? JSON.stringify(cart) : null}
-        WHERE id = ${parseInt(userId)}
+        WHERE id = ${targetUserId}
       `);
       return res.json({ success: true });
     } else if (action === 'delete-account') {
+      // Auth required; only admins can delete someone else.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
       const { userId } = body;
-      if (!userId) return res.status(400).json({ error: 'Falta userId' });
+      const requestedId = parseIntSafe(userId);
+      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetId) return res.status(400).json({ error: 'Falta userId' });
 
-      const parsedId = parseInt(userId);
       try {
-        await db.execute(sql`DELETE FROM users WHERE id = ${parsedId}`);
+        await db.execute(sql`DELETE FROM users WHERE id = ${targetId}`);
       } catch (err) {
         await db.execute(sql`
           UPDATE users
-          SET 
-            username = ${`eliminado_${parsedId}`},
-            email = ${`eliminado_${parsedId}@escapesymas.com`},
+          SET
+            username = ${`eliminado_${targetId}`},
+            email = ${`eliminado_${targetId}@escapesymas.com`},
             first_name = 'Usuario',
             last_name = 'Eliminado',
             password_hash = '',
@@ -6111,14 +6129,19 @@ app.post('/api/auth', authLimiter, async (req, res) => {
             garage = null,
             cart = null,
             role = 'customer'
-          WHERE id = ${parsedId}
+          WHERE id = ${targetId}
         `);
       }
     } else if (action === 'change-password') {
-      const { userId, currentPassword, newPassword } = body;
-      if (!userId || !currentPassword || !newPassword) return res.status(400).json({ error: 'Faltan campos obligatorios' });
+      // Auth required; can only change own password unless admin.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const { currentPassword, newPassword } = body;
+      const requestedId = body.userId ? parseIntSafe(body.userId) : null;
+      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetId || !currentPassword || !newPassword) return res.status(400).json({ error: 'Faltan campos obligatorios' });
 
-      const userRes = await db.execute(sql`SELECT password_hash FROM users WHERE id = ${parseInt(userId)}`);
+      const userRes = await db.execute(sql`SELECT password_hash FROM users WHERE id = ${targetId}`);
       if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
       const user = userRes.rows[0] as any;
@@ -6128,7 +6151,7 @@ app.post('/api/auth', authLimiter, async (req, res) => {
       }
 
       const newHash = await hashPassword(newPassword);
-      await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${parseInt(userId)}`);
+      await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${targetId}`);
       return res.json({ success: true });
     }
 
@@ -6756,24 +6779,46 @@ app.get('/api/orders/my-orders', async (req: any, res: any) => {
 
 app.post('/api/orders/finalize', async (req: any, res: any) => {
   try {
-    const { orderId, paymentId, status } = req.body;
+    // Auth required: caller must own the order. Previously this endpoint
+    // accepted an arbitrary `status` from the body and applied it to any
+    // orderId, letting an attacker mark other users' orders as 'completed'
+    // and trigger stock decrements. See audit 2026-08-15, finding #28/#46.
+    const auth = authenticateRequest(req);
+    if (!auth) return res.status(401).json({ error: 'No autenticado' });
+
+    const { orderId, paymentId } = req.body;
     if (!orderId) return res.status(400).json({ error: 'Falta orderId' });
+
+    const parsedOrderId = parseIntSafe(orderId);
+    if (!parsedOrderId) return res.status(400).json({ error: 'orderId inválido' });
 
     if (!paymentId || typeof paymentId !== 'string') {
       console.warn(`[SECURITY] /api/orders/finalize rejected: missing paymentId. orderId=${orderId} ip=${req.ip}`);
       return res.status(400).json({ error: 'Falta paymentId. La finalización de pedidos requiere verificación con Stripe.' });
     }
 
+    // Ownership check before touching Stripe (avoids leaking PI existence).
+    const ownerRes = await db.execute(sql`SELECT user_id FROM orders WHERE id = ${parsedOrderId}`);
+    if (!ownerRes.rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
+    const ownerId = (ownerRes.rows[0] as any).user_id;
+    if (ownerId !== auth.user_id && auth.role !== 'admin') {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+
+    // Status is DERIVED from Stripe — never trust the body.
+    let paymentStatus = 'failed';
     try {
       const client = getStripeClient(req);
       const paymentIntent = await client.paymentIntents.retrieve(paymentId);
-      if (paymentIntent.status !== 'succeeded') {
+      if (paymentIntent.status === 'succeeded') paymentStatus = 'processing';
+      else if (paymentIntent.status === 'processing') paymentStatus = 'pending';
+      else {
         console.warn(`[ORDER FINALIZE WARNING]: PaymentIntent ${paymentId} is in status ${paymentIntent.status}. Rejecting order finalization.`);
         return res.status(400).json({ error: 'El pago ha sido rechazado o cancelado. Por favor, inténtalo de nuevo o prueba con otro método de pago.' });
       }
       const piOrderId = (paymentIntent.metadata && (paymentIntent.metadata.order_id || paymentIntent.metadata.orderId)) || null;
-      if (piOrderId && String(piOrderId) !== String(orderId)) {
-        console.warn(`[SECURITY] /api/orders/finalize rejected: paymentIntent ${paymentId} metadata.order_id=${piOrderId} does not match request orderId=${orderId}`);
+      if (piOrderId && String(piOrderId) !== String(parsedOrderId)) {
+        console.warn(`[SECURITY] /api/orders/finalize rejected: paymentIntent ${paymentId} metadata.order_id=${piOrderId} does not match request orderId=${parsedOrderId}`);
         return res.status(400).json({ error: 'El paymentIntent no corresponde a esta orden.' });
       }
     } catch (stripeErr: any) {
@@ -6783,14 +6828,13 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
 
     await db.execute(sql`
       UPDATE orders
-      SET status = ${status || 'processing'}, payment_id = ${paymentId}
-      WHERE id = ${parseInt(orderId)}
+      SET status = ${paymentStatus}, payment_id = ${paymentId}
+      WHERE id = ${parsedOrderId}
     `);
 
-    const finalStatus = status || 'processing';
-    if (finalStatus === 'processing' || finalStatus === 'completed') {
+    if (paymentStatus === 'processing') {
       const itemsRes = await db.execute(sql`
-        SELECT product_id, quantity FROM order_items WHERE order_id = ${parseInt(orderId)}
+        SELECT product_id, quantity FROM order_items WHERE order_id = ${parsedOrderId}
       `);
 
       for (const rawItem of itemsRes.rows) {
@@ -6803,10 +6847,10 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
       }
 
       try {
-        await createInvoiceForOrder(parseInt(orderId));
-        console.log(`[AUTO-INVOICE] Invoice auto-generated successfully for Order ${orderId}`);
+        await createInvoiceForOrder(parsedOrderId);
+        console.log(`[AUTO-INVOICE] Invoice auto-generated successfully for Order ${parsedOrderId}`);
       } catch (e: any) {
-        console.error(`[AUTO-INVOICE ERROR] Failed to auto-generate invoice for Order ${orderId}:`, e);
+        console.error(`[AUTO-INVOICE ERROR] Failed to auto-generate invoice for Order ${parsedOrderId}:`, e);
       }
 
       // Bust product + filter cache: order finalization decrements stock on
@@ -7115,13 +7159,15 @@ app.post('/api/cart/recover/:token', async (req: any, res: any) => {
 app.get('/api/cart', async (req: any, res: any) => {
   try {
     const { sessionToken, userId } = req.query as any;
-    if (!sessionToken) return res.status(400).json({ error: 'Falta sessionToken' });
+    if (!sessionToken && (!userId || userId === 'undefined')) {
+      return res.status(400).json({ error: 'Falta sessionToken o userId' });
+    }
 
     let cartRes;
     if (userId && userId !== 'undefined') {
       cartRes = await db.execute(sql`
         SELECT * FROM carts 
-        WHERE user_id = ${parseInt(userId)} OR session_token = ${sessionToken}
+        WHERE user_id = ${parseInt(userId)} OR session_token = ${sessionToken || ''}
         ORDER BY updated_at DESC LIMIT 1
       `);
     } else {
@@ -7154,7 +7200,27 @@ app.get('/api/cart', async (req: any, res: any) => {
 
 app.post('/api/create-payment-intent', async (req: any, res: any) => {
   const { orderId, amount, currency, customerEmail, eventId } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'Importe inválido' });
+  if (!orderId) return res.status(400).json({ error: 'Falta orderId' });
+
+  // RECONCILE: the amount passed by the client is IGNORED — we always recompute
+  // from the persisted order so the caller cannot pay a different total. The
+  // body `amount` is kept only as a fallback for guest checkout flows that
+  // have not yet created the order row. See audit 2026-08-15, finding #1/#46.
+  let serverAmountCents: number;
+  try {
+    const orderRes = await db.execute(sql`SELECT total, user_id, shipping_data FROM orders WHERE id = ${parseIntSafe(orderId)}`);
+    if (orderRes.rows.length === 0) {
+      // Guest pre-order flow: trust body amount but require it to be positive.
+      if (!amount || amount <= 0) return res.status(400).json({ error: 'Importe inválido' });
+      serverAmountCents = Math.round(Number(amount) * 100);
+    } else {
+      const order = orderRes.rows[0] as any;
+      serverAmountCents = Number(order.total) || 0;
+      if (serverAmountCents <= 0) return res.status(400).json({ error: 'Pedido sin importe válido' });
+    }
+  } catch (e: any) {
+    return res.status(500).json({ error: 'Error consultando el pedido: ' + e.message });
+  }
 
   try {
     const client = getStripeClient(req);
@@ -7164,14 +7230,14 @@ app.post('/api/create-payment-intent', async (req: any, res: any) => {
       metadata.customer_email = customerEmail || '';
     }
     const paymentIntent = await client.paymentIntents.create({
-      amount: Math.round(amount * 100),
+      amount: serverAmountCents,
       currency: (currency || 'eur').toLowerCase(),
       metadata,
       receipt_email: customerEmail || undefined,
       payment_method_types: ['card', 'bizum', 'klarna'],
     });
 
-    console.log(`[STRIPE] PaymentIntent created: ${paymentIntent.id} for order ${orderId} (${amount} EUR)`);
+    console.log(`[STRIPE] PaymentIntent created: ${paymentIntent.id} for order ${orderId} (${serverAmountCents / 100} EUR)`);
     return res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
   } catch (error: any) {
     console.error('[STRIPE CREATE PAYMENT INTENT ERROR]:', error.message || error);
