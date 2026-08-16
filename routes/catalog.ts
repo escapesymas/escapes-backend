@@ -186,7 +186,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
     } else if (action === 'compatible-skus') {
       const skusSet = new Set<string>();
 
-      // 1. SKUs desde moto_catalog.json (jerarquía y mapeo de compatibilidad)
+      // 1. SKUs desde moto_catalog.json (jerarquía y mapeo de compatibilidad en memoria)
       if (brand && hierarchy[brand]) {
         const compatibilityMap = catalog?.compatibility || {};
         let codes: string[] = [];
@@ -216,7 +216,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
         });
       }
 
-      // 2. SKUs desde bihr_compatibility_cache.json
+      // 2. SKUs desde bihr_compatibility_cache.json (compatibilidades sincronizadas en memoria)
       const cacheFile = path.join(process.cwd(), 'bihr_compatibility_cache.json');
       if (fs.existsSync(cacheFile)) {
         try {
@@ -238,36 +238,6 @@ catalogRouter.get('/vehicles', async (req, res) => {
                 break;
               }
             }
-          }
-        } catch (e) {}
-      }
-
-      // 3. SKUs desde la columna compatibility JSONB de PostgreSQL (usando jsonb_array_elements rápido)
-      if (brand) {
-        try {
-          const bLower = brand.toLowerCase();
-          const mLower = model ? model.toLowerCase() : '';
-          const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
-
-          let sqlQuery = sql`
-            SELECT DISTINCT sku FROM products 
-            WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'::jsonb
-              AND EXISTS (
-                SELECT 1 FROM jsonb_array_elements(compatibility) elem
-                WHERE LOWER(elem->>'brand') = ${bLower}
-          `;
-
-          if (yNum) {
-            sqlQuery = sql`${sqlQuery} AND (elem->>'year')::int = ${yNum}`;
-          }
-          if (mLower) {
-            sqlQuery = sql`${sqlQuery} AND LOWER(elem->>'model') LIKE ${`%${mLower}%`}`;
-          }
-          sqlQuery = sql`${sqlQuery} )`;
-
-          const dbRes = await db.execute(sqlQuery);
-          for (const row of dbRes.rows as any[]) {
-            if (row.sku) skusSet.add(row.sku);
           }
         } catch (e) {}
       }
@@ -416,11 +386,8 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     const totalPages = Math.max(1, Math.ceil(total / perPage));
 
     const productsRes = await db.execute(sql`
-      SELECT p.*,
-             COALESCE(rs.avg_rating, 0) AS avg_rating,
-             COALESCE(rs.review_count, 0) AS review_count
+      SELECT p.*
       FROM products p
-      LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
       ${conditions}
       ORDER BY p.stock DESC, p.id DESC
       LIMIT ${perPage} OFFSET ${offset}
