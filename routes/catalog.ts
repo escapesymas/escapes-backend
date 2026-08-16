@@ -187,20 +187,22 @@ catalogRouter.get('/vehicles', async (req, res) => {
       const skusSet = new Set<string>();
 
       // 1. SKUs desde moto_catalog.json (jerarquía y mapeo de compatibilidad en memoria)
-      if (brand && hierarchy[brand]) {
+      const matchedBrandKey = brand ? (Object.keys(hierarchy).find(k => k.toLowerCase() === brand.toLowerCase()) || brand.toUpperCase()) : '';
+      if (matchedBrandKey && hierarchy[matchedBrandKey]) {
         const compatibilityMap = catalog?.compatibility || {};
         let codes: string[] = [];
 
         if (model) {
+          const matchedModelKey = Object.keys(hierarchy[matchedBrandKey] || {}).find(k => k.toLowerCase() === model.toLowerCase()) || model;
           if (year && year !== 'General' && year !== '') {
-            codes = hierarchy[brand][model]?.[year] || [];
-          } else if (hierarchy[brand][model]) {
-            Object.values(hierarchy[brand][model]).forEach((cList: any) => {
+            codes = hierarchy[matchedBrandKey][matchedModelKey]?.[year] || hierarchy[matchedBrandKey][model]?.[year] || [];
+          } else if (hierarchy[matchedBrandKey][matchedModelKey]) {
+            Object.values(hierarchy[matchedBrandKey][matchedModelKey]).forEach((cList: any) => {
               if (Array.isArray(cList)) codes.push(...cList);
             });
           }
         } else {
-          Object.values(hierarchy[brand]).forEach((modelsObj: any) => {
+          Object.values(hierarchy[matchedBrandKey]).forEach((modelsObj: any) => {
             if (modelsObj) {
               Object.values(modelsObj).forEach((cList: any) => {
                 if (Array.isArray(cList)) codes.push(...cList);
