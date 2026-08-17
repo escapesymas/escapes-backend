@@ -832,18 +832,25 @@ catalogRouter.get('/catalog/stock-check', async (req, res) => {
   }
 });
 
-// GET /api/catalog/products-by-skus
-catalogRouter.get('/catalog/products-by-skus', async (req, res) => {
+// GET & POST /api/catalog/products-by-skus
+catalogRouter.all('/catalog/products-by-skus', async (req, res) => {
   try {
-    const { skus, ids, category_id } = req.query as any;
+    const rawSkus = req.method === 'POST' ? (req.body?.skus || req.query?.skus) : req.query?.skus;
+    const rawIds = req.method === 'POST' ? (req.body?.ids || req.query?.ids) : req.query?.ids;
+    const category_id = req.method === 'POST' ? (req.body?.category_id || req.query?.category_id) : req.query?.category_id;
+
     const conditions = sql`WHERE status = 'published'`;
 
-    if (ids) {
-      const idsList = ids.split(',').map((id: string) => parseInt(id, 10)).filter((id: number) => !isNaN(id));
+    if (rawIds) {
+      const idsList = (Array.isArray(rawIds) ? rawIds : String(rawIds).split(','))
+        .map((id: any) => parseInt(String(id), 10))
+        .filter((id: number) => !isNaN(id));
       if (idsList.length === 0) return res.json([]);
       conditions.append(sql` AND id IN (${buildInClause(idsList)})`);
-    } else if (skus) {
-      const skusList = skus.split(',').map((s: string) => sanitizeString(s.trim()));
+    } else if (rawSkus) {
+      const skusList = (Array.isArray(rawSkus) ? rawSkus : String(rawSkus).split(','))
+        .map((s: any) => sanitizeString(String(s).trim()))
+        .filter(Boolean);
       if (skusList.length === 0) return res.json([]);
       conditions.append(sql` AND sku IN (${buildInClause(skusList)})`);
     } else {
