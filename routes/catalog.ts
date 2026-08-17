@@ -186,7 +186,61 @@ catalogRouter.get('/vehicles', async (req, res) => {
     } else if (action === 'compatible-skus') {
       const skusSet = new Set<string>();
 
-      // 1. SKUs desde moto_catalog.json (jerarquía y mapeo de compatibilidad en memoria)
+      // 1. SKUs desde productos en PostgreSQL (coincidencia directa por nombre de modelo y columna compatibility JSONB)
+      if (brand && model) {
+        try {
+          const bLower = (brand || '').toLowerCase();
+          const mClean = (model || '').replace(/\d+/g, '').trim().toLowerCase(); // ej: 'pcx'
+          const yStr = year ? String(year) : '';
+
+          if (mClean) {
+            const dbRes = await db.execute(sql`
+              SELECT sku, name, compatibility FROM products 
+              WHERE status = 'published' 
+                AND (
+                  (name ILIKE ${'%' + mClean + '%'})
+                  OR (compatibility IS NOT NULL AND compatibility != '[]'::jsonb)
+                )
+            `);
+
+            for (const row of dbRes.rows as any[]) {
+              if (!row.sku) continue;
+              const nameLower = (row.name || '').toLowerCase();
+
+              // Coincidencia directa por nombre si contiene el modelo
+              if (nameLower.includes(mClean)) {
+                skusSet.add(row.sku);
+                continue;
+              }
+
+              // Coincidencia por columna JSONB
+              if (row.compatibility) {
+                let list: any[] = [];
+                if (typeof row.compatibility === 'string') {
+                  try { list = JSON.parse(row.compatibility); } catch {}
+                } else if (Array.isArray(row.compatibility)) {
+                  list = row.compatibility;
+                }
+                for (const item of list) {
+                  if (!item.brand) continue;
+                  const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
+                  const matchModel = !mClean || (item.model && item.model.toLowerCase().includes(mClean));
+                  const matchYear = !yStr || (item.year && String(item.year) === yStr);
+
+                  if (matchBrand && matchModel && matchYear) {
+                    skusSet.add(row.sku);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.error('Error fetching DB products compatibility:', e);
+        }
+      }
+
+      // 2. SKUs desde moto_catalog.json (jerarquía y mapeo de compatibilidad en memoria)
       const matchedBrandKey = brand ? (Object.keys(hierarchy).find(k => k.toLowerCase() === brand.toLowerCase()) || brand.toUpperCase()) : '';
       if (matchedBrandKey && hierarchy[matchedBrandKey]) {
         const compatibilityMap = catalog?.compatibility || {};
@@ -218,7 +272,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
         });
       }
 
-      // 2. SKUs desde bihr_compatibility_cache.json (compatibilidades sincronizadas en memoria)
+      // 3. SKUs desde bihr_compatibility_cache.json (compatibilidades sincronizadas en memoria)
       const cacheFile = path.join(process.cwd(), 'bihr_compatibility_cache.json');
       if (fs.existsSync(cacheFile)) {
         try {
@@ -242,43 +296,6 @@ catalogRouter.get('/vehicles', async (req, res) => {
             }
           }
         } catch (e) {}
-      }
-
-      // 3. SKUs desde los productos en PostgreSQL con columna compatibility JSONB (rápido en 80ms)
-      if (brand) {
-        try {
-          const bLower = (brand || '').toLowerCase();
-          const mLower = (model || '').toLowerCase();
-          const yStr = year ? String(year) : '';
-
-          const dbRes = await db.execute(sql`
-            SELECT sku, compatibility FROM products 
-            WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'::jsonb
-          `);
-
-          for (const row of dbRes.rows as any[]) {
-            if (!row.sku || !row.compatibility) continue;
-            let list: any[] = [];
-            if (typeof row.compatibility === 'string') {
-              try { list = JSON.parse(row.compatibility); } catch {}
-            } else if (Array.isArray(row.compatibility)) {
-              list = row.compatibility;
-            }
-            for (const item of list) {
-              if (!item.brand) continue;
-              const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
-              const matchModel = !mLower || (item.model && (item.model.toLowerCase().includes(mLower) || mLower.includes(item.model.toLowerCase())));
-              const matchYear = !yStr || (item.year && String(item.year) === yStr);
-
-              if (matchBrand && matchModel && matchYear) {
-                skusSet.add(row.sku);
-                break;
-              }
-            }
-          }
-        } catch (e) {
-          console.error('Error fetching DB compatibility:', e);
-        }
       }
 
       responseData = Array.from(skusSet);
@@ -851,12 +868,8 @@ catalogRouter.get('/catalog/products-by-skus', async (req, res) => {
     }
 
     const productsRes = await db.execute(sql`
-      SELECT * FROM (
-        SELECT DISTINCT ON (split_part(name, ',', 1)) *
-        FROM products
-        ${conditions}
-        ORDER BY split_part(name, ',', 1), stock DESC, id ASC
-      ) distinct_products
+      SELECT * FROM products
+      ${conditions}
       ORDER BY price ASC
     `);
     const products = productsRes.rows.map(mapProductToFrontend);
