@@ -169,7 +169,30 @@ function cleanModelName(m: any): string {
   return String(m || '').replace(/\(.*\)/g, '').trim().toLowerCase();
 }
 
-// Índice en memoria para la columna compatibility JSONB de PostgreSQL
+function parseTitleYears(title: string): [number, number] | null {
+  let match = title.match(/\b(20\d{2})[-–](20\d{2})\b/);
+  if (match) return [parseInt(match[1], 10), parseInt(match[2], 10)];
+
+  match = title.match(/\b(19\d{2}|20\d{2})[-–]\b/) || title.match(/\((\d{2})[-–]\)/);
+  if (match) {
+    let y = parseInt(match[1], 10);
+    if (y < 100) y = 2000 + y;
+    return [y, 2030];
+  }
+
+  match = title.match(/\b(\d{2})[-–](\d{2})\b/);
+  if (match) {
+    let y1 = parseInt(match[1], 10);
+    let y2 = parseInt(match[2], 10);
+    if (y1 < 100) y1 = (y1 > 70 ? 1900 : 2000) + y1;
+    if (y2 < 100) y2 = (y2 > 70 ? 1900 : 2000) + y2;
+    return [y1, y2];
+  }
+
+  return null;
+}
+
+// Índice en memoria para la columna compatibility JSONB y rangos de título en PostgreSQL
 let dbCompatibilityIndex: Map<string, Set<string>> | null = null;
 let lastIndexBuildTime = 0;
 let isBuildingIndex = false;
@@ -188,33 +211,71 @@ async function getDbCompatibilityIndex(): Promise<Map<string, Set<string>>> {
 
   try {
     const res = await db.execute(sql`
-      SELECT sku, compatibility FROM products 
-      WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'::jsonb
+      SELECT sku, name, brand, compatibility FROM products 
+      WHERE status = 'published'
     `);
 
     for (const row of res.rows as any[]) {
-      if (!row.sku || !row.compatibility) continue;
-      let list: any[] = [];
-      if (typeof row.compatibility === 'string') {
-        try { list = JSON.parse(row.compatibility); } catch {}
-      } else if (Array.isArray(row.compatibility)) {
-        list = row.compatibility;
+      if (!row.sku) continue;
+
+      // 1. Coincidencia por columna JSONB
+      if (row.compatibility && row.compatibility !== '[]') {
+        let list: any[] = [];
+        if (typeof row.compatibility === 'string') {
+          try { list = JSON.parse(row.compatibility); } catch {}
+        } else if (Array.isArray(row.compatibility)) {
+          list = row.compatibility;
+        }
+
+        for (const item of list) {
+          if (!item.brand || !item.model) continue;
+          const b = String(item.brand).trim().toLowerCase();
+          const m = cleanModelName(item.model);
+          const y = item.year ? String(item.year).trim() : '';
+
+          if (y) {
+            const k1 = `${b}::${m}::${y}`;
+            if (!newIndex.has(k1)) newIndex.set(k1, new Set());
+            newIndex.get(k1)!.add(row.sku);
+          }
+          const k2 = `${b}::${m}`;
+          if (!newIndex.has(k2)) newIndex.set(k2, new Set());
+          newIndex.get(k2)!.add(row.sku);
+        }
       }
 
-      for (const item of list) {
-        if (!item.brand || !item.model) continue;
-        const b = String(item.brand).trim().toLowerCase();
-        const m = cleanModelName(item.model);
-        const y = item.year ? String(item.year).trim() : '';
+      // 2. Coincidencia por rango de años en el título si la compatibilidad JSONB es nula
+      if (row.name) {
+        const titleLower = String(row.name).toLowerCase();
+        const yearRange = parseTitleYears(row.name);
+        if (yearRange) {
+          const [yMin, yMax] = yearRange;
+          let b = row.brand ? String(row.brand).trim().toLowerCase() : '';
+          if (!b) {
+            if (titleLower.includes('honda')) b = 'honda';
+            else if (titleLower.includes('yamaha')) b = 'yamaha';
+            else if (titleLower.includes('kawasaki')) b = 'kawasaki';
+            else if (titleLower.includes('suzuki')) b = 'suzuki';
+            else if (titleLower.includes('bmw')) b = 'bmw';
+            else if (titleLower.includes('ktm')) b = 'ktm';
+            else if (titleLower.includes('piaggio')) b = 'piaggio';
+            else if (titleLower.includes('kymco')) b = 'kymco';
+            else if (titleLower.includes('sym')) b = 'sym';
+          }
 
-        if (y) {
-          const k1 = `${b}::${m}::${y}`;
-          if (!newIndex.has(k1)) newIndex.set(k1, new Set());
-          newIndex.get(k1)!.add(row.sku);
+          if (b) {
+            const knownModels = ['pcx 125', 'pcx', 'sh 125', 'sh 150', 'cbr 1000 rr', 'cbr 600 rr', 't-max 530', 't-max 560', 'x-max 125', 'x-max 300', 'z900', 'z650', 'mt-07', 'mt-09'];
+            for (const m of knownModels) {
+              if (titleLower.includes(m)) {
+                for (let y = yMin; y <= Math.min(yMax, 2030); y++) {
+                  const key = `${b}::${m}::${y}`;
+                  if (!newIndex.has(key)) newIndex.set(key, new Set());
+                  newIndex.get(key)!.add(row.sku);
+                }
+              }
+            }
+          }
         }
-        const k2 = `${b}::${m}`;
-        if (!newIndex.has(k2)) newIndex.set(k2, new Set());
-        newIndex.get(k2)!.add(row.sku);
       }
     }
 
