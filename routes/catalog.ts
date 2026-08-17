@@ -165,6 +165,70 @@ function getCatalogData() {
   return catalogDataCache;
 }
 
+function cleanModelName(m: any): string {
+  return String(m || '').replace(/\(.*\)/g, '').trim().toLowerCase();
+}
+
+// Índice en memoria para la columna compatibility JSONB de PostgreSQL
+let dbCompatibilityIndex: Map<string, Set<string>> | null = null;
+let lastIndexBuildTime = 0;
+let isBuildingIndex = false;
+
+async function getDbCompatibilityIndex(): Promise<Map<string, Set<string>>> {
+  const now = Date.now();
+  if (dbCompatibilityIndex && (now - lastIndexBuildTime < 30 * 60 * 1000)) {
+    return dbCompatibilityIndex;
+  }
+  if (isBuildingIndex && dbCompatibilityIndex) {
+    return dbCompatibilityIndex;
+  }
+
+  isBuildingIndex = true;
+  const newIndex = new Map<string, Set<string>>();
+
+  try {
+    const res = await db.execute(sql`
+      SELECT sku, compatibility FROM products 
+      WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'::jsonb
+    `);
+
+    for (const row of res.rows as any[]) {
+      if (!row.sku || !row.compatibility) continue;
+      let list: any[] = [];
+      if (typeof row.compatibility === 'string') {
+        try { list = JSON.parse(row.compatibility); } catch {}
+      } else if (Array.isArray(row.compatibility)) {
+        list = row.compatibility;
+      }
+
+      for (const item of list) {
+        if (!item.brand || !item.model) continue;
+        const b = String(item.brand).trim().toLowerCase();
+        const m = cleanModelName(item.model);
+        const y = item.year ? String(item.year).trim() : '';
+
+        if (y) {
+          const k1 = `${b}::${m}::${y}`;
+          if (!newIndex.has(k1)) newIndex.set(k1, new Set());
+          newIndex.get(k1)!.add(row.sku);
+        }
+        const k2 = `${b}::${m}`;
+        if (!newIndex.has(k2)) newIndex.set(k2, new Set());
+        newIndex.get(k2)!.add(row.sku);
+      }
+    }
+
+    dbCompatibilityIndex = newIndex;
+    lastIndexBuildTime = now;
+  } catch (e) {
+    console.error('[COMPATIBILITY INDEX BUILD ERROR]:', e);
+  } finally {
+    isBuildingIndex = false;
+  }
+
+  return dbCompatibilityIndex || newIndex;
+}
+
 // GET /api/vehicles
 catalogRouter.get('/vehicles', async (req, res) => {
   const { action, brand, model, year } = req.query as any;
@@ -186,25 +250,32 @@ catalogRouter.get('/vehicles', async (req, res) => {
     } else if (action === 'compatible-skus') {
       const skusSet = new Set<string>();
 
-      // 1. SKUs desde productos en PostgreSQL (coincidencia directa por nombre de modelo y columna compatibility JSONB)
+      // 1. SKUs desde el índice en memoria de productos en PostgreSQL (coincidencia exacta por marca, modelo y año)
       if (brand && model) {
         try {
-          const bLower = (brand || '').toLowerCase();
-          const mClean = (model || '').replace(/\d+/g, '').trim().toLowerCase(); // ej: 'pcx'
-          const yStr = year ? String(year) : '';
+          const indexMap = await getDbCompatibilityIndex();
+          const bLower = (brand || '').trim().toLowerCase();
+          const mLower = cleanModelName(model);
+          const mClean = mLower.replace(/\d+/g, '').trim(); // ej: 'pcx'
+          const yStr = year ? String(year).trim() : '';
 
-          if (mClean && mClean.length >= 2) {
-            const dbRes = await db.execute(sql`
-              SELECT sku, name FROM products 
-              WHERE status = 'published' AND name ILIKE ${'%' + mClean + '%'}
-            `);
+          const keysToTry: string[] = [];
+          if (yStr) {
+            keysToTry.push(`${bLower}::${mLower}::${yStr}`);
+            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}::${yStr}`);
+          } else {
+            keysToTry.push(`${bLower}::${mLower}`);
+            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}`);
+          }
 
-            for (const row of dbRes.rows as any[]) {
-              if (row.sku) skusSet.add(row.sku);
+          for (const key of keysToTry) {
+            const matchedSkus = indexMap.get(key);
+            if (matchedSkus) {
+              matchedSkus.forEach((sku) => skusSet.add(sku));
             }
           }
         } catch (e) {
-          console.error('Error fetching DB products compatibility:', e);
+          console.error('Error fetching indexed DB compatibility:', e);
         }
       }
 
