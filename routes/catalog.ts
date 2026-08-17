@@ -244,6 +244,43 @@ catalogRouter.get('/vehicles', async (req, res) => {
         } catch (e) {}
       }
 
+      // 3. SKUs desde los productos en PostgreSQL con columna compatibility JSONB (rápido en 80ms)
+      if (brand) {
+        try {
+          const bLower = (brand || '').toLowerCase();
+          const mLower = (model || '').toLowerCase();
+          const yStr = year ? String(year) : '';
+
+          const dbRes = await db.execute(sql`
+            SELECT sku, compatibility FROM products 
+            WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'::jsonb
+          `);
+
+          for (const row of dbRes.rows as any[]) {
+            if (!row.sku || !row.compatibility) continue;
+            let list: any[] = [];
+            if (typeof row.compatibility === 'string') {
+              try { list = JSON.parse(row.compatibility); } catch {}
+            } else if (Array.isArray(row.compatibility)) {
+              list = row.compatibility;
+            }
+            for (const item of list) {
+              if (!item.brand) continue;
+              const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
+              const matchModel = !mLower || (item.model && (item.model.toLowerCase().includes(mLower) || mLower.includes(item.model.toLowerCase())));
+              const matchYear = !yStr || (item.year && String(item.year) === yStr);
+
+              if (matchBrand && matchModel && matchYear) {
+                skusSet.add(row.sku);
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          console.error('Error fetching DB compatibility:', e);
+        }
+      }
+
       responseData = Array.from(skusSet);
     } else {
       responseData = Object.keys(hierarchy).sort();
