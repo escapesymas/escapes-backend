@@ -193,46 +193,14 @@ catalogRouter.get('/vehicles', async (req, res) => {
           const mClean = (model || '').replace(/\d+/g, '').trim().toLowerCase(); // ej: 'pcx'
           const yStr = year ? String(year) : '';
 
-          if (mClean) {
+          if (mClean && mClean.length >= 2) {
             const dbRes = await db.execute(sql`
-              SELECT sku, name, compatibility FROM products 
-              WHERE status = 'published' 
-                AND (
-                  (name ILIKE ${'%' + mClean + '%'})
-                  OR (compatibility IS NOT NULL AND compatibility != '[]'::jsonb)
-                )
+              SELECT sku, name FROM products 
+              WHERE status = 'published' AND name ILIKE ${'%' + mClean + '%'}
             `);
 
             for (const row of dbRes.rows as any[]) {
-              if (!row.sku) continue;
-              const nameLower = (row.name || '').toLowerCase();
-
-              // Coincidencia directa por nombre si contiene el modelo
-              if (nameLower.includes(mClean)) {
-                skusSet.add(row.sku);
-                continue;
-              }
-
-              // Coincidencia por columna JSONB
-              if (row.compatibility) {
-                let list: any[] = [];
-                if (typeof row.compatibility === 'string') {
-                  try { list = JSON.parse(row.compatibility); } catch {}
-                } else if (Array.isArray(row.compatibility)) {
-                  list = row.compatibility;
-                }
-                for (const item of list) {
-                  if (!item.brand) continue;
-                  const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
-                  const matchModel = !mClean || (item.model && item.model.toLowerCase().includes(mClean));
-                  const matchYear = !yStr || (item.year && String(item.year) === yStr);
-
-                  if (matchBrand && matchModel && matchYear) {
-                    skusSet.add(row.sku);
-                    break;
-                  }
-                }
-              }
+              if (row.sku) skusSet.add(row.sku);
             }
           }
         } catch (e) {
