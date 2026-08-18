@@ -8,6 +8,7 @@ import {
   isLegacyPasswordHash,
   parseIntSafe,
   sanitizeString,
+  authenticateRequest,
 } from '../utils.js';
 
 export const authRouter = Router();
@@ -56,22 +57,21 @@ authRouter.post('/auth/logout', (_req, res) => {
 
 // GET /api/auth
 authRouter.get('/auth', async (req, res) => {
-  const { action, email, id } = req.query as any;
+  const { action } = req.query as any;
 
   try {
     if (action === 'get-profile') {
-      if (!email && !id) return res.status(400).json({ error: 'Falta email o id' });
+      // Auth required. Admin can target any user by passing `?id=N`. Otherwise
+      // the caller's own profile is returned. Previously the endpoint accepted
+      // an arbitrary `?email=` from anyone — full PII leak. Audit 2026-08-15,
+      // finding #25.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const requestedId = parseIntSafe(req.query?.id as any);
+      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetId) return res.status(400).json({ error: 'ID inválido' });
 
-      const conditions = sql`WHERE 1=1`;
-      if (email) {
-        conditions.append(sql` AND LOWER(email) = LOWER(${email})`);
-      } else if (id) {
-        const safeId = parseIntSafe(id);
-        if (!safeId) return res.status(400).json({ error: 'ID inválido' });
-        conditions.append(sql` AND id = ${safeId}`);
-      }
-
-      const userRes = await db.execute(sql`SELECT * FROM users ${conditions}`);
+      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetId}`);
       if (userRes.rows.length === 0) {
         return res.status(404).json({ error: 'Usuario no encontrado' });
       }
@@ -148,20 +148,13 @@ authRouter.post('/auth', async (req, res) => {
 
   try {
     if (action === 'get-profile') {
-      const email = body?.email || req.query?.email;
-      const id = body?.id || body?.userId || req.query?.id;
-      if (!email && !id) return res.status(400).json({ error: 'Falta email o id' });
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const requestedId = parseIntSafe(body?.id || body?.userId || req.query?.id);
+      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetId) return res.status(400).json({ error: 'ID inválido' });
 
-      const conditions = sql`WHERE 1=1`;
-      if (email) {
-        conditions.append(sql` AND LOWER(email) = LOWER(${email})`);
-      } else if (id) {
-        const safeId = parseIntSafe(id);
-        if (!safeId) return res.status(400).json({ error: 'ID inválido' });
-        conditions.append(sql` AND id = ${safeId}`);
-      }
-
-      const userRes = await db.execute(sql`SELECT * FROM users ${conditions}`);
+      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetId}`);
       if (userRes.rows.length === 0) {
         return res.status(404).json({ error: 'Usuario no encontrado' });
       }
@@ -205,36 +198,74 @@ authRouter.post('/auth', async (req, res) => {
     }
 
     if (action === 'update-profile') {
-      const userId = body.userId || body.id;
-      if (!userId) return res.status(400).json({ error: 'Falta ID de usuario' });
+      // Auth required; the body's userId is now IGNORED unless caller is admin.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const requestedId = parseIntSafe(body.userId || body.id);
+      const targetUserId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetUserId) return res.status(400).json({ error: 'Falta userId' });
 
-      const updates: string[] = [];
-      if (body.firstName !== undefined) updates.push(`first_name = ${sql`${body.firstName}`}`);
-      if (body.lastName !== undefined) updates.push(`last_name = ${sql`${body.lastName}`}`);
-      if (body.avatarUrl !== undefined) updates.push(`avatar_url = ${sql`${body.avatarUrl}`}`);
-      if (body.billing !== undefined) updates.push(`billing = ${sql`${JSON.stringify(body.billing)}`}`);
-      if (body.garage !== undefined) updates.push(`garage = ${sql`${JSON.stringify(body.garage)}`}`);
+      const { username, firstName, lastName, email, billing, garage, avatarUrl } = body;
+
+      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetUserId}`);
+      if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+      const user = userRes.rows[0] as any;
+
+      if (username && username.trim().toLowerCase() !== user.username.toLowerCase()) {
+        const cleanUsername = username.trim().toLowerCase().replace(/[^a-z0-9_.]/gi, '');
+        if (cleanUsername.length < 3) {
+          return res.status(400).json({ error: 'El nombre de usuario (@username) debe tener al menos 3 caracteres.' });
+        }
+        const existUsernameRes = await db.execute(sql`
+          SELECT id FROM users WHERE LOWER(username) = LOWER(${cleanUsername}) AND id != ${targetUserId}
+        `);
+        if (existUsernameRes.rows.length > 0) {
+          return res.status(400).json({ error: `El nombre de usuario (@${cleanUsername}) ya está reservado por otro piloto.` });
+        }
+      }
+      if (email && email.toLowerCase() !== user.email.toLowerCase()) {
+        const existRes = await db.execute(sql`
+          SELECT id FROM users WHERE LOWER(email) = LOWER(${email}) AND id != ${targetUserId}
+        `);
+        if (existRes.rows.length > 0) {
+          return res.status(400).json({ error: 'El correo electrónico ya está registrado por otro usuario' });
+        }
+      }
+
+      const billingJson = billing !== undefined
+        ? (typeof billing === 'string' ? billing : JSON.stringify(billing))
+        : (user.billing ? (typeof user.billing === 'string' ? user.billing : JSON.stringify(user.billing)) : null);
+      const garageJson = garage !== undefined
+        ? (typeof garage === 'string' ? garage : JSON.stringify(garage))
+        : (user.garage ? (typeof user.garage === 'string' ? user.garage : JSON.stringify(user.garage)) : null);
+      const cleanUsernameToSave = username ? username.trim().toLowerCase().replace(/[^a-z0-9_.]/gi, '') : null;
 
       await db.execute(sql`
         UPDATE users SET
-          first_name = COALESCE(${body.firstName ?? null}, first_name),
-          last_name = COALESCE(${body.lastName ?? null}, last_name),
-          avatar_url = COALESCE(${body.avatarUrl ?? null}, avatar_url),
-          billing = CASE WHEN ${body.billing ? true : false} THEN ${JSON.stringify(body.billing || {})}::jsonb ELSE billing END,
-          garage = CASE WHEN ${body.garage ? true : false} THEN ${JSON.stringify(body.garage || [])}::jsonb ELSE garage END
-        WHERE id = ${parseIntSafe(userId)}
+          username = COALESCE(${cleanUsernameToSave || null}, username),
+          first_name = COALESCE(${firstName || null}, first_name),
+          last_name = COALESCE(${lastName || null}, last_name),
+          email = COALESCE(${email || null}, email),
+          billing = ${billingJson}::jsonb,
+          garage = ${garageJson}::jsonb,
+          avatar_url = COALESCE(${avatarUrl || null}, avatar_url)
+        WHERE id = ${targetUserId}
       `);
 
       return res.json({ success: true });
     }
 
     if (action === 'change-password') {
-      const { userId, currentPassword, newPassword } = body;
-      if (!userId || !currentPassword || !newPassword) {
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const { currentPassword, newPassword } = body;
+      const requestedId = parseIntSafe(body.userId || body.id);
+      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetId || !currentPassword || !newPassword) {
         return res.status(400).json({ error: 'Faltan datos obligatorios' });
       }
 
-      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${parseIntSafe(userId)}`);
+      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetId}`);
       if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
       const user = userRes.rows[0] as any;
@@ -247,15 +278,59 @@ authRouter.post('/auth', async (req, res) => {
     }
 
     if (action === 'delete-account') {
-      const { userId } = body;
-      if (!userId) return res.status(400).json({ error: 'Falta ID de usuario' });
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const requestedId = parseIntSafe(body.userId || body.id);
+      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetId) return res.status(400).json({ error: 'Falta userId' });
 
-      await db.execute(sql`DELETE FROM users WHERE id = ${parseIntSafe(userId)}`);
+      try {
+        await db.execute(sql`DELETE FROM users WHERE id = ${targetId}`);
+      } catch (err) {
+        await db.execute(sql`
+          UPDATE users SET
+            username = ${`eliminado_${targetId}`},
+            email = ${`eliminado_${targetId}@escapesymas.com`},
+            first_name = 'Usuario',
+            last_name = 'Eliminado',
+            password_hash = '',
+            avatar_url = '',
+            billing = null,
+            garage = null,
+            cart = null,
+            role = 'customer'
+          WHERE id = ${targetId}
+        `);
+      }
       clearAuthCookie(res);
       return res.json({ success: true });
     }
 
-    if (action === 'login' || action === 'social-login') {
+    if (action === 'save-cart') {
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const { cart } = body;
+      const requestedId = parseIntSafe(body.userId);
+      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
+      if (!targetId) return res.status(400).json({ error: 'Falta userId' });
+      await db.execute(sql`
+        UPDATE users SET cart = ${cart ? JSON.stringify(cart) : null}::jsonb
+        WHERE id = ${targetId}
+      `);
+      return res.json({ success: true });
+    }
+
+    if (action === 'social-login') {
+      // Social login was never wired up to a real OAuth provider. The previous
+      // implementation accepted any `provider`+`token` pair and issued a JWT
+      // without verifying the password — anyone could log in as any user.
+      // Reject the endpoint until a proper provider integration exists.
+      return res.status(501).json({
+        error: 'Inicio de sesión social no implementado',
+      });
+    }
+
+    if (action === 'login') {
       const { username, password } = body;
       if (!username) return res.status(400).json({ error: 'Falta email o usuario' });
 
@@ -269,18 +344,15 @@ authRouter.post('/auth', async (req, res) => {
       }
 
       const user = userRes.rows[0] as any;
-      const isSocial = !!(body.provider && body.token);
 
-      if (!isSocial) {
-        const isValid = await verifyPassword(password || '', user.password_hash);
-        if (!isValid) {
-          return res.status(401).json({ error: 'Contraseña incorrecta' });
-        }
+      const isValid = await verifyPassword(password || '', user.password_hash);
+      if (!isValid) {
+        return res.status(401).json({ error: 'Contraseña incorrecta' });
+      }
 
-        if (user.password_hash && isLegacyPasswordHash(user.password_hash)) {
-          const newHash = await hashPassword(password || '');
-          await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${user.id}`);
-        }
+      if (user.password_hash && isLegacyPasswordHash(user.password_hash)) {
+        const newHash = await hashPassword(password || '');
+        await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${user.id}`);
       }
 
       const token = generateJWT(user);

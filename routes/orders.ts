@@ -4,7 +4,7 @@ import { sql } from 'drizzle-orm';
 import fs from 'fs';
 import path from 'path';
 import PDFDocument from 'pdfkit';
-import { parseIntSafe } from '../utils.js';
+import { parseIntSafe, authenticateRequest } from '../utils.js';
 
 export const ordersRouter = Router();
 
@@ -161,21 +161,29 @@ export async function createInvoiceForOrder(orderId: number) {
 // GET /api/orders
 ordersRouter.get('/orders', async (req, res) => {
   try {
-    const { userId, email, status } = req.query as any;
-    if (!userId && !email) return res.status(400).json({ error: 'Falta userId o email' });
+    // Auth required: caller can only list their own orders. Admin role can
+    // pass `userId`/`email` to look up a specific user. Previously anyone
+    // could enumerate other customers' orders by passing `?userId=N`.
+    // Audit 2026-08-15, finding #17/#47.
+    const auth = authenticateRequest(req);
+    if (!auth) return res.status(401).json({ error: 'No autenticado' });
 
-    const conditions = sql`WHERE 1=1`;
+    const { userId, email, status } = req.query as any;
+    let targetUserId: number | null = null;
+    if (auth.role === 'admin' && userId) {
+      targetUserId = parseIntSafe(userId);
+    } else if (auth.role === 'admin' && email) {
+      const uRes = await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = LOWER(${email as string}) LIMIT 1`);
+      targetUserId = uRes.rows.length ? (uRes.rows[0] as any).id : null;
+    } else {
+      targetUserId = auth.user_id;
+    }
+    if (!targetUserId) return res.status(400).json({ error: 'Falta userId' });
+
+    const conditions = sql`WHERE user_id = ${targetUserId}`;
     if (status && status !== 'all') {
       conditions.append(sql` AND status = ${status}`);
     }
-    if (userId) {
-      const safeUserId = parseIntSafe(userId);
-      if (!safeUserId) return res.status(400).json({ error: 'userId inválido' });
-      conditions.append(sql` AND user_id = ${safeUserId}`);
-    } else if (email) {
-      conditions.append(sql` AND shipping_data->>'email' = ${email}`);
-    }
-
     conditions.append(sql` ORDER BY created_at DESC LIMIT 5`);
 
     const ordersRes = await db.execute(sql`SELECT * FROM orders ${conditions}`);
@@ -204,7 +212,10 @@ ordersRouter.get('/orders', async (req, res) => {
 
 // GET /api/orders/download-invoice
 ordersRouter.get('/orders/download-invoice', async (req: any, res: any) => {
-  const { orderId, userEmail } = req.query as any;
+  const auth = authenticateRequest(req);
+  if (!auth) return res.status(401).json({ error: 'No autenticado' });
+
+  const { orderId } = req.query as any;
   if (!orderId) return res.status(400).json({ error: 'Falta orderId' });
 
   try {
@@ -215,20 +226,14 @@ ordersRouter.get('/orders/download-invoice', async (req: any, res: any) => {
     const order = orderRes.rows[0] as any;
     if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
 
-    let isAuthorized = false;
-    if (userEmail) {
-      if (userEmail.toLowerCase() === 'info@escapesymas.com') {
-        isAuthorized = true;
-      } else {
-        const uRes = await db.execute(sql`SELECT id FROM users WHERE email = ${userEmail}`);
-        if (uRes.rows.length > 0 && uRes.rows[0].id === order.user_id) {
-          isAuthorized = true;
-        }
-      }
-    }
-
-    if (!isAuthorized) {
-      return res.status(401).json({ error: 'No autorizado para ver esta factura' });
+    // Ownership: must be the order's user OR admin. The previous implementation
+    // accepted any `userEmail` query param and hardcoded an exception for the
+    // admin address — anyone could download any invoice. See audit 2026-08-15,
+    // finding #18/#22.
+    const isOwner = order.user_id === auth.user_id;
+    const isAdmin = auth.role === 'admin';
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: 'No autorizado para ver esta factura' });
     }
 
     const invRow = await db.execute(sql`SELECT * FROM invoices WHERE order_id = ${parsedId}`);

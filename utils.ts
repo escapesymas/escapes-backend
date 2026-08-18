@@ -1,7 +1,18 @@
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
+import type { Request, Response, NextFunction } from 'express';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'escapes-y-mas-default-secret-change-in-production';
+// Single source of truth for the JWT signing secret. If it isn't configured,
+// or is shorter than 32 bytes, fail loudly at boot — silently falling back to
+// a hardcoded string would allow anyone to forge admin tokens.
+const RAW_JWT_SECRET = process.env.JWT_SECRET;
+if (!RAW_JWT_SECRET || RAW_JWT_SECRET.length < 32) {
+  throw new Error(
+    'JWT_SECRET is missing or shorter than 32 chars. ' +
+    'Set a strong random value (e.g. `openssl rand -hex 32`) in the environment.'
+  );
+}
+export const JWT_SECRET: string = RAW_JWT_SECRET;
 
 export function sanitizeString(str: string): string {
   if (!str || typeof str !== 'string') return '';
@@ -59,6 +70,30 @@ export function authenticateRequest(req: any): any | null {
     if (user) return user;
   }
   return null;
+}
+
+export function requireAuth(req: any, res: Response, next: NextFunction): void {
+  const user = authenticateRequest(req);
+  if (!user) {
+    res.status(401).json({ error: 'No autenticado' });
+    return;
+  }
+  req.user = user;
+  next();
+}
+
+export function requireAdmin(req: any, res: Response, next: NextFunction): void {
+  const user = authenticateRequest(req);
+  if (!user) {
+    res.status(401).json({ error: 'No autenticado' });
+    return;
+  }
+  if (user.role !== 'admin') {
+    res.status(403).json({ error: 'Acceso restringido a administradores' });
+    return;
+  }
+  req.user = user;
+  next();
 }
 
 export function hashPasswordSHA256(password: string): string {

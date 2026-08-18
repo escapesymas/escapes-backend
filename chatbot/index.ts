@@ -1,5 +1,5 @@
 import type { Request, Response } from 'express';
-import jwt from 'jsonwebtoken';
+import { verifyJWT } from '../utils.js';
 import { minimaxClient, CHAT_MODEL, CHAT_LIMITS } from './minimax.js';
 import { sanitizeUserInput, containsPromptInjection, isOutOfScope } from './sanitize.js';
 import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, type CatalogHit } from './catalog.js';
@@ -272,19 +272,14 @@ export async function chatHandler(req: Request, res: Response) {
 }
 
 function verifyChatJWT(token: string): ChatUser | null {
-  try {
-    const secret = process.env.JWT_SECRET || 'insecure-default-secret-change-me';
-    const decoded = jwt.verify(token, secret) as any;
-    if (!decoded || typeof decoded !== 'object' || !decoded.user_id) return null;
-    return {
-      user_id: decoded.user_id,
-      email: decoded.email,
-      username: decoded.username,
-      role: decoded.role,
-    };
-  } catch {
-    return null;
-  }
+  const decoded = verifyJWT(token) as any;
+  if (!decoded || typeof decoded !== 'object' || !decoded.user_id) return null;
+  return {
+    user_id: decoded.user_id,
+    email: decoded.email,
+    username: decoded.username,
+    role: decoded.role,
+  };
 }
 
 export function chatHealthHandler(_req: Request, res: Response) {
