@@ -2268,25 +2268,42 @@ async function initCompatIndex() {
 // ================================================================
 let catalog: any = null;
 function getCatalog() {
-  if (!catalog) {
-    const filePath = path.join(__dirname, 'moto_catalog.json');
-    if (!fs.existsSync(filePath)) {
-      const altPath = path.join(process.cwd(), 'moto_catalog.json');
-      if (fs.existsSync(altPath)) {
-        catalog = JSON.parse(fs.readFileSync(altPath, 'utf-8'));
-      } else {
-        // Intenta cargarlo del directorio server/
-        const serverPath = path.join(process.cwd(), 'server', 'moto_catalog.json');
-        if (fs.existsSync(serverPath)) {
-          catalog = JSON.parse(fs.readFileSync(serverPath, 'utf-8'));
-        } else {
-          throw new Error(`Catalog missing. Searched in: ${filePath}, ${altPath} and ${serverPath}`);
-        }
+  if (catalog) return catalog;
+
+  let currentDir = process.cwd();
+  try {
+    if (typeof __dirname !== 'undefined') {
+      currentDir = __dirname;
+    } else if (import.meta && import.meta.url) {
+      const { fileURLToPath } = require('url');
+      currentDir = path.dirname(fileURLToPath(import.meta.url));
+    }
+  } catch {
+    // fallback process.cwd()
+  }
+
+  const candidates = [
+    path.join(currentDir, 'moto_catalog.json'),
+    path.join(currentDir, '..', 'moto_catalog.json'),
+    path.join(process.cwd(), 'moto_catalog.json'),
+    path.join(process.cwd(), 'escapes-backend', 'moto_catalog.json'),
+    path.join(process.cwd(), 'server', 'moto_catalog.json'),
+  ];
+
+  for (const filePath of candidates) {
+    try {
+      if (fs.existsSync(filePath)) {
+        catalog = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        console.log(`[CATALOG] Loaded moto_catalog.json from ${filePath}`);
+        return catalog;
       }
-    } else {
-      catalog = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    } catch (err: any) {
+      console.warn(`[CATALOG] Failed to parse ${filePath}:`, err.message);
     }
   }
+
+  console.warn('[CATALOG] moto_catalog.json not found in any candidate path. Returning empty hierarchy.');
+  catalog = { hierarchy: {}, compatibility: {} };
   return catalog;
 }
 
