@@ -2565,11 +2565,10 @@ app.get('/api/vehicles', async (req, res) => {
             return [];
           }
 
-          const productsRes = await db.execute(sql`
-            SELECT * FROM products
-            WHERE status = 'published' AND price > 0 AND sku IN (${buildInClause(skusList)})
-            ORDER BY price ASC
-          `);
+          const productsRes = await pool.query(
+            `SELECT * FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
+            [skusList]
+          );
           const products = productsRes.rows.map(mapProductToFrontend);
           await cacheSet(redisKey, products, 600);
           return products;
@@ -2583,7 +2582,7 @@ app.get('/api/vehicles', async (req, res) => {
           const result = await db.execute(sql`SELECT DISTINCT brand FROM products WHERE brand IS NOT NULL AND brand != '' ORDER BY brand`);
           return result.rows.map((r: any) => r.brand);
         }
-        if (action === 'models' || action === 'years' || action === 'compatible-skus') {
+        if (action === 'models' || action === 'years' || action === 'compatible-skus' || action === 'compatible-products') {
           return [];
         }
         throw new Error('Acción no válida');
