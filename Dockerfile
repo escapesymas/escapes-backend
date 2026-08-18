@@ -28,7 +28,7 @@ RUN npm run build
 FROM node:22-alpine AS runner
 RUN apk add --no-cache wget curl unzip
 WORKDIR /app/server
-ENV NODE_ENV=production PORT=3001
+ENV NODE_ENV=production PORT=3001 NODE_OPTIONS="--max-old-space-size=4096"
 
 # System user & required persistent directories
 RUN addgroup --system --gid 1001 nodejs && \
