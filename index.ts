@@ -2320,6 +2320,124 @@ app.get('/api/vehicles', async (req, res) => {
   const { action, brand, model, year } = req.query as any;
 
   try {
+    if (action === 'compatible-products') {
+      const redisKey = `compat:products:v4:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+      const cachedProducts = await cacheGet<any[]>(redisKey);
+      if (cachedProducts) {
+        return res.json(cachedProducts);
+      }
+
+      const skusSet = new Set<string>();
+      const { hierarchy, compatibility } = getCatalog();
+
+      if (brand) {
+        const bKey = brand.toLowerCase();
+        const mKey = model ? model.toLowerCase() : '';
+        const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
+
+        if (currentCompatIndex) {
+          const yearMap = currentCompatIndex.get(bKey);
+          if (yearMap) {
+            if (yNum) {
+              const list = yearMap.get(yNum);
+              if (list) {
+                for (const item of list) {
+                  if (mKey) {
+                    const cModel = item.model?.toLowerCase() || '';
+                    if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
+                  }
+                  skusSet.add(item.sku);
+                }
+              }
+            } else {
+              for (const list of yearMap.values()) {
+                for (const item of list) {
+                  if (mKey) {
+                    const cModel = item.model?.toLowerCase() || '';
+                    if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
+                  }
+                  skusSet.add(item.sku);
+                }
+              }
+            }
+          }
+        } else {
+          const params: any[] = [brand];
+          let queryStr = `
+            SELECT DISTINCT sku 
+            FROM products 
+            WHERE status = 'published' 
+              AND compatibility IS NOT NULL 
+              AND compatibility != '[]'
+              AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements(compatibility) elem
+                WHERE LOWER(elem->>'brand') = LOWER($1)
+          `;
+          let paramIdx = 2;
+          if (yNum) {
+            queryStr += ` AND (elem->>'year')::int = $${paramIdx++}`;
+            params.push(yNum);
+          }
+          if (mKey) {
+            queryStr += ` AND (
+              LOWER(elem->>'model') LIKE $${paramIdx}
+              OR $${paramIdx + 1} LIKE CONCAT('%', LOWER(elem->>'model'), '%')
+            )`;
+            params.push(`%${mKey}%`);
+            params.push(mKey);
+          }
+          queryStr += `)`;
+          try {
+            const dbRes = await pool.query(queryStr, params);
+            dbRes.rows.forEach((r: any) => {
+              if (r.sku) skusSet.add(r.sku);
+            });
+          } catch (dbErr) {
+            console.error('[VEHICLES DB COMPATIBILITY ERROR]:', dbErr);
+          }
+        }
+      }
+
+      if (brand && hierarchy[brand]) {
+        let codes: string[] = [];
+        if (model) {
+          if (year && year !== 'General' && year !== '') {
+            codes = hierarchy[brand][model]?.[year] || [];
+          } else if (hierarchy[brand][model]) {
+            Object.values(hierarchy[brand][model]).forEach((cList: any) => {
+              codes.push(...cList);
+            });
+          }
+        } else {
+          Object.values(hierarchy[brand]).forEach((modelsObj: any) => {
+            if (modelsObj) {
+              Object.values(modelsObj).forEach((cList: any) => {
+                codes.push(...cList);
+              });
+            }
+          });
+        }
+        codes.forEach(code => {
+          const vehicleSkus = compatibility[code] || [];
+          vehicleSkus.forEach((sku: string) => skusSet.add(sku));
+        });
+      }
+
+      const skusList = Array.from(skusSet).slice(0, 500);
+      if (skusList.length === 0) {
+        await cacheSet(redisKey, [], 600);
+        return res.json([]);
+      }
+
+      const productsRes = await pool.query(
+        `SELECT * FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
+        [skusList]
+      );
+      const products = productsRes.rows.map(mapProductToFrontend);
+      await cacheSet(redisKey, products, 600);
+      return res.json(products);
+    }
+
     const cacheKey = `/api/vehicles?action=${action || ''}&brand=${brand || ''}&model=${model || ''}&year=${year || ''}`;
     const redisQuery = JSON.stringify({
       action: action || '',
@@ -2457,132 +2575,14 @@ app.get('/api/vehicles', async (req, res) => {
           return Array.from(skusSet);
         }
 
-        if (action === 'compatible-products') {
-          const redisKey = `compat:products:v2:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
-          const cachedProducts = await cacheGet<any[]>(redisKey);
-          if (cachedProducts) {
-            return cachedProducts;
-          }
-
-          const skusSet = new Set<string>();
-
-          if (brand) {
-            const bKey = brand.toLowerCase();
-            const mKey = model ? model.toLowerCase() : '';
-            const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
-
-            if (currentCompatIndex) {
-              const yearMap = currentCompatIndex.get(bKey);
-              if (yearMap) {
-                if (yNum) {
-                  const list = yearMap.get(yNum);
-                  if (list) {
-                    for (const item of list) {
-                      if (mKey) {
-                        const cModel = item.model?.toLowerCase() || '';
-                        if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
-                      }
-                      skusSet.add(item.sku);
-                    }
-                  }
-                } else {
-                  for (const list of yearMap.values()) {
-                    for (const item of list) {
-                      if (mKey) {
-                        const cModel = item.model?.toLowerCase() || '';
-                        if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
-                      }
-                      skusSet.add(item.sku);
-                    }
-                  }
-                }
-              }
-            } else {
-              const params: any[] = [brand];
-              let queryStr = `
-                SELECT DISTINCT sku 
-                FROM products 
-                WHERE status = 'published' 
-                  AND compatibility IS NOT NULL 
-                  AND compatibility != '[]'
-                  AND EXISTS (
-                    SELECT 1 FROM jsonb_array_elements(compatibility) elem
-                    WHERE LOWER(elem->>'brand') = LOWER($1)
-              `;
-              let paramIdx = 2;
-              if (yNum) {
-                queryStr += ` AND (elem->>'year')::int = $${paramIdx++}`;
-                params.push(yNum);
-              }
-              if (mKey) {
-                queryStr += ` AND (
-                  LOWER(elem->>'model') LIKE $${paramIdx}
-                  OR $${paramIdx + 1} LIKE CONCAT('%', LOWER(elem->>'model'), '%')
-                )`;
-                params.push(`%${mKey}%`);
-                params.push(mKey);
-              }
-              queryStr += `)`;
-              try {
-                const dbRes = await pool.query(queryStr, params);
-                dbRes.rows.forEach((r: any) => {
-                  if (r.sku) skusSet.add(r.sku);
-                });
-              } catch (dbErr) {
-                console.error('[VEHICLES DB COMPATIBILITY ERROR]:', dbErr);
-              }
-            }
-          }
-
-          if (brand && hierarchy[brand]) {
-            let codes: string[] = [];
-            if (model) {
-              if (year && year !== 'General' && year !== '') {
-                codes = hierarchy[brand][model]?.[year] || [];
-              } else if (hierarchy[brand][model]) {
-                Object.values(hierarchy[brand][model]).forEach((cList: any) => {
-                  codes.push(...cList);
-                });
-              }
-            } else {
-              Object.values(hierarchy[brand]).forEach((modelsObj: any) => {
-                if (modelsObj) {
-                  Object.values(modelsObj).forEach((cList: any) => {
-                    codes.push(...cList);
-                  });
-                }
-              });
-            }
-            codes.forEach(code => {
-              const vehicleSkus = compatibility[code] || [];
-              vehicleSkus.forEach((sku: string) => skusSet.add(sku));
-            });
-          }
-
-          const skusList = Array.from(skusSet).slice(0, 500);
-          if (skusList.length === 0) {
-            await cacheSet(redisKey, [], 600);
-            return [];
-          }
-
-          const productsRes = await pool.query(
-            `SELECT * FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
-            [skusList]
-          );
-          const products = productsRes.rows.map(mapProductToFrontend);
-          await cacheSet(redisKey, products, 600);
-          return products;
-        }
-
         throw new Error('Acción no válida');
       } catch (swrErr: any) {
         console.error('[VEHICLES SWR ERROR]:', swrErr);
-        // Fallback: if moto_catalog.json is missing, query DB directly
         if (action === 'brands') {
           const result = await db.execute(sql`SELECT DISTINCT brand FROM products WHERE brand IS NOT NULL AND brand != '' ORDER BY brand`);
           return result.rows.map((r: any) => r.brand);
         }
-        if (action === 'models' || action === 'years' || action === 'compatible-skus' || action === 'compatible-products') {
+        if (action === 'models' || action === 'years' || action === 'compatible-skus') {
           return [];
         }
         throw new Error('Acción no válida');
