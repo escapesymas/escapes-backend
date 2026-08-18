@@ -2220,27 +2220,10 @@ async function initCompatIndex() {
   console.log('⚡ Loading compatibility index into memory...');
   const start = Date.now();
   try {
-    const cachedObj = await cacheGet<Record<string, Record<string, Array<{ sku: string, model: string }>>>>(REDIS_COMPAT_INDEX_KEY);
-    if (cachedObj) {
-      const newCompatIndex = new Map<string, Map<number, Array<{ sku: string, model: string }>>>();
-      for (const [bKey, yearObj] of Object.entries(cachedObj)) {
-        const yearMap = new Map<number, Array<{ sku: string, model: string }>>();
-        for (const [yStr, list] of Object.entries(yearObj)) {
-          yearMap.set(Number(yStr), list);
-        }
-        newCompatIndex.set(bKey, yearMap);
-      }
-      currentCompatIndex = newCompatIndex;
-      console.log(`✅ Pre-built compatibility index restored from Redis in ${Date.now() - start}ms (${newCompatIndex.size} brands)`);
-      isIndexLoading = false;
-      return;
-    }
-
     const res = await pool.query(
       `SELECT sku, compatibility FROM products WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'`
     );
     const newCompatIndex = new Map<string, Map<number, Array<{ sku: string, model: string }>>>();
-    const serializableObj: Record<string, Record<number, Array<{ sku: string, model: string }>>> = {};
 
     for (const row of res.rows) {
       if (!row.compatibility) continue;
@@ -2255,28 +2238,19 @@ async function initCompatIndex() {
           yearMap = new Map();
           newCompatIndex.set(bKey, yearMap);
         }
-        if (!serializableObj[bKey]) {
-          serializableObj[bKey] = {};
-        }
 
         let list = yearMap.get(yKey);
         if (!list) {
           list = [];
           yearMap.set(yKey, list);
         }
-        if (!serializableObj[bKey][yKey]) {
-          serializableObj[bKey][yKey] = [];
-        }
 
-        const entry = { sku: row.sku, model: item.model };
-        list.push(entry);
-        serializableObj[bKey][yKey].push(entry);
+        list.push({ sku: row.sku, model: item.model });
       }
     }
 
     currentCompatIndex = newCompatIndex;
     console.log(`✅ Compatibility index ready! Loaded ${newCompatIndex.size} brands in ${Date.now() - start}ms`);
-    cacheSet(REDIS_COMPAT_INDEX_KEY, serializableObj, 86400).catch(() => {});
   } catch (err) {
     console.error('❌ Failed to build compatibility index:', err);
   } finally {
