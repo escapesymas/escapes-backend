@@ -309,7 +309,7 @@ async function getDbCompatibilityIndex(): Promise<Map<string, Set<string>>> {
 catalogRouter.get('/vehicles', async (req, res) => {
   const { action, brand, model, year } = req.query as any;
   try {
-    const redisKey = `cache:vehicles:${action || ''}:${brand || ''}:${model || ''}:${year || ''}`;
+    const redisKey = `cache:vehicles:v5:${action || ''}:${brand || ''}:${model || ''}:${year || ''}`;
     const cached = await cacheGet<any>(redisKey);
     if (cached) return res.json(cached);
 
