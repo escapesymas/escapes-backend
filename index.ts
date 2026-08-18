@@ -2212,16 +2212,36 @@ async function initCategoryMap() {
 let currentCompatIndex: Map<string, Map<number, Array<{ sku: string, model: string }>>> | null = null;
 let isIndexLoading = false;
 
+const REDIS_COMPAT_INDEX_KEY = 'compat:index:v2';
+
 async function initCompatIndex() {
   if (isIndexLoading) return;
   isIndexLoading = true;
   console.log('⚡ Loading compatibility index into memory...');
   const start = Date.now();
   try {
+    const cachedObj = await cacheGet<Record<string, Record<string, Array<{ sku: string, model: string }>>>>(REDIS_COMPAT_INDEX_KEY);
+    if (cachedObj) {
+      const newCompatIndex = new Map<string, Map<number, Array<{ sku: string, model: string }>>>();
+      for (const [bKey, yearObj] of Object.entries(cachedObj)) {
+        const yearMap = new Map<number, Array<{ sku: string, model: string }>>();
+        for (const [yStr, list] of Object.entries(yearObj)) {
+          yearMap.set(Number(yStr), list);
+        }
+        newCompatIndex.set(bKey, yearMap);
+      }
+      currentCompatIndex = newCompatIndex;
+      console.log(`✅ Pre-built compatibility index restored from Redis in ${Date.now() - start}ms (${newCompatIndex.size} brands)`);
+      isIndexLoading = false;
+      return;
+    }
+
     const res = await pool.query(
       `SELECT sku, compatibility FROM products WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'`
     );
     const newCompatIndex = new Map<string, Map<number, Array<{ sku: string, model: string }>>>();
+    const serializableObj: Record<string, Record<number, Array<{ sku: string, model: string }>>> = {};
+
     for (const row of res.rows) {
       if (!row.compatibility) continue;
       for (const item of row.compatibility) {
@@ -2235,21 +2255,28 @@ async function initCompatIndex() {
           yearMap = new Map();
           newCompatIndex.set(bKey, yearMap);
         }
+        if (!serializableObj[bKey]) {
+          serializableObj[bKey] = {};
+        }
 
         let list = yearMap.get(yKey);
         if (!list) {
           list = [];
           yearMap.set(yKey, list);
         }
+        if (!serializableObj[bKey][yKey]) {
+          serializableObj[bKey][yKey] = [];
+        }
 
-        list.push({ sku: row.sku, model: item.model });
+        const entry = { sku: row.sku, model: item.model };
+        list.push(entry);
+        serializableObj[bKey][yKey].push(entry);
       }
     }
-    // Atomic swap: in-flight requests keep reading from the old map until the new one
-    // is fully built. The reference assignment is atomic in JS, so no request can ever
-    // observe a partially populated `currentCompatIndex`.
+
     currentCompatIndex = newCompatIndex;
     console.log(`✅ Compatibility index ready! Loaded ${newCompatIndex.size} brands in ${Date.now() - start}ms`);
+    cacheSet(REDIS_COMPAT_INDEX_KEY, serializableObj, 86400).catch(() => {});
   } catch (err) {
     console.error('❌ Failed to build compatibility index:', err);
   } finally {
@@ -2430,6 +2457,124 @@ app.get('/api/vehicles', async (req, res) => {
           }
 
           return Array.from(skusSet);
+        }
+
+        if (action === 'compatible-products') {
+          const redisKey = `compat:products:v2:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+          const cachedProducts = await cacheGet<any[]>(redisKey);
+          if (cachedProducts) {
+            return cachedProducts;
+          }
+
+          const skusSet = new Set<string>();
+
+          if (brand) {
+            const bKey = brand.toLowerCase();
+            const mKey = model ? model.toLowerCase() : '';
+            const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
+
+            if (currentCompatIndex) {
+              const yearMap = currentCompatIndex.get(bKey);
+              if (yearMap) {
+                if (yNum) {
+                  const list = yearMap.get(yNum);
+                  if (list) {
+                    for (const item of list) {
+                      if (mKey) {
+                        const cModel = item.model?.toLowerCase() || '';
+                        if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
+                      }
+                      skusSet.add(item.sku);
+                    }
+                  }
+                } else {
+                  for (const list of yearMap.values()) {
+                    for (const item of list) {
+                      if (mKey) {
+                        const cModel = item.model?.toLowerCase() || '';
+                        if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
+                      }
+                      skusSet.add(item.sku);
+                    }
+                  }
+                }
+              }
+            } else {
+              const params: any[] = [brand];
+              let queryStr = `
+                SELECT DISTINCT sku 
+                FROM products 
+                WHERE status = 'published' 
+                  AND compatibility IS NOT NULL 
+                  AND compatibility != '[]'
+                  AND EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(compatibility) elem
+                    WHERE LOWER(elem->>'brand') = LOWER($1)
+              `;
+              let paramIdx = 2;
+              if (yNum) {
+                queryStr += ` AND (elem->>'year')::int = $${paramIdx++}`;
+                params.push(yNum);
+              }
+              if (mKey) {
+                queryStr += ` AND (
+                  LOWER(elem->>'model') LIKE $${paramIdx}
+                  OR $${paramIdx + 1} LIKE CONCAT('%', LOWER(elem->>'model'), '%')
+                )`;
+                params.push(`%${mKey}%`);
+                params.push(mKey);
+              }
+              queryStr += `)`;
+              try {
+                const dbRes = await pool.query(queryStr, params);
+                dbRes.rows.forEach((r: any) => {
+                  if (r.sku) skusSet.add(r.sku);
+                });
+              } catch (dbErr) {
+                console.error('[VEHICLES DB COMPATIBILITY ERROR]:', dbErr);
+              }
+            }
+          }
+
+          if (brand && hierarchy[brand]) {
+            let codes: string[] = [];
+            if (model) {
+              if (year && year !== 'General' && year !== '') {
+                codes = hierarchy[brand][model]?.[year] || [];
+              } else if (hierarchy[brand][model]) {
+                Object.values(hierarchy[brand][model]).forEach((cList: any) => {
+                  codes.push(...cList);
+                });
+              }
+            } else {
+              Object.values(hierarchy[brand]).forEach((modelsObj: any) => {
+                if (modelsObj) {
+                  Object.values(modelsObj).forEach((cList: any) => {
+                    codes.push(...cList);
+                  });
+                }
+              });
+            }
+            codes.forEach(code => {
+              const vehicleSkus = compatibility[code] || [];
+              vehicleSkus.forEach((sku: string) => skusSet.add(sku));
+            });
+          }
+
+          const skusList = Array.from(skusSet).slice(0, 500);
+          if (skusList.length === 0) {
+            await cacheSet(redisKey, [], 600);
+            return [];
+          }
+
+          const productsRes = await db.execute(sql`
+            SELECT * FROM products
+            WHERE status = 'published' AND price > 0 AND sku IN (${buildInClause(skusList)})
+            ORDER BY price ASC
+          `);
+          const products = productsRes.rows.map(mapProductToFrontend);
+          await cacheSet(redisKey, products, 600);
+          return products;
         }
 
         throw new Error('Acción no válida');
