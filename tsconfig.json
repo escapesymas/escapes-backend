@@ -13,6 +13,6 @@
     "resolveJsonModule": true,
     "declaration": true
   },
-  "include": ["*.ts", "routes/*.ts", "chatbot/**/*.ts", "templates/**/*.ts", "lib/**/*.ts", "schemas/**/*.ts", "migrations/**/*.ts", "scripts/**/*.ts"],
-  "exclude": ["node_modules", "dist", "e2e", "tests"]
+  "include": ["*.ts", "routes/*.ts", "chatbot/**/*.ts", "templates/**/*.ts", "lib/**/*.ts", "schemas/**/*.ts", "migrations/**/*.ts"],
+  "exclude": ["node_modules", "dist", "e2e", "tests", "scripts"]
 }
