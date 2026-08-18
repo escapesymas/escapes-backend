@@ -2309,6 +2309,9 @@ app.get('/api/vehicles', async (req, res) => {
         const mKey = model ? model.toLowerCase() : '';
         const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
 
+        const mClean = mKey.replace(/\(.*\)/g, '').trim();
+        const mTokens = mClean.split(/\s+/).filter(Boolean);
+
         if (currentCompatIndex) {
           const yearMap = currentCompatIndex.get(bKey);
           if (yearMap) {
@@ -2316,9 +2319,10 @@ app.get('/api/vehicles', async (req, res) => {
               const list = yearMap.get(yNum);
               if (list) {
                 for (const item of list) {
-                  if (mKey) {
+                  if (mClean) {
                     const cModel = item.model?.toLowerCase() || '';
-                    if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
+                    const isMatch = mTokens.length === 0 || mTokens.every(t => cModel.includes(t)) || cModel.includes(mClean) || mClean.includes(cModel);
+                    if (!isMatch) continue;
                   }
                   skusSet.add(item.sku);
                 }
@@ -2326,9 +2330,10 @@ app.get('/api/vehicles', async (req, res) => {
             } else {
               for (const list of yearMap.values()) {
                 for (const item of list) {
-                  if (mKey) {
+                  if (mClean) {
                     const cModel = item.model?.toLowerCase() || '';
-                    if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
+                    const isMatch = mTokens.length === 0 || mTokens.every(t => cModel.includes(t)) || cModel.includes(mClean) || mClean.includes(cModel);
+                    if (!isMatch) continue;
                   }
                   skusSet.add(item.sku);
                 }
@@ -2352,13 +2357,13 @@ app.get('/api/vehicles', async (req, res) => {
             queryStr += ` AND (elem->>'year')::int = $${paramIdx++}`;
             params.push(yNum);
           }
-          if (mKey) {
+          if (mClean) {
             queryStr += ` AND (
               LOWER(elem->>'model') LIKE $${paramIdx}
               OR $${paramIdx + 1} LIKE CONCAT('%', LOWER(elem->>'model'), '%')
             )`;
-            params.push(`%${mKey}%`);
-            params.push(mKey);
+            params.push(`%${mClean}%`);
+            params.push(mClean);
           }
           queryStr += `)`;
           try {
