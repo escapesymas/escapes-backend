@@ -2327,9 +2327,7 @@ app.get('/api/vehicles', async (req, res) => {
       model: model || '',
       year: year || '',
     });
-    const redisKey = redisQuery.length > 200
-      ? `cache:vehicles:${crypto.createHash('sha256').update(redisQuery).digest('hex')}`
-      : `cache:vehicles:${redisQuery}`;
+    const redisKey = `cache:v3:vehicles:${crypto.createHash('sha256').update(redisQuery).digest('hex')}`;
     const cached = await cacheGet<any[]>(redisKey);
     if (cached) {
       return res.json(cached);
