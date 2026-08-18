@@ -195,6 +195,20 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
     return;
   }
 
+  // AMOUNT RECONCILIATION: refuse to mark the order paid if the amount
+  // Stripe charged does not match the order total. Protects against tampered
+  // PaymentIntents and partial captures. See audit 2026-08-15, finding #2.
+  const expectedCents = Number(existingOrder.total) || 0;
+  const chargedCents = Number(obj.amount_received ?? obj.amount) || 0;
+  if (expectedCents > 0 && chargedCents !== expectedCents) {
+    console.warn(
+      `[STRIPE WEBHOOK SECURITY] Pedido #${orderId} importe ${chargedCents} != esperado ${expectedCents}. ` +
+      `Marcando como 'payment_amount_mismatch' y NO aceptando el pago.`
+    );
+    await db.execute(sql`UPDATE orders SET status = 'payment_amount_mismatch', last_payment_error = ${`Charged ${chargedCents} cents vs expected ${expectedCents}`} WHERE id = ${orderId}`);
+    return;
+  }
+
   if (existingOrder.status === 'paid' || existingOrder.status === 'processing') {
     console.log(`[STRIPE WEBHOOK] Pedido #${orderId} ya se encuentra en estado '${existingOrder.status}'. Omitiendo duplicado.`);
     return;

@@ -7238,7 +7238,8 @@ app.post('/api/create-payment-intent', async (req: any, res: any) => {
     });
 
     console.log(`[STRIPE] PaymentIntent created: ${paymentIntent.id} for order ${orderId} (${serverAmountCents / 100} EUR)`);
-    return res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+    const pubKey = process.env.STRIPE_PUBLISHABLE_KEY || process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY;
+    return res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id, publishableKey: pubKey });
   } catch (error: any) {
     console.error('[STRIPE CREATE PAYMENT INTENT ERROR]:', error.message || error);
     console.error('[STRIPE ERROR TYPE]:', error.type);

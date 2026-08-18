@@ -10,3 +10,11 @@ uploads/catalog-*/
 bihr-catalog.json
 moto_catalog.json
 package-lock.json
+
+# Secretos e infra (Bloque 0.6 auditoría 2026-08-15)
+ecosystem.config.cjs
+escapesymas-infra-reference.md
+infra/RECOVERY.md
+infra/escapes-post-deploy.sh
+**/secrets/
+*.env.build
