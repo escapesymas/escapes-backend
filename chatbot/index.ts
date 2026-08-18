@@ -2,7 +2,8 @@ import type { Request, Response } from 'express';
 import { verifyJWT } from '../utils.js';
 import { minimaxClient, CHAT_MODEL, CHAT_LIMITS } from './minimax.js';
 import { sanitizeUserInput, containsPromptInjection, isOutOfScope } from './sanitize.js';
-import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, type CatalogHit } from './catalog.js';
+import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, extractMotorcycleFromQuery, type CatalogHit } from './catalog.js';
+import { isTechSpecQuery, searchMotorcycleTechSpecs } from './webSearch.js';
 
 interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
@@ -16,14 +17,15 @@ interface ChatUser {
   role?: string;
 }
 
-function buildSystemPrompt(userContext: string, catalogContext: string, ordersContext: string): string {
+function buildSystemPrompt(userContext: string, catalogContext: string, ordersContext: string, webSearchText: string = ''): string {
   return `Eres el asistente IA de Escapes y Más (escapesymas.com), una tienda online de recambios y accesorios para motos.
 
 ALCANCE ESTRICTO — solo puedes responder sobre:
 1. Catálogo de Escapes y Más (escapes, recambios, accesorios de moto).
-2. Estado de pedidos, envíos, devoluciones.
-3. Atención comercial: precios, stock, disponibilidad, compatibilidades.
-4. Soporte técnico de la web (cuenta, pedidos, navegación).
+2. Datos técnicos oficiales y especificaciones de motocicletas (desarrollos de transmisión de serie, piñón/corona original, capacidades de aceite, batería, bujías, neumáticos, etc.).
+3. Estado de pedidos, envíos, devoluciones.
+4. Atención comercial: precios, stock, disponibilidad, compatibilidades.
+5. Soporte técnico de la web (cuenta, pedidos, navegación).
 
 PROHIBIDO:
 - Política, religión, recetas, chistes, código, traducciones, matemáticas, historia, cine, etc.
@@ -36,11 +38,14 @@ ${userContext || 'Usuario autenticado sin datos adicionales.'}
 
 ${ordersContext}
 
+${webSearchText ? `${webSearchText}\n\nUsa estos datos técnicos informativos para responder la consulta del cliente (ej. desarrollo de serie, piñón, corona, etc.) y compáralos con los productos de nuestra tienda.` : ''}
+
 CATÁLOGO RELEVANTE PARA LA CONSULTA (puedes mencionar SKUs, precios y marcas exactas):
 ${catalogContext}
 
 REGLAS DE RESPUESTA:
 - Sé breve: 2-4 frases por respuesta salvo que pidan detalles.
+- Si el usuario pregunta por especificaciones técnicas de serie (ej. relación de transmisión original, piñón/corona de serie, aceite, batería), usa la información técnica provista para explicárselo con total precisión y recomiéndale los productos de nuestra tienda que coincidan.
 - Si preguntan por un producto que NO aparece en el catálogo relevante, di: "No tengo ese producto concreto, pero si me das más detalles (marca, modelo de moto, tipo de recambio) te ayudo a buscarlo."
 - Si preguntan por el estado de un pedido concreto, indícale el estado actual que aparece en la sección "Pedidos recientes del cliente". Si no tienen pedidos, dilo amablemente.
 - Si preguntan algo FUERA de tu alcance, responde EXACTAMENTE: "Lo siento, solo puedo ayudarte con temas de Escapes y Más (catálogo, pedidos o soporte web). ¿En qué producto o pedido te echo una mano?"
@@ -174,11 +179,16 @@ export async function chatHandler(req: Request, res: Response) {
   }
 
   try {
-    const [userContext, garageEntries, ordersContext, catalogResult] = await Promise.all([
+    const motoFromQuery = extractMotorcycleFromQuery(cleanInput);
+
+    const [userContext, garageEntries, ordersContext, catalogResult, webSearchText] = await Promise.all([
       getGarageContext(user.user_id),
       getGarageEntries(user.user_id),
       getRecentOrdersContext(user.user_id),
       getCatalogContext(cleanInput, []),
+      isTechSpecQuery(cleanInput)
+        ? searchMotorcycleTechSpecs(cleanInput, motoFromQuery?.brand, motoFromQuery?.model, motoFromQuery?.year)
+        : Promise.resolve(''),
     ]);
 
     let { hits: catalogHits, text: catalogText } = catalogResult;
@@ -192,7 +202,7 @@ export async function chatHandler(req: Request, res: Response) {
       }
     }
 
-    const systemPrompt = buildSystemPrompt(userContext, catalogText, ordersContext);
+    const systemPrompt = buildSystemPrompt(userContext, catalogText, ordersContext, webSearchText);
     const history = truncateHistory(
       body.messages.map((m) => ({ role: m.role, content: sanitizeUserInput(m.content) }))
     );

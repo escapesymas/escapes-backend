@@ -219,78 +219,41 @@ async function getDbCompatibilityIndex(): Promise<Map<string, Set<string>>> {
 
   try {
     const res = await db.execute(sql`
-      SELECT sku, name, brand, compatibility FROM products 
-      WHERE status = 'published'
+      SELECT sku, compatibility FROM products 
+      WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'
     `);
 
     for (const row of res.rows as any[]) {
-      if (!row.sku) continue;
+      if (!row.sku || !row.compatibility) continue;
 
-      // 1. Coincidencia por columna JSONB
-      if (row.compatibility && row.compatibility !== '[]') {
-        let list: any[] = [];
-        if (typeof row.compatibility === 'string') {
-          try { list = JSON.parse(row.compatibility); } catch {}
-        } else if (Array.isArray(row.compatibility)) {
-          list = row.compatibility;
-        }
-
-        for (const item of list) {
-          if (!item.brand || !item.model) continue;
-          const b = String(item.brand).trim().toLowerCase();
-          const mClean = cleanModelName(item.model);
-          const mRaw = String(item.model).replace(/\(.*\)/g, '').trim().toLowerCase();
-          const y = item.year ? String(item.year).trim() : '';
-
-          if (y) {
-            const k1 = `${b}::${mClean}::${y}`;
-            if (!newIndex.has(k1)) newIndex.set(k1, new Set());
-            newIndex.get(k1)!.add(row.sku);
-
-            if (mRaw !== mClean) {
-              const k1raw = `${b}::${mRaw}::${y}`;
-              if (!newIndex.has(k1raw)) newIndex.set(k1raw, new Set());
-              newIndex.get(k1raw)!.add(row.sku);
-            }
-          }
-          const k2 = `${b}::${mClean}`;
-          if (!newIndex.has(k2)) newIndex.set(k2, new Set());
-          newIndex.get(k2)!.add(row.sku);
-        }
+      let list: any[] = [];
+      if (typeof row.compatibility === 'string') {
+        try { list = JSON.parse(row.compatibility); } catch {}
+      } else if (Array.isArray(row.compatibility)) {
+        list = row.compatibility;
       }
 
-      // 2. Coincidencia por rango de años en el título si la compatibilidad JSONB es nula
-      if (row.name) {
-        const titleLower = String(row.name).toLowerCase();
-        const yearRange = parseTitleYears(row.name);
-        if (yearRange) {
-          const [yMin, yMax] = yearRange;
-          let b = row.brand ? String(row.brand).trim().toLowerCase() : '';
-          if (!b) {
-            if (titleLower.includes('honda')) b = 'honda';
-            else if (titleLower.includes('yamaha')) b = 'yamaha';
-            else if (titleLower.includes('kawasaki')) b = 'kawasaki';
-            else if (titleLower.includes('suzuki')) b = 'suzuki';
-            else if (titleLower.includes('bmw')) b = 'bmw';
-            else if (titleLower.includes('ktm')) b = 'ktm';
-            else if (titleLower.includes('piaggio')) b = 'piaggio';
-            else if (titleLower.includes('kymco')) b = 'kymco';
-            else if (titleLower.includes('sym')) b = 'sym';
-          }
+      for (const item of list) {
+        if (!item.brand || !item.model) continue;
+        const b = String(item.brand).trim().toLowerCase();
+        const mClean = cleanModelName(item.model);
+        const mRaw = String(item.model).replace(/\(.*\)/g, '').trim().toLowerCase();
+        const y = item.year ? String(item.year).trim() : '';
 
-          if (b) {
-            const knownModels = ['pcx 125', 'pcx', 'sh 125', 'sh 150', 'cbr 1000 rr', 'cbr 600 rr', 't-max 530', 't-max 560', 'x-max 125', 'x-max 300', 'z900', 'z650', 'mt-07', 'mt-09'];
-            for (const m of knownModels) {
-              if (titleLower.includes(m)) {
-                for (let y = yMin; y <= Math.min(yMax, 2030); y++) {
-                  const key = `${b}::${m}::${y}`;
-                  if (!newIndex.has(key)) newIndex.set(key, new Set());
-                  newIndex.get(key)!.add(row.sku);
-                }
-              }
-            }
+        if (y) {
+          const k1 = `${b}::${mClean}::${y}`;
+          if (!newIndex.has(k1)) newIndex.set(k1, new Set());
+          newIndex.get(k1)!.add(row.sku);
+
+          if (mRaw !== mClean) {
+            const k1raw = `${b}::${mRaw}::${y}`;
+            if (!newIndex.has(k1raw)) newIndex.set(k1raw, new Set());
+            newIndex.get(k1raw)!.add(row.sku);
           }
         }
+        const k2 = `${b}::${mClean}`;
+        if (!newIndex.has(k2)) newIndex.set(k2, new Set());
+        newIndex.get(k2)!.add(row.sku);
       }
     }
 

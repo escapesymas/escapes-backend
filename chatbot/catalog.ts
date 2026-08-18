@@ -38,9 +38,17 @@ const SYNONYMS_ES_EN: Record<string, string[]> = {
   'bujias': ['spark', 'plug'],
   'bujía': ['spark', 'plug'],
   'bujías': ['spark', 'plug'],
-  'cadena': ['chain'],
-  'cadenas': ['chain'],
-  'transmision': ['chain', 'transmission'],
+  'cadena': ['chain', 'cadena'],
+  'cadenas': ['chain', 'cadena'],
+  'piñon': ['sprocket', 'pinion', 'piñon', 'piñón'],
+  'piñones': ['sprocket', 'pinion', 'piñon', 'piñón'],
+  'piñón': ['sprocket', 'pinion', 'piñon', 'piñón'],
+  'pinon': ['sprocket', 'pinion', 'piñon', 'piñón'],
+  'corona': ['sprocket', 'corona'],
+  'coronas': ['sprocket', 'corona'],
+  'transmision': ['chain', 'sprocket', 'pinion', 'corona', 'transmission'],
+  'transmisión': ['chain', 'sprocket', 'pinion', 'corona', 'transmission'],
+  'desarrollo': ['sprocket', 'pinion', 'corona'],
   'aceite': ['oil'],
   'filtro': ['filter'],
   'filtros': ['filter'],
@@ -72,7 +80,7 @@ const SYNONYMS_ES_EN: Record<string, string[]> = {
   'rodamiento': ['bearing'],
   'rodamientos': ['bearing'],
   'kit': ['kit'],
-  'arrastre': ['chain', 'sprocket'],
+  'arrastre': ['chain', 'sprocket', 'pinion'],
 };
 
 function expandSynonyms(keywords: string[]): string[] {
@@ -96,8 +104,8 @@ function extractKeywords(text: string): string[] {
     'este', 'esta', 'estos', 'estas', 'ese', 'esa', 'esos', 'esas', 'aqui', 'allí',
     'the', 'and', 'for', 'are', 'you', 'can', 'have', 'has', 'with', 'from',
   ]);
-  const matches = text.toLowerCase().match(/[a-záéíóúñ0-9]{3,}/g) || [];
-  const filtered = matches.filter((w) => !stopwords.has(w)).slice(0, 8);
+  const matches = text.toLowerCase().match(/[a-záéíóúñ0-9]{2,}/g) || [];
+  const filtered = matches.filter((w) => !stopwords.has(w)).slice(0, 10);
   return expandSynonyms(filtered);
 }
 
@@ -105,7 +113,8 @@ const PURCHASE_INTENT_WORDS = [
   'busco', 'buscando', 'quiero', 'quisiera', 'necesito', 'recomienda', 'recomiendas',
   'tienes', 'teneis', 'hay', 'toca', 'cambiar', 'comprar', 'escape', 'escapes',
   'recambio', 'recambios', 'filtro', 'filtros', 'pastilla', 'pastillas', 'freno',
-  'frenos', 'cadena', 'transmision', 'transmisión', 'aceite', 'bujia', 'bujía',
+  'frenos', 'cadena', 'transmision', 'transmisión', 'piñon', 'piñón', 'pinon', 'corona',
+  'desarrollo', 'dientes', 'aceite', 'bujia', 'bujía',
   'bateria', 'batería', 'kit', 'moto', 'motero', 'compatible', 'compatibilidad',
   'sirve', 'valvula', 'válvula', 'embrague', 'amortiguador', 'suspension',
 ];
@@ -140,7 +149,7 @@ function modelMatchesGarage(model: string, garageModel: string): boolean {
   if (a === b) return true;
   const tokensA = a.split(/\s+/).filter((t) => t.length >= 2);
   const tokensB = b.split(/\s+/).filter((t) => t.length >= 2);
-  const significant = tokensA.filter((t) => !/^\d+$/.test(t) && t.length >= 3);
+  const significant = tokensA.filter((t) => !/^\d+$/.test(t) && t.length >= 2);
   if (significant.length === 0) return false;
   return significant.some((t) => b.includes(t));
 }
@@ -254,11 +263,11 @@ async function searchByCompatibility(
 
   for (const moto of validMotos) {
     const parts: string[] = [];
-    const modelNorm = moto.model.replace(/[^A-Za-z0-9]/g, '');
-    const modelHyphen = modelNorm.replace(/^([A-Za-z]+)(\d+)$/, '$1-$2');
-    const modelSpace = modelNorm.replace(/^([A-Za-z]+)(\d+)$/, '$1 $2');
-    const modelOriginal = moto.model.replace(/[^A-Za-z0-9]/g, '');
-    const variants = Array.from(new Set([modelNorm, modelHyphen, modelSpace, modelOriginal].filter((v, i, a) => v && a.indexOf(v) === i)));
+    const modelRaw = (moto.model || '').trim();
+    const modelSpace = modelRaw.replace(/\s+/g, ' ');
+    const modelNorm = modelRaw.replace(/[^A-Za-z0-9]/g, '');
+    const modelSpacedFromNorm = modelNorm.replace(/^([A-Za-z]+)(\d+)([A-Za-z]*)$/, '$1 $2 $3').trim();
+    const variants = Array.from(new Set([modelRaw, modelSpace, modelSpacedFromNorm, modelNorm].filter((v) => v && v.length >= 2)));
 
     if (moto.brand && moto.model && moto.year) {
       const variantConds = variants.map((_v, idx) => `c->>'model' ILIKE $${i + 1 + idx}`).join(' OR ');
@@ -300,7 +309,7 @@ async function searchByCompatibility(
   }
 
   let nameILikeFilter = '';
-  const productKeywords = keywords.filter((k) => /pastill|brake|pads|filtro|filter|aceite|oil|escape|exhaust|cadena|chain|buji|spark|embrague|clutch|amortiguador|suspension|bateria|battery|kit|faros?|light|motor|engine|correa|belt|sprocket|rodamiento|bearing|junta|gasket|disco|disc|casco|helmet|guant|glove/i.test(k));
+  const productKeywords = keywords.filter((k) => /pastill|brake|pads|filtro|filter|aceite|oil|escape|exhaust|cadena|chain|buji|spark|embrague|clutch|amortiguador|suspension|bateria|battery|kit|faros?|light|motor|engine|correa|belt|sprocket|pinion|piñon|piñón|pinon|corona|transmisi|bearing|junta|gasket|disco|disc|casco|helmet|guant|glove/i.test(k));
   if (productKeywords.length > 0) {
     const orClauses = productKeywords
       .map((_k, idx) => `(coalesce(name,'') ILIKE $${i + idx} OR coalesce(category3,'') ILIKE $${i + idx})`)
@@ -395,7 +404,7 @@ function mentionsGarage(query: string, garageMotos: GarageMotorcycle[]): boolean
   return garageMotos.some((m) => {
     if (m.brand && lower.includes(m.brand.toLowerCase())) return true;
     if (m.model) {
-      const tokens = m.model.toLowerCase().split(/\s+/).filter((t) => t.length >= 3);
+      const tokens = m.model.toLowerCase().split(/\s+/).filter((t) => t.length >= 2);
       return tokens.some((t) => lower.includes(t));
     }
     return false;
@@ -457,51 +466,62 @@ function normalizeModelForSearch(model: string): string {
 }
 
 export function extractMotorcycleFromQuery(query: string): GarageMotorcycle | null {
-  const lower = query.toLowerCase();
-  let detectedBrand: string | null = null;
+  const cleaned = query.trim();
+  const lower = cleaned.toLowerCase();
+
+  let detectedBrand = '';
+  let brandPos = -1;
+  let brandLen = 0;
 
   for (const alias of Object.keys(BRAND_ALIASES)) {
-    const re = new RegExp(`(?:^|[^a-z])${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[^a-z]|$)`);
-    if (re.test(lower)) {
-      detectedBrand = BRAND_ALIASES[alias];
-      break;
+    const idx = lower.indexOf(alias);
+    if (idx !== -1) {
+      const charBefore = idx > 0 ? lower[idx - 1] : ' ';
+      const charAfter = idx + alias.length < lower.length ? lower[idx + alias.length] : ' ';
+      if (!/[a-z0-9]/.test(charBefore) && !/[a-z0-9]/.test(charAfter)) {
+        detectedBrand = BRAND_ALIASES[alias];
+        brandPos = idx;
+        brandLen = alias.length;
+        break;
+      }
     }
   }
 
   const yearMatch = lower.match(/\b(19[8-9]\d|20[0-3]\d)\b/);
   const detectedYear = yearMatch ? parseInt(yearMatch[1], 10) : null;
 
-  const modelCandidates: string[] = [];
-  const knownModelPrefixes = ['mt', 'gs', 'xr', 'cbr', 'cb', 'yzf', 'r1', 'r6', 'z750', 'z800', 'z900', 'zx', 'ninja', 'er6', 'er', 'klr', 'crf', 'cb500', 'cb1000', 'cbr600', 'cbr1000', 'gsxr', 'sv', 'rmz', 'drz', 'dr', 'xt', 'wr', 'xf', 'xc', 'fe', 'te', 'tx', 'sm', 'yz', 'cr', 'rm', 'klx', 'pcx', 'sh', 'nss', 'vision', 'xmax', 'aerox', 'fz', 'mtn', 'trk', 'rx', 'cbf', 'cbx', 'nx', 'gl', 'st', 'vf', 'vfr', 'cbrf', 'kx', 'versys', 'tmax', 'nmax', 'vespa', 'medley', 'mp3', 'gts', 'et4', 'fj1200', 'tenera', 'tracer', 'tricity', 'niken', 'xs', 'xj', 'tt', 'fz', 'fz6', 'fz1', 'fazer', 'xl', 'xr', 'xt'];
+  let modelStr = '';
 
-  const tokenRe = /\b([a-z]{2,}[\-\d]?[a-z\d]*)\b/g;
-  let m: RegExpExecArray | null;
-  while ((m = tokenRe.exec(lower)) !== null) {
-    const t = m[1];
-    if (KNOWN_BRANDS.has(t.toUpperCase())) continue;
-    if (/^\d+$/.test(t)) continue;
-    if (/^(para|mi|tu|tus|mis|los|las|del|con|sin|uno|una|unos|unas|este|esta|ese|esa|moto|necesito|quiero|busco|tengo|tienes|filtro|filtros|aceite|escape|escapes|recambio|recambios|hola|holas)$/.test(t)) continue;
-    if (t.length < 3) continue;
+  if (detectedBrand && brandPos !== -1) {
+    let afterBrand = lower.substring(brandPos + brandLen).trim();
+    afterBrand = afterBrand.replace(/\b(19[8-9]\d|20[0-3]\d)\b/g, '').replace(/\(\s*\)/g, '').trim();
 
-    const isKnownModel = knownModelPrefixes.some((p) => t.toUpperCase().startsWith(p.toUpperCase()) || t.toUpperCase() === p.toUpperCase());
-    if (isKnownModel) {
-      modelCandidates.push(t);
-    } else if (/^[a-z]+\d+/.test(t) && t.length <= 12) {
-      modelCandidates.push(t);
+    const stopWords = /\b(para|como|tengo|tienes|quiero|busco|hola|dias|tardes|noches|este|esta|cambiar|comprar|recambio|recambios|escape|escapes|transmision|transmisión|cadena|cadenas|piñon|piñones|piñón|pinon|corona|coronas|filtro|filtros|aceite|pastilla|pastillas|freno|frenos|kit|embrague|bateria|bujia|bujías|del|con|sin|que|qué)\b/gi;
+
+    const parts = afterBrand.split(stopWords);
+    const firstSegment = (parts[0] || '').trim();
+    if (firstSegment && firstSegment.length >= 1) {
+      modelStr = firstSegment.toUpperCase().replace(/\s+/g, ' ');
     }
   }
 
-  let detectedModel: string | null = null;
-  if (modelCandidates.length > 0) {
-    const sorted = [...modelCandidates].sort((a, b) => b.length - a.length);
-    detectedModel = normalizeModelForSearch(sorted[0]);
+  if (!modelStr) {
+    const modelPattern = /\b([a-z]{1,3}\s*\d{2,4}\s*[a-z]{0,4}|[a-z]+\s*\d{2,4})\b/gi;
+    const matches = lower.match(modelPattern) || [];
+    for (const m of matches) {
+      const cleanM = m.trim().toUpperCase();
+      if (KNOWN_BRANDS.has(cleanM)) continue;
+      if (/^(PARA|COMO|TENGO|TIENES|QUIERO|BUSCO|HOLA|CAMBIAR|COMPRAR|RECAMBIO|ESCAPE|TRANSMISION|CADENA|PIÑON|CORONA|KIT)$/i.test(cleanM)) continue;
+      modelStr = cleanM;
+      break;
+    }
   }
 
-  if (!detectedBrand && !detectedModel) return null;
+  if (!detectedBrand && !modelStr) return null;
 
   return {
     brand: detectedBrand || '',
-    model: detectedModel || '',
+    model: modelStr || '',
     year: detectedYear,
   };
 }
