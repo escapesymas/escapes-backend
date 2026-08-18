@@ -202,18 +202,15 @@ let cronHandle: NodeJS.Timeout | null = null;
  */
 export function startBihrStockCron(): void {
   if (cronHandle) return;
-  if (BIHR_STOCK_SYNC_DISABLED) {
-    console.log('[BIHR STOCK SYNC] cron disabled via BIHR_STOCK_SYNC_DISABLED=true');
+  const ENABLE_CRON = process.env.ENABLE_BIHR_STOCK_CRON === 'true';
+  if (!ENABLE_CRON || BIHR_STOCK_SYNC_DISABLED) {
+    console.log('[BIHR STOCK SYNC] cron disabled (set ENABLE_BIHR_STOCK_CRON=true to enable)');
     return;
   }
   console.log(`[BIHR STOCK SYNC] cron registered — every ${CRON_INTERVAL_MS / 1000}s`);
   cronHandle = setInterval(() => {
     syncBihrStock().catch((e) => console.error('[BIHR STOCK SYNC] interval error:', e));
   }, CRON_INTERVAL_MS);
-  // Fire one pass after 60s boot delay so startup requests remain fast and clean.
-  setTimeout(() => {
-    syncBihrStock().catch((e) => console.error('[BIHR STOCK SYNC] initial run error:', e));
-  }, 60000);
 }
 
 /** Stop the cron (used in tests; not called by the running server). */
