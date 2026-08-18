@@ -413,7 +413,115 @@ catalogRouter.get('/vehicles', async (req, res) => {
         } catch (e) {}
       }
 
-      responseData = Array.from(skusSet);
+    } else if (action === 'compatible-products') {
+      const prodRedisKey = `compat:prod:v5:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+      const cachedProducts = await cacheGet<any[]>(prodRedisKey);
+      if (cachedProducts) {
+        return res.json(cachedProducts);
+      }
+
+      const skusSet = new Set<string>();
+
+      // 1. SKUs desde el índice en memoria de productos en PostgreSQL
+      if (brand && model) {
+        try {
+          const indexMap = await getDbCompatibilityIndex();
+          const bLower = (brand || '').trim().toLowerCase();
+          const mLower = cleanModelName(model);
+          const mClean = mLower.replace(/\d+/g, '').trim();
+          const yStr = year ? String(year).trim() : '';
+
+          const keysToTry: string[] = [];
+          if (yStr) {
+            keysToTry.push(`${bLower}::${mLower}::${yStr}`);
+            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}::${yStr}`);
+          } else {
+            keysToTry.push(`${bLower}::${mLower}`);
+            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}`);
+          }
+
+          for (const key of keysToTry) {
+            const matchedSkus = indexMap.get(key);
+            if (matchedSkus) {
+              matchedSkus.forEach((sku) => skusSet.add(sku));
+            }
+          }
+        } catch (e) {
+          console.error('Error fetching indexed DB compatibility:', e);
+        }
+      }
+
+      // 2. SKUs desde moto_catalog.json
+      const matchedBrandKey = brand ? (Object.keys(hierarchy).find(k => k.toLowerCase() === brand.toLowerCase()) || brand.toUpperCase()) : '';
+      if (matchedBrandKey && hierarchy[matchedBrandKey]) {
+        const compatibilityMap = catalog?.compatibility || {};
+        let codes: string[] = [];
+
+        if (model) {
+          const matchedModelKey = Object.keys(hierarchy[matchedBrandKey] || {}).find(k => k.toLowerCase() === model.toLowerCase()) || model;
+          if (year && year !== 'General' && year !== '') {
+            codes = hierarchy[matchedBrandKey][matchedModelKey]?.[year] || hierarchy[matchedBrandKey][model]?.[year] || [];
+          } else if (hierarchy[matchedBrandKey][matchedModelKey]) {
+            Object.values(hierarchy[matchedBrandKey][matchedModelKey]).forEach((cList: any) => {
+              if (Array.isArray(cList)) codes.push(...cList);
+            });
+          }
+        } else {
+          Object.values(hierarchy[matchedBrandKey]).forEach((modelsObj: any) => {
+            if (modelsObj) {
+              Object.values(modelsObj).forEach((cList: any) => {
+                if (Array.isArray(cList)) codes.push(...cList);
+              });
+            }
+          });
+        }
+
+        codes.forEach(code => {
+          const vehicleSkus = compatibilityMap[code] || [];
+          vehicleSkus.forEach((sku: string) => skusSet.add(sku));
+          skusSet.add(code);
+        });
+      }
+
+      // 3. SKUs desde bihr_compatibility_cache.json
+      const cacheFile = path.join(process.cwd(), 'bihr_compatibility_cache.json');
+      if (fs.existsSync(cacheFile)) {
+        try {
+          const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+          const bLower = (brand || '').toLowerCase();
+          const mLower = (model || '').toLowerCase();
+          const yStr = year ? String(year) : '';
+
+          for (const [sku, list] of Object.entries(cacheData)) {
+            if (!Array.isArray(list)) continue;
+            for (const item of list) {
+              if (!item.brand) continue;
+              const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
+              const matchModel = !mLower || (item.model && (item.model.toLowerCase().includes(mLower) || mLower.includes(item.model.toLowerCase())));
+              const matchYear = !yStr || (item.year && String(item.year) === yStr);
+
+              if (matchBrand && matchModel && matchYear) {
+                skusSet.add(sku);
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      const skusList = Array.from(skusSet).slice(0, 500);
+      if (skusList.length === 0) {
+        await cacheSet(prodRedisKey, [], 600);
+        return res.json([]);
+      }
+
+      const productsRes = await pool.query(
+        `SELECT * FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
+        [skusList]
+      );
+      const products = productsRes.rows.map(mapProductToFrontend);
+      await cacheSet(prodRedisKey, products, 600);
+      return res.json(products);
     } else {
       responseData = Object.keys(hierarchy).sort();
     }
