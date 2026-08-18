@@ -309,7 +309,7 @@ async function searchByCompatibility(
   }
 
   let nameILikeFilter = '';
-  const productKeywords = keywords.filter((k) => /pastill|brake|pads|filtro|filter|aceite|oil|escape|exhaust|cadena|chain|buji|spark|embrague|clutch|amortiguador|suspension|bateria|battery|kit|faros?|light|motor|engine|correa|belt|sprocket|pinion|piñon|piñón|pinon|corona|transmisi|bearing|junta|gasket|disco|disc|casco|helmet|guant|glove/i.test(k));
+  const productKeywords = keywords.filter((k) => /pastill|brake|pads|filtro|filter|aceite|oil|escape|exhaust|cadena|chain|buji|spark|embrague|clutch|amortiguador|suspension|bateria|battery|faros?|light|motor|engine|correa|belt|sprocket|pinion|piñon|piñón|pinon|corona|transmisi|bearing|junta|gasket|disco|disc|casco|helmet|guant|glove/i.test(k));
   if (productKeywords.length > 0) {
     const orClauses = productKeywords
       .map((_k, idx) => `(coalesce(name,'') ILIKE $${i + idx} OR coalesce(category3,'') ILIKE $${i + idx})`)
@@ -323,12 +323,16 @@ async function searchByCompatibility(
   const wantsOil = keywords.some((k) => /aceite|oil/i.test(k));
   const wantsPad = keywords.some((k) => /pastill|pads/i.test(k));
   const wantsAir = keywords.some((k) => /aire|air/i.test(k));
+  const wantsTransmission = keywords.some((k) => /transmisi|piñon|piñón|pinon|corona|cadena|sprocket|pinion|arrastre/i.test(k));
+
   if (wantsOil && !wantsAir) {
     typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%oil%' OR coalesce(name,'') ILIKE '%aceite%' OR coalesce(category3,'') ILIKE '%oil%')`;
   } else if (wantsPad) {
     typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%pad%' OR coalesce(name,'') ILIKE '%pastilla%' OR coalesce(category3,'') ILIKE '%brake pads%')`;
   } else if (wantsAir) {
     typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%air%' OR coalesce(name,'') ILIKE '%aire%')`;
+  } else if (wantsTransmission) {
+    typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%transmi%' OR coalesce(name,'') ILIKE '%cadena%' OR coalesce(name,'') ILIKE '%chain%' OR coalesce(name,'') ILIKE '%piñon%' OR coalesce(name,'') ILIKE '%piñón%' OR coalesce(name,'') ILIKE '%sproc%' OR coalesce(name,'') ILIKE '%corona%' OR coalesce(name,'') ILIKE '%pinion%' OR coalesce(category3,'') ILIKE '%transmi%' OR coalesce(category3,'') ILIKE '%chain%')`;
   }
 
   const sql = `
