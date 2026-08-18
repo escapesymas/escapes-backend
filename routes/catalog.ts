@@ -154,17 +154,37 @@ export function mapProductToFrontend(row: any) {
 
 let catalogDataCache: any = null;
 function getCatalogData() {
-  if (!catalogDataCache) {
-    const p = path.join(process.cwd(), 'moto_catalog.json');
-    if (fs.existsSync(p)) {
-      catalogDataCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
-    } else {
-      const p2 = path.join(__dirname, '..', 'moto_catalog.json');
-      if (fs.existsSync(p2)) {
-        catalogDataCache = JSON.parse(fs.readFileSync(p2, 'utf-8'));
+  if (catalogDataCache) return catalogDataCache;
+
+  let currentDir = process.cwd();
+  try {
+    if (typeof __dirname !== 'undefined') {
+      currentDir = __dirname;
+    }
+  } catch {
+    // fallback process.cwd()
+  }
+
+  const candidates = [
+    path.join(currentDir, 'moto_catalog.json'),
+    path.join(currentDir, '..', 'moto_catalog.json'),
+    path.join(process.cwd(), 'moto_catalog.json'),
+    path.join(process.cwd(), 'escapes-backend', 'moto_catalog.json'),
+    path.join(process.cwd(), 'server', 'moto_catalog.json'),
+  ];
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        catalogDataCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        return catalogDataCache;
       }
+    } catch {
+      // continue
     }
   }
+
+  catalogDataCache = { hierarchy: {}, compatibility: {} };
   return catalogDataCache;
 }
 
