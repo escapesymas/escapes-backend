@@ -194,42 +194,46 @@ export async function sendTemplatedEmail(
  * Sweep the persistent retry queue. Run from a cron interval.
  */
 export async function processEmailRetryQueue(): Promise<{ processed: number; failed: number; requeued: number; parked: number }> {
-  const due = await db.execute(sql`
-    SELECT id, event_id, template, to_addr, payload, attempts
-    FROM email_send_queue
-    WHERE next_retry_at <= NOW() AND attempts < 10
-    ORDER BY next_retry_at ASC
-    LIMIT 20
-  `);
+  try {
+    const due = await db.execute(sql`
+      SELECT id, event_id, template, to_addr, payload, attempts
+      FROM email_send_queue
+      WHERE next_retry_at <= NOW() AND attempts < 10
+      ORDER BY next_retry_at ASC
+      LIMIT 20
+    `);
 
-  let processed = 0, failed = 0, requeued = 0, parked = 0;
+    let processed = 0, failed = 0, requeued = 0, parked = 0;
 
-  for (const row of due.rows as any[]) {
-    const payload: EmailPayload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
-    const result = await sendEmail(payload);
-    if (result.status === 'sent') {
-      await db.execute(sql`DELETE FROM email_send_queue WHERE id = ${row.id}`);
-      processed++;
-    } else {
-      const nextAttempt = (row.attempts || 0) + 1;
-      if (nextAttempt >= 10) {
+    for (const row of due.rows as any[]) {
+      const payload: EmailPayload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+      const result = await sendEmail(payload);
+      if (result.status === 'sent') {
         await db.execute(sql`DELETE FROM email_send_queue WHERE id = ${row.id}`);
-        parked++;
+        processed++;
       } else {
-        const backoffMs = RETRY_DELAYS_MS[Math.min(nextAttempt - 1, RETRY_DELAYS_MS.length - 1)] || 60_000;
-        await db.execute(sql`
-          UPDATE email_send_queue
-          SET attempts = ${nextAttempt}, last_error = ${result.lastError || null},
-              next_retry_at = NOW() + (${backoffMs}::bigint * INTERVAL '1 millisecond')
-          WHERE id = ${row.id}
-        `);
-        requeued++;
+        const nextAttempt = (row.attempts || 0) + 1;
+        if (nextAttempt >= 10) {
+          await db.execute(sql`DELETE FROM email_send_queue WHERE id = ${row.id}`);
+          parked++;
+        } else {
+          const backoffMs = RETRY_DELAYS_MS[Math.min(nextAttempt - 1, RETRY_DELAYS_MS.length - 1)] || 60_000;
+          await db.execute(sql`
+            UPDATE email_send_queue
+            SET attempts = ${nextAttempt}, last_error = ${result.lastError || null},
+                next_retry_at = NOW() + (${backoffMs}::bigint * INTERVAL '1 millisecond')
+            WHERE id = ${row.id}
+          `);
+          requeued++;
+        }
+        failed++;
       }
-      failed++;
     }
-  }
 
-  return { processed, failed, requeued, parked };
+    return { processed, failed, requeued, parked };
+  } catch (err) {
+    return { processed: 0, failed: 0, requeued: 0, parked: 0 };
+  }
 }
 
 /**

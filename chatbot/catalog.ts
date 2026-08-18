@@ -269,28 +269,38 @@ async function searchByCompatibility(
     const modelSpacedFromNorm = modelNorm.replace(/^([A-Za-z]+)(\d+)([A-Za-z]*)$/, '$1 $2 $3').trim();
     const variants = Array.from(new Set([modelRaw, modelSpace, modelSpacedFromNorm, modelNorm].filter((v) => v && v.length >= 2)));
 
+    // Tokenized model matching: handles unordered model terms like "HYPERMOTARD 1100" matching "1100 HYPERMOTARD EVO"
+    const modelTokens = modelRaw.split(/\s+/).filter((t) => t.length >= 1);
+    let tokenizedCond = '';
+    let tokenizedParams: string[] = [];
+    if (modelTokens.length >= 2) {
+      const conds = modelTokens.map((_t, idx) => `c->>'model' ILIKE $${i + (moto.brand ? 1 : 0) + idx}`).join(' AND ');
+      tokenizedCond = `(${conds})`;
+      tokenizedParams = modelTokens.map((t) => `%${t}%`);
+    }
+
     if (moto.brand && moto.model && moto.year) {
       const variantConds = variants.map((_v, idx) => `c->>'model' ILIKE $${i + 1 + idx}`).join(' OR ');
-      parts.push(`(c->>'brand' = $${i} AND (${variantConds}) AND ABS(COALESCE((c->>'year')::int, $${i + 1 + variants.length}) - $${i + 1 + variants.length}) <= 2)`);
-      params.push(moto.brand, ...variants.map((v) => `%${v}%`), moto.year);
-      i += 2 + variants.length;
-    }
-    if (moto.brand && moto.model) {
+      const fullVariantCond = tokenizedCond ? `((${variantConds}) OR ${tokenizedCond})` : `(${variantConds})`;
+      parts.push(`(c->>'brand' = $${i} AND ${fullVariantCond} AND ABS(COALESCE((c->>'year')::int, $${i + 1 + variants.length + tokenizedParams.length}) - $${i + 1 + variants.length + tokenizedParams.length}) <= 3)`);
+      params.push(moto.brand, ...variants.map((v) => `%${v}%`), ...tokenizedParams, moto.year);
+      i += 2 + variants.length + tokenizedParams.length;
+    } else if (moto.brand && moto.model) {
       const variantConds = variants.map((_v, idx) => `c->>'model' ILIKE $${i + 1 + idx}`).join(' OR ');
-      parts.push(`(c->>'brand' = $${i} AND (${variantConds}))`);
-      params.push(moto.brand, ...variants.map((v) => `%${v}%`));
-      i += 1 + variants.length;
-    }
-    if (moto.brand && !moto.model) {
+      const fullVariantCond = tokenizedCond ? `((${variantConds}) OR ${tokenizedCond})` : `(${variantConds})`;
+      parts.push(`(c->>'brand' = $${i} AND ${fullVariantCond})`);
+      params.push(moto.brand, ...variants.map((v) => `%${v}%`), ...tokenizedParams);
+      i += 1 + variants.length + tokenizedParams.length;
+    } else if (moto.brand && !moto.model) {
       parts.push(`(c->>'brand' = $${i})`);
       params.push(moto.brand);
       i += 1;
-    }
-    if (!moto.brand && moto.model) {
+    } else if (!moto.brand && moto.model) {
       const variantConds = variants.map((_v, idx) => `c->>'model' ILIKE $${i + idx}`).join(' OR ');
-      parts.push(`(${variantConds})`);
-      params.push(...variants.map((v) => `%${v}%`));
-      i += variants.length;
+      const fullVariantCond = tokenizedCond ? `((${variantConds}) OR ${tokenizedCond})` : `(${variantConds})`;
+      parts.push(`(${fullVariantCond})`);
+      params.push(...variants.map((v) => `%${v}%`), ...tokenizedParams);
+      i += variants.length + tokenizedParams.length;
     }
 
     if (parts.length > 0) {
@@ -328,7 +338,7 @@ async function searchByCompatibility(
   if (wantsOil && !wantsAir) {
     typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%oil%' OR coalesce(name,'') ILIKE '%aceite%' OR coalesce(category3,'') ILIKE '%oil%')`;
   } else if (wantsPad) {
-    typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%pad%' OR coalesce(name,'') ILIKE '%pastilla%' OR coalesce(category3,'') ILIKE '%brake pads%')`;
+    typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%pad%' OR coalesce(name,'') ILIKE '%pastilla%' OR coalesce(category3,'') ILIKE '%brake pads%') AND coalesce(name,'') NOT ILIKE '%shoe%' AND coalesce(name,'') NOT ILIKE '%zapata%' AND coalesce(name,'') NOT ILIKE '%drum%'`;
   } else if (wantsAir) {
     typeSpecificFilter = `AND (coalesce(name,'') ILIKE '%air%' OR coalesce(name,'') ILIKE '%aire%')`;
   } else if (wantsTransmission) {
