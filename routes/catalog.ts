@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import sharp from 'sharp';
 import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
+import { getLiveStockValue } from '../bihrService.js';
 
 export const catalogRouter = Router();
 
@@ -145,7 +146,9 @@ export function mapProductToFrontend(row: any) {
     avg_rating: row.avg_rating ? parseFloat(row.avg_rating) : 0,
     averageRating: row.avg_rating ? parseFloat(row.avg_rating) : 0,
     review_count: row.review_count ? parseInt(row.review_count, 10) : 0,
-    ratingCount: row.review_count ? parseInt(row.review_count, 10) : 0
+    ratingCount: row.review_count ? parseInt(row.review_count, 10) : 0,
+    dropshipping: !!row.dropshipping,
+    ondemand: !!row.ondemand
   };
 }
 
@@ -166,7 +169,12 @@ function getCatalogData() {
 }
 
 function cleanModelName(m: any): string {
-  return String(m || '').replace(/\(.*\)/g, '').trim().toLowerCase();
+  return String(m || '')
+    .replace(/\(.*\)/g, '')
+    .replace(/\b(abs|cbs|dx|sx|sp|se|rr|r|i|ie|fi|euro\s*\d)\b/gi, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
 }
 
 function parseTitleYears(title: string): [number, number] | null {
@@ -230,15 +238,22 @@ async function getDbCompatibilityIndex(): Promise<Map<string, Set<string>>> {
         for (const item of list) {
           if (!item.brand || !item.model) continue;
           const b = String(item.brand).trim().toLowerCase();
-          const m = cleanModelName(item.model);
+          const mClean = cleanModelName(item.model);
+          const mRaw = String(item.model).replace(/\(.*\)/g, '').trim().toLowerCase();
           const y = item.year ? String(item.year).trim() : '';
 
           if (y) {
-            const k1 = `${b}::${m}::${y}`;
+            const k1 = `${b}::${mClean}::${y}`;
             if (!newIndex.has(k1)) newIndex.set(k1, new Set());
             newIndex.get(k1)!.add(row.sku);
+
+            if (mRaw !== mClean) {
+              const k1raw = `${b}::${mRaw}::${y}`;
+              if (!newIndex.has(k1raw)) newIndex.set(k1raw, new Set());
+              newIndex.get(k1raw)!.add(row.sku);
+            }
           }
-          const k2 = `${b}::${m}`;
+          const k2 = `${b}::${mClean}`;
           if (!newIndex.has(k2)) newIndex.set(k2, new Set());
           newIndex.get(k2)!.add(row.sku);
         }
@@ -828,6 +843,67 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
     res.json(mapProductToFrontend(result.rows[0]));
   } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/catalog/product/:id/refresh-stock
+catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
+  try {
+    const productId = parseInt(req.params.id, 10);
+    if (isNaN(productId)) return res.status(400).json({ error: 'ID de producto inválido' });
+
+    const result = await db.execute(sql`
+      SELECT id, sku, supplier_code, stock, in_stock, dropshipping, ondemand, updated_at 
+      FROM products 
+      WHERE id = ${productId} AND status = 'published'
+      LIMIT 1
+    `);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Producto no encontrado' });
+
+    const product = result.rows[0] as any;
+
+    // Si no es dropshipping ni ondemand, retornamos el stock actual de inmediato
+    if (!product.dropshipping && !product.ondemand) {
+      return res.json({ stock: product.stock, inStock: product.in_stock });
+    }
+
+    const supplierCode = String(product.supplier_code || product.sku || '');
+    if (!supplierCode) {
+      return res.json({ stock: product.stock, inStock: product.in_stock });
+    }
+
+    // Throttle de 15 minutos: si se actualizó hace poco, no llamamos a la API de Bihr
+    const quinceMinutos = 15 * 60 * 1000;
+    const necesitaActualizacion = !product.updated_at || (Date.now() - new Date(product.updated_at).getTime() > quinceMinutos);
+
+    if (!necesitaActualizacion) {
+      return res.json({ stock: product.stock, inStock: product.in_stock });
+    }
+
+    // Llamamos a la API externa de Bihr para obtener el stock real numérico
+    const stock = await getLiveStockValue(supplierCode);
+    const safeStock = Number.isFinite(stock) && stock >= 0 ? Math.floor(stock) : 0;
+    const inStock = safeStock > 0;
+
+    // Actualizamos la base de datos
+    await db.execute(sql`
+      UPDATE products 
+      SET stock = ${safeStock}, in_stock = ${inStock}, updated_at = NOW() 
+      WHERE id = ${product.id}
+    `);
+
+    console.log(`[LIVE STOCK REFRESH] Updated stock for ${product.sku} to ${safeStock} (inStock: ${inStock})`);
+    return res.json({ stock: safeStock, inStock });
+  } catch (err: any) {
+    console.error('[LIVE STOCK REFRESH ERROR]:', err);
+    // En caso de error de la API (ej: 429), devolvemos el stock cacheado para no romper la UI
+    try {
+      const fallback = await db.execute(sql`SELECT stock, in_stock FROM products WHERE id = ${parseInt(req.params.id, 10)}`);
+      if (fallback.rows.length > 0) {
+        return res.json({ stock: fallback.rows[0].stock, inStock: fallback.rows[0].in_stock });
+      }
+    } catch {}
     res.status(500).json({ error: err.message });
   }
 });
