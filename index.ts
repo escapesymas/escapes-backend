@@ -6325,7 +6325,7 @@ app.get('/api/user/:id/rank', async (req, res) => {
 // GARAGE
 // ================================================================
 app.all('/api/garage', async (req, res) => {
-  const { userEmail } = req.query as any;
+  const userEmail = (req.query.userEmail || req.body?.userEmail) as string;
   if (!userEmail) return res.status(401).json({ error: 'No autorizado' });
 
   try {
