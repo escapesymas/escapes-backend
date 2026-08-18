@@ -210,8 +210,10 @@ export function startBihrStockCron(): void {
   cronHandle = setInterval(() => {
     syncBihrStock().catch((e) => console.error('[BIHR STOCK SYNC] interval error:', e));
   }, CRON_INTERVAL_MS);
-  // Fire one pass on boot so we don't wait 6h after a restart.
-  syncBihrStock().catch((e) => console.error('[BIHR STOCK SYNC] initial run error:', e));
+  // Fire one pass after 60s boot delay so startup requests remain fast and clean.
+  setTimeout(() => {
+    syncBihrStock().catch((e) => console.error('[BIHR STOCK SYNC] initial run error:', e));
+  }, 60000);
 }
 
 /** Stop the cron (used in tests; not called by the running server). */
