@@ -185,12 +185,15 @@ function mapHit(row: any): CatalogHit {
   };
 }
 
-function formatHitText(p: CatalogHit): string {
+function formatHitText(p: CatalogHit, targetMoto?: GarageMotorcycle | null): string {
   const priceStr = p.sale_price
     ? `${(p.sale_price / 100).toFixed(2)}€ (antes ${(p.price / 100).toFixed(2)}€)`
     : `${(p.price / 100).toFixed(2)}€`;
   const stockStr = (p.stock || 0) > 0 ? `stock: ${p.stock}` : 'sin stock';
-  return `- ${p.sku} | ${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}`;
+  const compatTag = targetMoto && (targetMoto.brand || targetMoto.model)
+    ? `[COMPATIBLE VERIFICADO CON ${targetMoto.brand} ${targetMoto.model}${targetMoto.year ? ` (${targetMoto.year})` : ''}] `
+    : '';
+  return `- ${compatTag}${p.sku} | ${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}`;
 }
 
 async function searchByKeywords(
@@ -259,7 +262,11 @@ async function searchByCompatibility(
 
   const conditions: string[] = [];
   const params: any[] = [];
-  let i = 1;
+  let paramIdx = 1;
+  const p = (val: any) => {
+    params.push(val);
+    return `$${paramIdx++}`;
+  };
 
   for (const moto of validMotos) {
     const parts: string[] = [];
@@ -268,39 +275,34 @@ async function searchByCompatibility(
     const modelNorm = modelRaw.replace(/[^A-Za-z0-9]/g, '');
     const modelSpacedFromNorm = modelNorm.replace(/^([A-Za-z]+)(\d+)([A-Za-z]*)$/, '$1 $2 $3').trim();
     const variants = Array.from(new Set([modelRaw, modelSpace, modelSpacedFromNorm, modelNorm].filter((v) => v && v.length >= 2)));
-
-    // Tokenized model matching: handles unordered model terms like "HYPERMOTARD 1100" matching "1100 HYPERMOTARD EVO"
     const modelTokens = modelRaw.split(/\s+/).filter((t) => t.length >= 1);
-    let tokenizedCond = '';
-    let tokenizedParams: string[] = [];
+
+    const brandPlaceholder = moto.brand ? p(moto.brand) : null;
+
+    const modelConds: string[] = [];
+    if (variants.length > 0) {
+      const vConds = variants.map((v) => `c->>'model' ILIKE ${p(`%${v}%`)}`);
+      modelConds.push(`(${vConds.join(' OR ')})`);
+    }
     if (modelTokens.length >= 2) {
-      const conds = modelTokens.map((_t, idx) => `c->>'model' ILIKE $${i + (moto.brand ? 1 : 0) + idx}`).join(' AND ');
-      tokenizedCond = `(${conds})`;
-      tokenizedParams = modelTokens.map((t) => `%${t}%`);
+      const tConds = modelTokens.map((t) => `c->>'model' ILIKE ${p(`%${t}%`)}`);
+      modelConds.push(`(${tConds.join(' AND ')})`);
     }
 
-    if (moto.brand && moto.model && moto.year) {
-      const variantConds = variants.map((_v, idx) => `c->>'model' ILIKE $${i + 1 + idx}`).join(' OR ');
-      const fullVariantCond = tokenizedCond ? `((${variantConds}) OR ${tokenizedCond})` : `(${variantConds})`;
-      parts.push(`(c->>'brand' = $${i} AND ${fullVariantCond} AND ABS(COALESCE((c->>'year')::int, $${i + 1 + variants.length + tokenizedParams.length}) - $${i + 1 + variants.length + tokenizedParams.length}) <= 3)`);
-      params.push(moto.brand, ...variants.map((v) => `%${v}%`), ...tokenizedParams, moto.year);
-      i += 2 + variants.length + tokenizedParams.length;
-    } else if (moto.brand && moto.model) {
-      const variantConds = variants.map((_v, idx) => `c->>'model' ILIKE $${i + 1 + idx}`).join(' OR ');
-      const fullVariantCond = tokenizedCond ? `((${variantConds}) OR ${tokenizedCond})` : `(${variantConds})`;
-      parts.push(`(c->>'brand' = $${i} AND ${fullVariantCond})`);
-      params.push(moto.brand, ...variants.map((v) => `%${v}%`), ...tokenizedParams);
-      i += 1 + variants.length + tokenizedParams.length;
-    } else if (moto.brand && !moto.model) {
-      parts.push(`(c->>'brand' = $${i})`);
-      params.push(moto.brand);
-      i += 1;
-    } else if (!moto.brand && moto.model) {
-      const variantConds = variants.map((_v, idx) => `c->>'model' ILIKE $${i + idx}`).join(' OR ');
-      const fullVariantCond = tokenizedCond ? `((${variantConds}) OR ${tokenizedCond})` : `(${variantConds})`;
-      parts.push(`(${fullVariantCond})`);
-      params.push(...variants.map((v) => `%${v}%`), ...tokenizedParams);
-      i += variants.length + tokenizedParams.length;
+    const modelPart = modelConds.length > 0 ? `(${modelConds.join(' OR ')})` : '';
+
+    let yearPart = '';
+    if (moto.year) {
+      const yP = p(moto.year);
+      yearPart = `AND ABS(COALESCE((c->>'year')::int, ${yP}::int) - ${yP}::int) <= 3`;
+    }
+
+    if (brandPlaceholder && modelPart) {
+      parts.push(`(c->>'brand' = ${brandPlaceholder} AND ${modelPart} ${yearPart})`);
+    } else if (brandPlaceholder && !modelPart) {
+      parts.push(`(c->>'brand' = ${brandPlaceholder})`);
+    } else if (!brandPlaceholder && modelPart) {
+      parts.push(`(${modelPart} ${yearPart})`);
     }
 
     if (parts.length > 0) {
@@ -313,20 +315,16 @@ async function searchByCompatibility(
   let keywordFilter = '';
   if (keywords.length > 0) {
     const tsQuery = keywords.map((k) => `${k}:*`).join(' | ');
-    keywordFilter = `AND to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(category2,'') || ' ' || coalesce(category3,'') || ' ' || coalesce(brand,'') || ' ' || coalesce(sku,'')) @@ to_tsquery('simple', $${i})`;
-    params.push(tsQuery);
-    i += 1;
+    keywordFilter = `AND to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(category2,'') || ' ' || coalesce(category3,'') || ' ' || coalesce(brand,'') || ' ' || coalesce(sku,'')) @@ to_tsquery('simple', ${p(tsQuery)})`;
   }
 
   let nameILikeFilter = '';
   const productKeywords = keywords.filter((k) => /pastill|brake|pads|filtro|filter|aceite|oil|escape|exhaust|cadena|chain|buji|spark|embrague|clutch|amortiguador|suspension|bateria|battery|faros?|light|motor|engine|correa|belt|sprocket|pinion|piñon|piñón|pinon|corona|transmisi|bearing|junta|gasket|disco|disc|casco|helmet|guant|glove/i.test(k));
   if (productKeywords.length > 0) {
     const orClauses = productKeywords
-      .map((_k, idx) => `(coalesce(name,'') ILIKE $${i + idx} OR coalesce(category3,'') ILIKE $${i + idx})`)
+      .map((k) => `(coalesce(name,'') ILIKE ${p(`%${k}%`)} OR coalesce(category3,'') ILIKE ${p(`%${k}%`)})`)
       .join(' OR ');
     nameILikeFilter = `AND (${orClauses})`;
-    params.push(...productKeywords.map((k) => `%${k}%`));
-    i += productKeywords.length;
   }
 
   let typeSpecificFilter = '';
@@ -602,7 +600,8 @@ export async function getCatalogContext(
     }
   }
 
-  if (merged.length < 4) {
+  // STRICT VEHICLE FILTER: Only run keyword fallback if NO specific vehicle was requested
+  if (merged.length < 4 && targetMotos.length === 0) {
     const fallbackHits = await searchByKeywords(keywords, { garageMotos: [], limit: 12, typeFilter });
     for (const h of fallbackHits) {
       if (!seen.has(h.id) && merged.length < 12) {
@@ -613,9 +612,12 @@ export async function getCatalogContext(
   }
 
   if (merged.length === 0) {
+    const bikeDesc = targetMotos.length > 0
+      ? `${targetMotos[0].brand} ${targetMotos[0].model}${targetMotos[0].year ? ` (${targetMotos[0].year})` : ''}`
+      : 'la consulta';
     return {
       hits: [],
-      text: 'Resumen del catálogo: 156.862 productos totales, 107.917 en stock. No se encontraron coincidencias exactas para la consulta.',
+      text: `NO SE ENCONTRARON PRODUCTOS EN STOCK COMPATIBLES CON ${bikeDesc.toUpperCase()}. Informa al cliente amablemente de que no hay stock disponible en el catálogo para esta moto en este momento.`,
     };
   }
 
@@ -623,7 +625,8 @@ export async function getCatalogContext(
   const diversified = diversifyByBrand(ranked, 1);
   const finalHits = diversified.slice(0, 6);
 
-  const text = finalHits.map(formatHitText).join('\n');
+  const mainMoto = targetMotos.length > 0 ? targetMotos[0] : null;
+  const text = finalHits.map((h) => formatHitText(h, mainMoto)).join('\n');
 
   return { hits: finalHits, text };
 }
