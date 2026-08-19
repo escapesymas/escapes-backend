@@ -7301,11 +7301,13 @@ app.get('/api/cart', async (req: any, res: any) => {
       return res.status(400).json({ error: 'Falta sessionToken o userId' });
     }
 
+    const parsedUserId = userId && userId !== 'undefined' && !isNaN(parseInt(userId)) ? parseInt(userId) : null;
+
     let cartRes;
-    if (userId && userId !== 'undefined') {
+    if (parsedUserId) {
       cartRes = await db.execute(sql`
         SELECT * FROM carts 
-        WHERE user_id = ${parseInt(userId)} OR session_token = ${sessionToken || ''}
+        WHERE user_id = ${parsedUserId} OR session_token = ${sessionToken || ''}
         ORDER BY updated_at DESC LIMIT 1
       `);
     } else {
@@ -7316,11 +7318,19 @@ app.get('/api/cart', async (req: any, res: any) => {
 
     if (cartRes.rows.length > 0) {
       const cart = cartRes.rows[0] as any;
+      let parsedItems = cart.items;
+      if (typeof parsedItems === 'string') {
+        try {
+          parsedItems = JSON.parse(parsedItems);
+        } catch {
+          parsedItems = [];
+        }
+      }
       return res.json({
         id: cart.id,
         userId: cart.user_id,
         sessionToken: cart.session_token,
-        items: cart.items ? JSON.parse(cart.items as string) : [],
+        items: Array.isArray(parsedItems) ? parsedItems : [],
         updatedAt: cart.updated_at
       });
     } else {
