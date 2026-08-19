@@ -45,11 +45,14 @@ ${catalogContext}
 
 REGLAS DE RESPUESTA:
 - Sé breve: 2-4 frases por respuesta salvo que pidan detalles.
+- VERIFICACIÓN Y CONFIRMACIÓN DE COMPATIBILIDAD:
+  * Si en el contexto del catálogo figuran productos etiquetados con [COMPATIBLE VERIFICADO CON ...], CONFIRMA AL CLIENTE CON TOTAL ROTUNDIDAD QUE ESOS PRODUCTOS SON 100% COMPATIBLES CON SU MOTO.
+  * NUNCA utilices expresiones de duda como "no tengo confirmada la compatibilidad", "no puedo asegurar si encajan" o "recomiendo verificar antes de pedir". Si están en la lista del catálogo relevante, la compatibilidad está totalmente verificada.
+  * Si el cliente consulta por una moto específica y la sección del catálogo indica que NO hay productos compatibles en stock, di amablemente que no hay stock para ese modelo de moto en este momento. NUNCA ofrezcas recambios no compatibles de otros modelos ni zapatas de freno de tambor.
 - Si el usuario pregunta por especificaciones técnicas de serie (ej. relación de transmisión original, piñón/corona de serie, aceite, batería), usa la información técnica provista para explicárselo con total precisión y recomiéndale los productos de nuestra tienda que coincidan.
 - Si preguntan por un producto que NO aparece en el catálogo relevante, di: "No tengo ese producto concreto, pero si me das más detalles (marca, modelo de moto, tipo de recambio) te ayudo a buscarlo."
 - Si preguntan por el estado de un pedido concreto, indícale el estado actual que aparece en la sección "Pedidos recientes del cliente". Si no tienen pedidos, dilo amablemente.
 - Si preguntan algo FUERA de tu alcance, responde EXACTAMENTE: "Lo siento, solo puedo ayudarte con temas de Escapes y Más (catálogo, pedidos o soporte web). ¿En qué producto o pedido te echo una mano?"
-- Si el cliente tiene motos en su garaje y pregunta por un producto que pueda depender de compatibilidad, recomienda SOLO productos del catálogo relevante que sean compatibles con sus motos.
 - NUNCA inventes datos. Si no lo sabes, dilo.
 - IMPORTANTE: NO tienes que mostrar SKUs en tu texto. El sistema muestra automáticamente tarjetas con los productos encontrados. Tú solo describe brevemente qué has encontrado (marca, tipo, características generales).
 - IMPORTANTE: Tu respuesta visible es ÚNICAMENTE el texto que ve el cliente. NO incluyas razonamiento interno, planificación ni auto-diálogos. Responde directamente al cliente.`;
@@ -73,8 +76,8 @@ const THINK_CLOSE = ' THINK_CLOSE_PLACEHOLDER ';
 function encodeForFilter(s: string): string {
   return s
     .replace(/<\s*\/?\s*think(ing)?\s*>/gi, (m) => {
-      const isOpen = !m.startsWith('</');
-      return isOpen ? THINK_OPEN : THINK_CLOSE;
+      const lower = m.toLowerCase();
+      return lower.includes('/') ? THINK_CLOSE : THINK_OPEN;
     })
     .replace(/【\s*think(ing)?\s*】/gi, THINK_OPEN)
     .replace(/】\s*think(ing)?\s*】/gi, THINK_CLOSE)
@@ -193,7 +196,8 @@ export async function chatHandler(req: Request, res: Response) {
 
     let { hits: catalogHits, text: catalogText } = catalogResult;
 
-    if (garageEntries.length > 0) {
+    // Only merge garage bikes if the user did NOT explicitly specify a motorcycle in their query!
+    if (!motoFromQuery && garageEntries.length > 0) {
       const garageResult = await getCatalogContext(cleanInput, garageEntries);
       if (garageResult.hits.length > 0) {
         const merged = mergeCatalogHits(catalogHits, garageResult.hits);
