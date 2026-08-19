@@ -7960,7 +7960,7 @@ app.get('/api/reviews/:productId', async (req, res) => {
     const { limit = '10', offset = '0' } = req.query as any;
     
     const reviewsRes = await db.execute(sql`
-      SELECT r.id, r.product_id, r.user_id, u.email as user_email, COALESCE(u.username, u.first_name, 'Usuario') as username,
+      SELECT r.id, r.product_id, r.user_id, u.email as user_email, u.avatar_url as avatar_url, COALESCE(u.username, u.first_name, 'Usuario') as username,
              r.rating, r.title, r.content, r.verified_purchase, r.created_at
       FROM product_reviews r
       LEFT JOIN users u ON r.user_id = u.id
