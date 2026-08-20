@@ -2275,7 +2275,6 @@ function getCatalog() {
     if (typeof __dirname !== 'undefined') {
       currentDir = __dirname;
     } else if (import.meta && import.meta.url) {
-      const { fileURLToPath } = require('url');
       currentDir = path.dirname(fileURLToPath(import.meta.url));
     }
   } catch {
@@ -2288,6 +2287,7 @@ function getCatalog() {
     path.join(process.cwd(), 'moto_catalog.json'),
     path.join(process.cwd(), 'escapes-backend', 'moto_catalog.json'),
     path.join(process.cwd(), 'server', 'moto_catalog.json'),
+    '/app/server/moto_catalog.json',
   ];
 
   for (const filePath of candidates) {

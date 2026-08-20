@@ -156,21 +156,13 @@ let catalogDataCache: any = null;
 function getCatalogData() {
   if (catalogDataCache) return catalogDataCache;
 
-  let currentDir = process.cwd();
-  try {
-    if (typeof __dirname !== 'undefined') {
-      currentDir = __dirname;
-    }
-  } catch {
-    // fallback process.cwd()
-  }
-
   const candidates = [
-    path.join(currentDir, 'moto_catalog.json'),
-    path.join(currentDir, '..', 'moto_catalog.json'),
+    path.join(__dirname, '..', 'moto_catalog.json'),
+    path.join(__dirname, 'moto_catalog.json'),
     path.join(process.cwd(), 'moto_catalog.json'),
     path.join(process.cwd(), 'escapes-backend', 'moto_catalog.json'),
     path.join(process.cwd(), 'server', 'moto_catalog.json'),
+    '/app/server/moto_catalog.json',
   ];
 
   for (const p of candidates) {
