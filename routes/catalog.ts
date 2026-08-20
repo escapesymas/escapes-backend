@@ -3,11 +3,15 @@ import { db, pool } from '../db.js';
 import { sql } from 'drizzle-orm';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import sharp from 'sharp';
 import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
 import { getLiveStockValue } from '../bihrService.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export const catalogRouter = Router();
 
