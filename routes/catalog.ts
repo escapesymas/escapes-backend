@@ -993,7 +993,8 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
     try {
       const fallback = await db.execute(sql`SELECT stock FROM products WHERE id = ${parseInt(req.params.id, 10)}`);
       if (fallback.rows.length > 0) {
-        const fStock = typeof fallback.rows[0].stock === 'string' ? parseInt(fallback.rows[0].stock, 10) : (fallback.rows[0].stock || 0);
+        const fRow = fallback.rows[0] as any;
+        const fStock = typeof fRow?.stock === 'string' ? parseInt(fRow.stock, 10) : (Number(fRow?.stock) || 0);
         return res.json({ stock: fStock, inStock: fStock > 0 });
       }
     } catch {}
