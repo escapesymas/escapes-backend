@@ -945,7 +945,7 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
     if (isNaN(productId)) return res.status(400).json({ error: 'ID de producto inválido' });
 
     const result = await db.execute(sql`
-      SELECT id, sku, supplier_code, stock, in_stock, dropshipping, ondemand, updated_at 
+      SELECT id, sku, supplier_code, stock, dropshipping, ondemand, updated_at 
       FROM products 
       WHERE id = ${productId} AND status = 'published'
       LIMIT 1
@@ -953,15 +953,16 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: 'Producto no encontrado' });
 
     const product = result.rows[0] as any;
+    const currentStock = typeof product.stock === 'string' ? parseInt(product.stock, 10) : (product.stock || 0);
 
     // Si no es dropshipping ni ondemand, retornamos el stock actual de inmediato
     if (!product.dropshipping && !product.ondemand) {
-      return res.json({ stock: product.stock, inStock: product.in_stock });
+      return res.json({ stock: currentStock, inStock: currentStock > 0 });
     }
 
     const supplierCode = String(product.supplier_code || product.sku || '');
     if (!supplierCode) {
-      return res.json({ stock: product.stock, inStock: product.in_stock });
+      return res.json({ stock: currentStock, inStock: currentStock > 0 });
     }
 
     // Throttle de 15 minutos: si se actualizó hace poco, no llamamos a la API de Bihr
@@ -969,7 +970,7 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
     const necesitaActualizacion = !product.updated_at || (Date.now() - new Date(product.updated_at).getTime() > quinceMinutos);
 
     if (!necesitaActualizacion) {
-      return res.json({ stock: product.stock, inStock: product.in_stock });
+      return res.json({ stock: currentStock, inStock: currentStock > 0 });
     }
 
     // Llamamos a la API externa de Bihr para obtener el stock real numérico
@@ -980,7 +981,7 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
     // Actualizamos la base de datos
     await db.execute(sql`
       UPDATE products 
-      SET stock = ${safeStock}, in_stock = ${inStock}, updated_at = NOW() 
+      SET stock = ${safeStock}, updated_at = NOW() 
       WHERE id = ${product.id}
     `);
 
@@ -990,9 +991,10 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
     console.error('[LIVE STOCK REFRESH ERROR]:', err);
     // En caso de error de la API (ej: 429), devolvemos el stock cacheado para no romper la UI
     try {
-      const fallback = await db.execute(sql`SELECT stock, in_stock FROM products WHERE id = ${parseInt(req.params.id, 10)}`);
+      const fallback = await db.execute(sql`SELECT stock FROM products WHERE id = ${parseInt(req.params.id, 10)}`);
       if (fallback.rows.length > 0) {
-        return res.json({ stock: fallback.rows[0].stock, inStock: fallback.rows[0].in_stock });
+        const fStock = typeof fallback.rows[0].stock === 'string' ? parseInt(fallback.rows[0].stock, 10) : (fallback.rows[0].stock || 0);
+        return res.json({ stock: fStock, inStock: fStock > 0 });
       }
     } catch {}
     res.status(500).json({ error: err.message });
