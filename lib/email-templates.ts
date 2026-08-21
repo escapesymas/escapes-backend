@@ -65,6 +65,25 @@ function money(cents: number | string): number {
   return (typeof cents === 'string' ? parseInt(cents) : cents) / 100;
 }
 
+export function formatOrderNumber(orderId: number | string | null | undefined, dateInput?: Date | string | null): string {
+  if (orderId === null || orderId === undefined || orderId === '') return '';
+  const strId = String(orderId).trim();
+  if (/^\d{14}$/.test(strId)) return strId;
+
+  const cleanId = strId.replace(/\D/g, '');
+  const idNum = parseInt(cleanId || '0', 10);
+  const paddedId = String(idNum).padStart(6, '0');
+
+  const d = dateInput ? new Date(dateInput) : new Date();
+  const validDate = isNaN(d.getTime()) ? new Date() : d;
+
+  const mm = String(validDate.getMonth() + 1).padStart(2, '0');
+  const yyyy = String(validDate.getFullYear());
+  const dd = String(validDate.getDate()).padStart(2, '0');
+
+  return `${mm}${yyyy}${dd}${paddedId}`;
+}
+
 export interface OrderConfirmationData {
   orderId: number | string;
   customerName?: string;
@@ -74,11 +93,12 @@ export interface OrderConfirmationData {
 }
 
 export function orderConfirmation(d: OrderConfirmationData): RenderedEmail {
+  const formattedId = formatOrderNumber(d.orderId);
   const total = money(d.total).toFixed(2);
-  const subject = `Pedido #${d.orderId} confirmado · ${BRAND}`;
+  const subject = `Pedido #${formattedId} confirmado · ${BRAND}`;
   const text = `Hola${d.customerName ? ` ${d.customerName}` : ''},
 
-Tu pedido #${d.orderId} por ${total}€ ha sido confirmado correctamente.
+Tu pedido #${formattedId} por ${total}€ ha sido confirmado correctamente.
 ${d.invoiceNumber ? `Factura: ${d.invoiceNumber} (adjunta en este email).` : ''}
 
 En los próximos días recibirás un email con el código de seguimiento cuando tu pedido salga de nuestro almacén.
@@ -90,7 +110,7 @@ El equipo de ${BRAND}.`;
   const html = shell(`
     <h2 style="color:${BRAND_COLOR};margin:0 0 8px">¡Pedido confirmado!</h2>
     <p>Hola${d.customerName ? ` <strong>${escapeHtml(d.customerName)}</strong>` : ''},</p>
-    <p>Tu pedido <strong>#${escapeHtml(String(d.orderId))}</strong> por <strong style="color:${BRAND_COLOR}">${total}€</strong> ha sido confirmado correctamente.</p>
+    <p>Tu pedido <strong>#${escapeHtml(formattedId)}</strong> por <strong style="color:${BRAND_COLOR}">${total}€</strong> ha sido confirmado correctamente.</p>
     ${d.invoiceNumber ? `<p>Factura: <strong>${escapeHtml(d.invoiceNumber)}</strong> (adjunta en este email).</p>` : ''}
     <p>En los próximos días recibirás un email con el código de seguimiento cuando tu pedido salga de nuestro almacén.</p>
     <p style="margin-top:24px">Gracias por confiar en nosotros.</p>
@@ -107,10 +127,11 @@ export interface OrderShippedData {
 }
 
 export function orderShipped(d: OrderShippedData): RenderedEmail {
-  const subject = `Tu pedido #${d.orderId} está en camino · ${BRAND}`;
+  const formattedId = formatOrderNumber(d.orderId);
+  const subject = `Tu pedido #${formattedId} está en camino · ${BRAND}`;
   const text = `Hola${d.customerName ? ` ${d.customerName}` : ''},
 
-Tu pedido #${d.orderId} ha salido de nuestro almacén${d.carrier ? ` con ${d.carrier}` : ''}.
+Tu pedido #${formattedId} ha salido de nuestro almacén${d.carrier ? ` con ${d.carrier}` : ''}.
 
 Número de seguimiento: ${d.trackingNumber}
 Sigue tu envío: ${d.trackingUrl}
@@ -122,7 +143,7 @@ El equipo de ${BRAND}.`;
   const html = shell(`
     <h2 style="color:${BRAND_COLOR};margin:0 0 8px">¡Tu pedido está en camino!</h2>
     <p>Hola${d.customerName ? ` <strong>${escapeHtml(d.customerName)}</strong>` : ''},</p>
-    <p>Tu pedido <strong>#${escapeHtml(String(d.orderId))}</strong> ha salido de nuestro almacén${d.carrier ? ` con <strong>${escapeHtml(d.carrier)}</strong>` : ''}.</p>
+    <p>Tu pedido <strong>#${escapeHtml(formattedId)}</strong> ha salido de nuestro almacén${d.carrier ? ` con <strong>${escapeHtml(d.carrier)}</strong>` : ''}.</p>
     <table style="margin:16px 0;border-collapse:collapse">
       <tr><td style="padding:4px 12px 4px 0;color:#666">Seguimiento:</td><td><strong>${escapeHtml(d.trackingNumber)}</strong></td></tr>
       <tr><td style="padding:4px 12px 4px 0;color:#666">Carrier:</td><td>${escapeHtml(d.carrier || '—')}</td></tr>
@@ -141,10 +162,11 @@ export interface OrderCancelledData {
 }
 
 export function orderCancelled(d: OrderCancelledData): RenderedEmail {
-  const subject = `Tu pedido #${d.orderId} ha sido cancelado · ${BRAND}`;
+  const formattedId = formatOrderNumber(d.orderId);
+  const subject = `Tu pedido #${formattedId} ha sido cancelado · ${BRAND}`;
   const text = `Hola${d.customerName ? ` ${d.customerName}` : ''},
 
-Tu pedido #${d.orderId} ha sido cancelado.${d.reason ? `\n\nMotivo: ${d.reason}` : ''}
+Tu pedido #${formattedId} ha sido cancelado.${d.reason ? `\n\nMotivo: ${d.reason}` : ''}
 
 Si esto es un error o necesitas ayuda, responde a este email.
 
@@ -153,7 +175,7 @@ El equipo de ${BRAND}.`;
   const html = shell(`
     <h2 style="color:#666;margin:0 0 8px">Pedido cancelado</h2>
     <p>Hola${d.customerName ? ` <strong>${escapeHtml(d.customerName)}</strong>` : ''},</p>
-    <p>Tu pedido <strong>#${escapeHtml(String(d.orderId))}</strong> ha sido cancelado.</p>
+    <p>Tu pedido <strong>#${escapeHtml(formattedId)}</strong> ha sido cancelado.</p>
     ${d.reason ? `<p style="color:#666">Motivo: ${escapeHtml(d.reason)}</p>` : ''}
     <p>Si esto es un error o necesitas ayuda, responde a este email.</p>
   `);
