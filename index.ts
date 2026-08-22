@@ -5224,6 +5224,10 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           SELECT c.*, u.email as user_email, u.first_name as user_firstname, u.last_name as user_lastname, u.username as user_username
           FROM carts c
           LEFT JOIN users u ON c.user_id = u.wp_id OR c.user_id = u.id
+          WHERE (c.is_deleted = 0 OR c.is_deleted IS NULL)
+            AND c.items IS NOT NULL
+            AND c.items != ''
+            AND c.items != '[]'
           ORDER BY c.updated_at DESC
         `);
         const result = [];
@@ -7126,6 +7130,8 @@ app.post('/api/cart', async (req: any, res: any) => {
       }
     }
 
+    const hasItems = Array.isArray(items) && items.length > 0;
+
     const existing = await db.execute(sql`
       SELECT id FROM carts WHERE session_token = ${sessionToken}
     `);
@@ -7133,13 +7139,13 @@ app.post('/api/cart', async (req: any, res: any) => {
     if (existing.rows.length > 0) {
       await db.execute(sql`
         UPDATE carts
-        SET user_id = ${safeUserId}, items = ${itemsStr}, updated_at = CURRENT_TIMESTAMP
+        SET user_id = ${safeUserId}, items = ${itemsStr}, updated_at = CURRENT_TIMESTAMP, is_deleted = ${hasItems ? 0 : 1}
         WHERE session_token = ${sessionToken}
       `);
-    } else {
+    } else if (hasItems) {
       await db.execute(sql`
-        INSERT INTO carts (user_id, session_token, items)
-        VALUES (${safeUserId}, ${sessionToken}, ${itemsStr})
+        INSERT INTO carts (user_id, session_token, items, is_deleted)
+        VALUES (${safeUserId}, ${sessionToken}, ${itemsStr}, 0)
       `);
     }
 
