@@ -244,6 +244,15 @@ const db = drizzle(pool);
         issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS admin_push_tokens (
+        id SERIAL PRIMARY KEY,
+        token VARCHAR(255) NOT NULL UNIQUE,
+        device_name VARCHAR(100),
+        platform VARCHAR(50) DEFAULT 'ios',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS image_regen_state (
         id SERIAL PRIMARY KEY,
         status VARCHAR(50) DEFAULT 'idle',
@@ -5270,6 +5279,20 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           WHERE id = ${parseInt(cartId)}
         `);
         return res.json({ success: true });
+      }
+
+      case 'push-register': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { pushToken, deviceName } = req.body;
+        if (!pushToken) return res.status(400).json({ error: 'Falta pushToken' });
+
+        await db.execute(sql`
+          INSERT INTO admin_push_tokens (token, device_name, platform, updated_at)
+          VALUES (${pushToken}, ${deviceName || 'iPhone'}, 'ios', CURRENT_TIMESTAMP)
+          ON CONFLICT (token) DO UPDATE SET updated_at = CURRENT_TIMESTAMP, device_name = ${deviceName || 'iPhone'}
+        `);
+
+        return res.json({ success: true, message: 'Token de notificación registrado' });
       }
 
       case 'send-abandoned-email': {
