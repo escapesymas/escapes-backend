@@ -1,4 +1,5 @@
-import { db, sql } from '../index.js';
+import { db } from '../db.js';
+import { sql } from 'drizzle-orm';
 
 export interface PushNotificationPayload {
   title: string;
