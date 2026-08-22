@@ -26,8 +26,8 @@ export interface RenderedEmail {
 }
 
 const BRAND = 'Escapes y Más';
-const BRAND_URL = 'https://escapesymas.com';
-const BRAND_COLOR = '#FF6B00';
+const BRAND_URL = process.env.PUBLIC_BASE_URL || 'https://escapesymas.com';
+const BRAND_COLOR = '#facc15';
 
 function shell(content: string): string {
   return `<!DOCTYPE html>
@@ -37,17 +37,26 @@ function shell(content: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${BRAND}</title>
 </head>
-<body style="margin:0;padding:0;background:#f7f7f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#222">
-  <div style="max-width:600px;margin:0 auto;background:#fff;padding:24px;border:1px solid #e5e7eb">
-    <div style="text-align:center;border-bottom:1px solid #f0f0f0;padding-bottom:16px;margin-bottom:16px">
-      <a href="${BRAND_URL}" style="color:${BRAND_COLOR};font-size:22px;font-weight:700;text-decoration:none">${BRAND}</a>
-    </div>
-    ${content}
-    <div style="border-top:1px solid #f0f0f0;margin-top:24px;padding-top:16px;text-align:center;color:#888;font-size:12px">
-      <a href="${BRAND_URL}" style="color:#888;text-decoration:none">${BRAND_URL.replace('https://', '')}</a>
-      &middot; <a href="${BRAND_URL}/cuenta" style="color:#888;text-decoration:none">Mi cuenta</a>
-    </div>
-  </div>
+<body style="margin:0;padding:0;background:#090b10;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#f8fafc">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#090b10;padding:32px 16px">
+    <tr><td align="center">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="max-width:600px;background:#11141d;border-radius:16px;overflow:hidden;border:1px solid #1e293b;box-shadow:0 20px 40px rgba(0,0,0,0.8)">
+        <tr><td style="padding:28px 32px 20px;text-align:center;background:#0f172a;border-bottom:1px solid #1e293b">
+          <a href="${BRAND_URL}" style="text-decoration:none">
+            <img src="${BRAND_URL}/logo-cabecera.svg" alt="${BRAND}" style="height:42px;width:auto;max-width:240px;display:inline-block" />
+          </a>
+        </td></tr>
+        <tr><td style="padding:32px">
+          ${content}
+        </td></tr>
+        <tr><td style="padding:20px 32px;background:#0f172a;border-top:1px solid #1e293b;text-align:center;color:#64748b;font-family:'Courier New',Courier,monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.5px">
+          <a href="${BRAND_URL}" style="color:#facc15;text-decoration:none;font-weight:700">${BRAND_URL.replace('https://', '')}</a>
+          &middot; <a href="${BRAND_URL}/perfil" style="color:#94a3b8;text-decoration:none">Mi cuenta</a>
+          &middot; <a href="mailto:info@escapesymas.com" style="color:#94a3b8;text-decoration:none">Soporte</a>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
 </body>
 </html>`;
 }
