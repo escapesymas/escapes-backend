@@ -319,6 +319,15 @@ authRouter.post('/auth', async (req, res) => {
       const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
       if (!targetId) return res.status(400).json({ error: 'Falta userId' });
 
+      // Si el cliente está eliminando su propia cuenta desde el frontend (no un admin borrándolo)
+      const isSelfDeletion = auth.role !== 'admin' || auth.user_id === targetId;
+      let deletedUserData: any = null;
+
+      try {
+        const uRes = await db.execute(sql`SELECT first_name, last_name, username, email FROM users WHERE id = ${targetId}`);
+        if (uRes.rows.length > 0) deletedUserData = uRes.rows[0];
+      } catch (e) {}
+
       try {
         await db.execute(sql`DELETE FROM users WHERE id = ${targetId}`);
       } catch (err) {
@@ -337,6 +346,23 @@ authRouter.post('/auth', async (req, res) => {
           WHERE id = ${targetId}
         `);
       }
+
+      // Notificar al admin vía Push si es una eliminación de cuenta solicitada por el usuario
+      if (isSelfDeletion && deletedUserData) {
+        try {
+          const { sendNotificationToAll } = await import('../pushService.js');
+          const clientName = [deletedUserData.first_name, deletedUserData.last_name].filter(Boolean).join(' ') || deletedUserData.username || deletedUserData.email;
+          await sendNotificationToAll({
+            title: `🗑️ Cuenta Eliminada por el Cliente`,
+            body: `${clientName} (${deletedUserData.email}) ha solicitado y eliminado su cuenta.`,
+            url: `/users`,
+            category: 'new_user' // Usar categoría de usuarios para la preferencia
+          });
+        } catch (pushErr: any) {
+          console.error('[DELETE ACCOUNT PUSH ERROR]:', pushErr.message);
+        }
+      }
+
       clearAuthCookie(res);
       return res.json({ success: true });
     }
