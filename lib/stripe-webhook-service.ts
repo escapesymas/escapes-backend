@@ -352,18 +352,16 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
     console.error(`[STRIPE WEBHOOK] Tracking server-side falló para pedido #${orderId}:`, trackErr.message);
   }
 
-  // 4. Send iOS Admin Push Notification for new paid order
+  // 4. Send Web Push Notification for new paid order
   try {
-    const { sendAdminPushNotification } = await import('./push-notifications.js');
-    const totalEur = ((existingOrder.total || 0) / 100).toFixed(2);
-    await sendAdminPushNotification({
-      title: `🛒 ¡Nuevo Pedido: ${totalEur} €!`,
-      body: customerName ? `${customerName} ha realizado el pedido #${orderId}` : `Pedido #${orderId} completado con éxito.`,
-      data: { orderId, type: 'new_order' },
-      sound: 'default'
+    const { notifyNewOrder } = await import('../pushService.js');
+    await notifyNewOrder({
+      id: orderId,
+      total: existingOrder.total || 0,
+      customerName
     });
   } catch (pushErr: any) {
-    console.error(`[STRIPE WEBHOOK] Error enviando notificación push admin para pedido #${orderId}:`, pushErr.message);
+    console.error(`[STRIPE WEBHOOK] Error enviando notificación push para pedido #${orderId}:`, pushErr.message);
   }
 }
 

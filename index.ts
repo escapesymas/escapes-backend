@@ -41,6 +41,7 @@ import { ordersRouter } from './routes/orders.js';
 import { authRouter } from './routes/auth.js';
 import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
+import { pushRouter } from './routes/pushRoutes.js';
 
 // Initialize Sentry as early as possible so subsequent unhandled errors are
 // captured. No-op when SENTRY_DSN is unset (local dev).
@@ -616,6 +617,7 @@ app.use('/api', ordersRouter);
 app.use('/api', authRouter);
 app.use('/api', bihrRouter);
 app.use('/api', adminRouter);
+app.use('/api', pushRouter);
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
