@@ -7243,6 +7243,18 @@ app.post('/api/cart', async (req: any, res: any) => {
       `);
     }
 
+    // Sincronizar también en la columna cart de la tabla users si hay un usuario logueado
+    if (safeUserId) {
+      try {
+        await db.execute(sql`
+          UPDATE users SET cart = ${itemsStr}::jsonb
+          WHERE id = ${safeUserId} OR wp_id = ${safeUserId}
+        `);
+      } catch (errUserCart) {
+        console.error('[USER CART COLUMN SYNC ERROR]:', errUserCart);
+      }
+    }
+
     try {
       const safeEmail = (userEmail && userEmail !== 'undefined' && userEmail.includes('@')) ? userEmail : null;
       const safeItems = Array.isArray(items) ? items.filter((it: any) => it && (it.id || it.product_id)) : [];
