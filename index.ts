@@ -5453,32 +5453,44 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         `);
 
         const rows = usersRes.rows.map((row: any) => {
-          let bikes: any[] = [];
+          let rawBikes: any[] = [];
           
           // 1. Motos de la tabla `garage`
           if (Array.isArray(row.garageTable) && row.garageTable.length > 0) {
-            bikes.push(...row.garageTable);
+            rawBikes.push(...row.garageTable);
           }
 
-          // 2. Motos de la columna JSONB `users.garage` (soporte para listas de strings de la frontend)
+          // 2. Motos de la columna JSONB `users.garage`
           if (row.userGarageJson) {
             try {
               const parsed = typeof row.userGarageJson === 'string' ? JSON.parse(row.userGarageJson) : row.userGarageJson;
               if (Array.isArray(parsed)) {
                 parsed.forEach((b: any) => {
                   if (typeof b === 'string' && b.trim()) {
-                    bikes.push(b.trim());
+                    rawBikes.push(b.trim());
                   } else if (b && typeof b === 'object') {
-                    bikes.push(b);
+                    rawBikes.push(b);
                   }
-                });
-              }
-            } catch (e) {}
+          // 3. Deduplicación por clave única normalizada
+          const seen = new Set<string>();
+          const uniqueBikes: any[] = [];
+
+          for (const item of rawBikes) {
+            let labelKey = '';
+            if (typeof item === 'string') {
+              labelKey = item.toLowerCase().trim();
+            } else if (item && typeof item === 'object') {
+              labelKey = `${item.brand || ''} ${item.model || ''} ${item.year || ''}`.toLowerCase().trim();
+            }
+            if (labelKey && !seen.has(labelKey)) {
+              seen.add(labelKey);
+              uniqueBikes.push(item);
+            }
           }
 
           return {
             ...row,
-            garage: bikes
+            garage: uniqueBikes
           };
         });
 
@@ -5524,6 +5536,160 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           `);
         }
         return res.json({ success: true, message: 'Cliente eliminado correctamente' });
+      }
+
+      case 'admin-add-garage-bike': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { userId, bike } = req.body;
+        if (!userId || !bike) return res.status(400).json({ error: 'Faltan datos (userId, bike)' });
+
+        const bikeStr = typeof bike === 'string'
+          ? bike.trim()
+          : `${bike.brand || ''} ${bike.model || ''} ${bike.year ? `(${bike.year})` : ''}`.trim();
+
+        if (!bikeStr) return res.status(400).json({ error: 'Moto no válida' });
+
+        // 1. Insertar en la tabla `garage`
+        let brand = typeof bike === 'object' ? bike.brand || 'Moto' : bikeStr.split(' ')[0] || 'Moto';
+        let model = typeof bike === 'object' ? bike.model || 'Modelo' : bikeStr.split(' ').slice(1).join(' ') || 'Modelo';
+        let year = typeof bike === 'object' ? bike.year || '' : '';
+
+        await db.execute(sql`
+          INSERT INTO garage (user_id, brand, model, year, is_primary)
+          VALUES (${parseInt(userId)}, ${brand}, ${model}, ${year}, 0)
+        `);
+
+        // 2. Sincronizar en la columna `users.garage` JSONB
+        const uRes = await db.execute(sql`SELECT garage FROM users WHERE id = ${parseInt(userId)}`);
+        if (uRes.rows.length > 0) {
+          let currentGarage: string[] = [];
+          try {
+            const raw = uRes.rows[0].garage;
+            currentGarage = typeof raw === 'string' ? JSON.parse(raw) : (Array.isArray(raw) ? raw : []);
+          } catch {}
+          if (!currentGarage.includes(bikeStr)) {
+            currentGarage.unshift(bikeStr);
+            await db.execute(sql`
+              UPDATE users SET garage = ${JSON.stringify(currentGarage)} WHERE id = ${parseInt(userId)}
+            `);
+          }
+        }
+
+        return res.json({ success: true });
+      }
+
+      case 'admin-remove-garage-bike': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { userId, bikeLabel } = req.body;
+        if (!userId || !bikeLabel) return res.status(400).json({ error: 'Faltan datos' });
+
+        const searchKey = bikeLabel.toLowerCase().trim();
+
+        // 1. Eliminar de la tabla `garage`
+        await db.execute(sql`
+          DELETE FROM garage 
+          WHERE user_id = ${parseInt(userId)} 
+            AND (
+              LOWER(TRIM(CONCAT(brand, ' ', model, ' ', year))) LIKE ${`%${searchKey}%`}
+              OR LOWER(TRIM(CONCAT(brand, ' ', model))) LIKE ${`%${searchKey}%`}
+            )
+        `);
+
+        // 2. Eliminar de la columna JSONB `users.garage`
+        const uRes = await db.execute(sql`SELECT garage FROM users WHERE id = ${parseInt(userId)}`);
+        if (uRes.rows.length > 0) {
+          let currentGarage: any[] = [];
+          try {
+            const raw = uRes.rows[0].garage;
+            currentGarage = typeof raw === 'string' ? JSON.parse(raw) : (Array.isArray(raw) ? raw : []);
+          } catch {}
+
+          const updatedGarage = currentGarage.filter((item: any) => {
+            const label = typeof item === 'string'
+              ? item.trim()
+              : `${item.brand || ''} ${item.model || ''} ${item.year || ''}`.trim();
+            return !label.toLowerCase().includes(searchKey);
+          });
+
+          await db.execute(sql`
+            UPDATE users SET garage = ${JSON.stringify(updatedGarage)} WHERE id = ${parseInt(userId)}
+          `);
+        }
+
+        return res.json({ success: true });
+      }
+
+      case 'admin-save-address': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { userId, address } = req.body;
+        if (!userId || !address) return res.status(400).json({ error: 'Faltan datos obligatorios' });
+
+        const uRes = await db.execute(sql`SELECT billing FROM users WHERE id = ${parseInt(userId)}`);
+        if (uRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        let currentBilling: any = {};
+        try {
+          const raw = uRes.rows[0].billing;
+          currentBilling = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
+        } catch {}
+
+        const addresses: any[] = Array.isArray(currentBilling.addresses) ? currentBilling.addresses : [];
+
+        if (address.id) {
+          // Actualizar dirección existente
+          const idx = addresses.findIndex((a: any) => a.id === address.id);
+          if (idx !== -1) {
+            addresses[idx] = { ...addresses[idx], ...address };
+          } else {
+            addresses.push(address);
+          }
+        } else {
+          // Crear nueva dirección
+          address.id = `addr-${Date.now()}`;
+          addresses.push(address);
+        }
+
+        currentBilling.addresses = addresses;
+
+        // Actualizar campos principales si no estaban o si se está editando la primera
+        if (!currentBilling.address_1 || addresses.length === 1) {
+          currentBilling.address_1 = address.address_1 || currentBilling.address_1 || '';
+          currentBilling.city = address.city || currentBilling.city || '';
+          currentBilling.postcode = address.postcode || currentBilling.postcode || '';
+          currentBilling.phone = address.phone || currentBilling.phone || '';
+        }
+
+        const billingJson = JSON.stringify(currentBilling);
+
+        await db.execute(sql`
+          UPDATE users SET billing = ${billingJson} WHERE id = ${parseInt(userId)}
+        `);
+
+        return res.json({ success: true, address, billing: currentBilling });
+      }
+
+      case 'admin-delete-address': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { userId, addressId } = req.body;
+        if (!userId || !addressId) return res.status(400).json({ error: 'Faltan datos obligatorios' });
+
+        const uRes = await db.execute(sql`SELECT billing FROM users WHERE id = ${parseInt(userId)}`);
+        if (uRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        let currentBilling: any = {};
+        try {
+          const raw = uRes.rows[0].billing;
+          currentBilling = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
+        } catch {}
+
+        const addresses: any[] = Array.isArray(currentBilling.addresses) ? currentBilling.addresses : [];
+        currentBilling.addresses = addresses.filter((a: any) => a.id !== addressId);
+
+        await db.execute(sql`
+          UPDATE users SET billing = ${JSON.stringify(currentBilling)} WHERE id = ${parseInt(userId)}
+        `);
+
+        return res.json({ success: true, billing: currentBilling });
       }
 
       case 'moderate-thread': {
