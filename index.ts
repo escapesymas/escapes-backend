@@ -5471,6 +5471,10 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
                   } else if (b && typeof b === 'object') {
                     rawBikes.push(b);
                   }
+                });
+              }
+            } catch {}
+          }
           // 3. Deduplicación por clave única normalizada
           const seen = new Set<string>();
           const uniqueBikes: any[] = [];
