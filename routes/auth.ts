@@ -50,7 +50,42 @@ async function hashPassword(password: string): Promise<string> {
 }
 
 // POST /api/auth/logout
-authRouter.post('/auth/logout', (_req, res) => {
+authRouter.post('/auth/logout', async (req, res) => {
+  try {
+    const auth = authenticateRequest(req);
+    if (auth && auth.user_id) {
+      const userRes = await db.execute(sql`SELECT id, first_name, last_name, username, email, cart FROM users WHERE id = ${auth.user_id}`);
+      if (userRes.rows.length > 0) {
+        const user = userRes.rows[0] as any;
+        let cartItems: any[] = [];
+        try {
+          if (user.cart) {
+            cartItems = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
+          }
+        } catch (e) {}
+
+        if (Array.isArray(cartItems) && cartItems.length > 0) {
+          let totalCents = 0;
+          for (const item of cartItems) {
+            const price = parseFloat(item.price || item.unit_price || 0);
+            const qty = parseInt(item.quantity || 1);
+            totalCents += Math.round(price * qty * 100);
+          }
+
+          const { notifyAbandonedCart } = await import('../pushService.js');
+          const customerName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.email;
+          await notifyAbandonedCart({
+            id: user.id,
+            customerName,
+            total: totalCents
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[LOGOUT PUSH ERROR]:', err);
+  }
+
   clearAuthCookie(res);
   res.json({ success: true });
 });
@@ -318,6 +353,40 @@ authRouter.post('/auth', async (req, res) => {
         WHERE id = ${targetId}
       `);
       return res.json({ success: true });
+    }
+
+    if (action === 'inactivity-notification') {
+      const auth = authenticateRequest(req);
+      if (auth && auth.user_id) {
+        const userRes = await db.execute(sql`SELECT id, first_name, last_name, username, email, cart FROM users WHERE id = ${auth.user_id}`);
+        if (userRes.rows.length > 0) {
+          const user = userRes.rows[0] as any;
+          let cartItems: any[] = [];
+          try {
+            if (user.cart) {
+              cartItems = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
+            }
+          } catch (e) {}
+
+          if (Array.isArray(cartItems) && cartItems.length > 0) {
+            let totalCents = 0;
+            for (const item of cartItems) {
+              const price = parseFloat(item.price || item.unit_price || 0);
+              const qty = parseInt(item.quantity || 1);
+              totalCents += Math.round(price * qty * 100);
+            }
+
+            const { notifyAbandonedCart } = await import('../pushService.js');
+            const customerName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.email;
+            await notifyAbandonedCart({
+              id: user.id,
+              customerName,
+              total: totalCents
+            });
+          }
+        }
+      }
+      return res.json({ success: true, message: 'Notificación de inactividad enviada' });
     }
 
     if (action === 'social-login') {
