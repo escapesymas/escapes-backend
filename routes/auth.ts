@@ -406,6 +406,18 @@ authRouter.post('/auth', async (req, res) => {
       const token = generateJWT(user);
       setAuthCookie(res, token);
 
+      // Disparar Notificación Push para el Admin sobre nuevo usuario
+      try {
+        const { notifyNewUser } = await import('../pushService.js');
+        const name = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username;
+        await notifyNewUser({
+          name,
+          email: user.email
+        });
+      } catch (pushErr: any) {
+        console.error('[AUTH REGISTER PUSH ERROR]:', pushErr.message);
+      }
+
       return res.json({
         token,
         user: {
