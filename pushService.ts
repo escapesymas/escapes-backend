@@ -136,3 +136,18 @@ export async function notifyNewOrder(order: { id: number; total: number; custome
     data: { orderId: order.id }
   });
 }
+
+/**
+ * Helper específico para pago fallido
+ */
+export async function notifyFailedPayment(order: { id?: number | null; reason?: string }) {
+  const orderText = order.id ? ` #${order.id}` : '';
+  const reasonText = order.reason ? `: ${order.reason}` : '';
+
+  await sendNotificationToAll({
+    title: `⚠️ Pago Rechazado/Fallido${orderText}`,
+    body: `Un intento de pago ha sido rechazado${reasonText}`,
+    url: `/orders`,
+    data: { orderId: order.id, type: 'payment_failed' }
+  });
+}

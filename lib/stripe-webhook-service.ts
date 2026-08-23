@@ -395,6 +395,17 @@ async function handlePaymentFailure(evt: Stripe.Event): Promise<void> {
   `);
 
   console.log(`[STRIPE WEBHOOK] Pedido #${orderId} actualizado a 'payment_failed'. Motivo: ${errorMessage}`);
+
+  // Send Web Push Notification for failed payment
+  try {
+    const { notifyFailedPayment } = await import('../pushService.js');
+    await notifyFailedPayment({
+      id: orderId,
+      reason: errorMessage
+    });
+  } catch (pushErr: any) {
+    console.error(`[STRIPE WEBHOOK] Error enviando notificación de pago fallido para pedido #${orderId}:`, pushErr.message);
+  }
 }
 
 /**
