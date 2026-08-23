@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/root/.npm (npm ci --legacy-peer-deps --prefer-off
 
 # Copy source files for compilation
 COPY tsconfig.json ./
-COPY index.ts db.ts redis.ts utils.ts bihrService.ts ./
+COPY index.ts db.ts redis.ts utils.ts bihrService.ts pushService.ts ./
 COPY routes/ ./routes/
 COPY lib/ ./lib/
 COPY chatbot/ ./chatbot/
