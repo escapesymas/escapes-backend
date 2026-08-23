@@ -4840,6 +4840,17 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             WHERE id = ${orderIdInt}
           `);
 
+          // Disparar Notificación Push para el Admin sobre estado de dropshipping
+          try {
+            const { notifyDropshippingStatus } = await import('./pushService.js');
+            await notifyDropshippingStatus({
+              orderId: orderIdInt,
+              status: 'pending_bihr'
+            });
+          } catch (pushErr: any) {
+            console.error('[DROPSHIPPING PUSH ERROR]:', pushErr.message);
+          }
+
           return res.json({ success: true, ticketId });
         } catch (e: any) {
           console.error('[DROPSHIPPING SEND ERROR]:', e);
@@ -5384,6 +5395,19 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           };
 
           await transporter.sendMail(mailOptions);
+
+          // Disparar Notificación Push para el Admin sobre carrito abandonado
+          try {
+            const { notifyAbandonedCart } = await import('./pushService.js');
+            await notifyAbandonedCart({
+              id: parseInt(cartId),
+              customerName: firstName || '',
+              total: Math.round((total || 0) * 100)
+            });
+          } catch (pushErr: any) {
+            console.error('[ABANDONED CART PUSH ERROR]:', pushErr.message);
+          }
+
           return res.json({ success: true });
         } catch (e: any) {
           console.error('[SEND ABANDONED EMAIL ERROR]:', e);
