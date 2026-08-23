@@ -382,35 +382,62 @@ authRouter.post('/auth', async (req, res) => {
     }
 
     if (action === 'inactivity-notification') {
-      const auth = authenticateRequest(req);
-      if (auth && auth.user_id) {
-        const userRes = await db.execute(sql`SELECT id, first_name, last_name, username, email, cart FROM users WHERE id = ${auth.user_id}`);
-        if (userRes.rows.length > 0) {
-          const user = userRes.rows[0] as any;
-          let cartItems: any[] = [];
-          try {
-            if (user.cart) {
-              cartItems = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
-            }
-          } catch (e) {}
+      try {
+        const auth = authenticateRequest(req);
+        const { sessionToken, userId: bodyUserId } = body;
 
-          if (Array.isArray(cartItems) && cartItems.length > 0) {
-            let totalCents = 0;
-            for (const item of cartItems) {
-              const price = parseFloat(item.price || item.unit_price || 0);
-              const qty = parseInt(item.quantity || 1);
-              totalCents += Math.round(price * qty * 100);
-            }
+        let cartItems: any[] = [];
+        let customerName = 'Invitado';
+        let entityId = 0;
 
-            const { notifyAbandonedCart } = await import('../pushService.js');
-            const customerName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.email;
-            await notifyAbandonedCart({
-              id: user.id,
-              customerName,
-              total: totalCents
-            });
+        // 1. Intentar obtener usuario registrado
+        const targetUserId = (auth && auth.user_id) || (bodyUserId ? parseInt(bodyUserId) : null);
+        if (targetUserId) {
+          const userRes = await db.execute(sql`SELECT id, first_name, last_name, username, email, cart FROM users WHERE id = ${targetUserId}`);
+          if (userRes.rows.length > 0) {
+            const user = userRes.rows[0] as any;
+            entityId = user.id;
+            customerName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.email;
+            try {
+              if (user.cart) {
+                cartItems = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
+              }
+            } catch (e) {}
           }
         }
+
+        // 2. Si no hay items en user.cart o es invitado, consultar la tabla carts
+        if ((!cartItems || cartItems.length === 0) && sessionToken) {
+          const cartRes = await db.execute(sql`SELECT items, user_email, user_first_name, user_last_name FROM carts WHERE session_token = ${sessionToken} AND is_deleted = 0`);
+          if (cartRes.rows.length > 0) {
+            const row = cartRes.rows[0] as any;
+            if (row.items) {
+              cartItems = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+            }
+            if (customerName === 'Invitado') {
+              const nameFromCart = [row.user_first_name, row.user_last_name].filter(Boolean).join(' ');
+              customerName = nameFromCart || row.user_email || 'Invitado';
+            }
+          }
+        }
+
+        if (Array.isArray(cartItems) && cartItems.length > 0) {
+          let totalCents = 0;
+          for (const item of cartItems) {
+            const price = parseFloat(item.price || item.unit_price || 0);
+            const qty = parseInt(item.quantity || 1);
+            totalCents += Math.round(price * qty * 100);
+          }
+
+          const { notifyAbandonedCart } = await import('../pushService.js');
+          await notifyAbandonedCart({
+            id: entityId,
+            customerName,
+            total: totalCents
+          });
+        }
+      } catch (err: any) {
+        console.error('[INACTIVITY PUSH ERROR]:', err);
       }
       return res.json({ success: true, message: 'Notificación de inactividad enviada' });
     }
