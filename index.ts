@@ -5428,7 +5428,22 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             u.rank_xp as "rankXp", 
             u.created_at as "createdAt", 
             u.billing,
-            u.garage,
+            u.garage as "userGarageJson",
+            (
+              SELECT COALESCE(
+                json_agg(
+                  json_build_object(
+                    'id', g.id,
+                    'brand', g.brand,
+                    'model', g.model,
+                    'year', g.year,
+                    'isPrimary', g.is_primary
+                  )
+                ), '[]'::json
+              )
+              FROM garage g
+              WHERE g.user_id = u.id
+            ) as "garageTable",
             COALESCE(COUNT(o.id), 0)::int as "totalOrders",
             COALESCE(SUM(CASE WHEN o.status = 'paid' THEN o.total ELSE 0 END), 0)::int as "totalSpentCents"
           FROM users u
@@ -5436,7 +5451,38 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           GROUP BY u.id
           ORDER BY u.id ASC
         `);
-        return res.json(usersRes.rows);
+
+        const rows = usersRes.rows.map((row: any) => {
+          let bikes: any[] = [];
+          
+          // 1. Motos de la tabla `garage`
+          if (Array.isArray(row.garageTable) && row.garageTable.length > 0) {
+            bikes.push(...row.garageTable);
+          }
+
+          // 2. Motos de la columna JSONB `users.garage` (soporte para listas de strings de la frontend)
+          if (row.userGarageJson) {
+            try {
+              const parsed = typeof row.userGarageJson === 'string' ? JSON.parse(row.userGarageJson) : row.userGarageJson;
+              if (Array.isArray(parsed)) {
+                parsed.forEach((b: any) => {
+                  if (typeof b === 'string' && b.trim()) {
+                    bikes.push(b.trim());
+                  } else if (b && typeof b === 'object') {
+                    bikes.push(b);
+                  }
+                });
+              }
+            } catch (e) {}
+          }
+
+          return {
+            ...row,
+            garage: bikes
+          };
+        });
+
+        return res.json(rows);
       }
 
       case 'update-user-role': {
