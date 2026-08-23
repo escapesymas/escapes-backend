@@ -53,34 +53,58 @@ async function hashPassword(password: string): Promise<string> {
 authRouter.post('/auth/logout', async (req, res) => {
   try {
     const auth = authenticateRequest(req);
-    if (auth && auth.user_id) {
-      const userRes = await db.execute(sql`SELECT id, first_name, last_name, username, email, cart FROM users WHERE id = ${auth.user_id}`);
+    const body = req.body || {};
+    const { sessionToken, userId: bodyUserId } = body;
+    const targetUserId = (auth && auth.user_id) || (bodyUserId ? parseInt(bodyUserId) : null);
+
+    let cartItems: any[] = [];
+    let customerName = 'Usuario';
+    let entityId = 0;
+
+    if (targetUserId) {
+      const userRes = await db.execute(sql`SELECT id, first_name, last_name, username, email, cart FROM users WHERE id = ${targetUserId}`);
       if (userRes.rows.length > 0) {
         const user = userRes.rows[0] as any;
-        let cartItems: any[] = [];
+        entityId = user.id;
+        customerName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.email;
         try {
           if (user.cart) {
             cartItems = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
           }
         } catch (e) {}
-
-        if (Array.isArray(cartItems) && cartItems.length > 0) {
-          let totalCents = 0;
-          for (const item of cartItems) {
-            const price = parseFloat(item.price || item.unit_price || 0);
-            const qty = parseInt(item.quantity || 1);
-            totalCents += Math.round(price * qty * 100);
-          }
-
-          const { notifyAbandonedCart } = await import('../pushService.js');
-          const customerName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.email;
-          await notifyAbandonedCart({
-            id: user.id,
-            customerName,
-            total: totalCents
-          });
-        }
       }
+    }
+
+    // Si no hay items en user.cart, buscar en la tabla carts
+    if ((!cartItems || cartItems.length === 0) && (sessionToken || targetUserId)) {
+      const cartRes = await db.execute(sql`
+        SELECT items FROM carts 
+        WHERE (user_id = ${targetUserId || -1} OR session_token = ${sessionToken || ''}) 
+        AND is_deleted = 0
+        ORDER BY updated_at DESC LIMIT 1
+      `);
+      if (cartRes.rows.length > 0 && cartRes.rows[0].items) {
+        const row = cartRes.rows[0] as any;
+        try {
+          cartItems = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+        } catch (e) {}
+      }
+    }
+
+    if (Array.isArray(cartItems) && cartItems.length > 0) {
+      let totalCents = 0;
+      for (const item of cartItems) {
+        const price = parseFloat(item.price || item.unit_price || 0);
+        const qty = parseInt(item.quantity || 1);
+        totalCents += Math.round(price * qty * 100);
+      }
+
+      const { notifyAbandonedCart } = await import('../pushService.js');
+      await notifyAbandonedCart({
+        id: entityId,
+        customerName,
+        total: totalCents
+      });
     }
   } catch (err) {
     console.error('[LOGOUT PUSH ERROR]:', err);
