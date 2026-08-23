@@ -5417,7 +5417,24 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
       case 'users-list': {
         const usersRes = await db.execute(sql`
-          SELECT id, email, first_name as "firstName", last_name as "lastName", role, rank_level as "rankLevel", rank_xp as "rankXp", created_at as "createdAt", billing FROM users ORDER BY id ASC
+          SELECT 
+            u.id, 
+            u.email, 
+            u.username,
+            u.first_name as "firstName", 
+            u.last_name as "lastName", 
+            u.role, 
+            u.rank_level as "rankLevel", 
+            u.rank_xp as "rankXp", 
+            u.created_at as "createdAt", 
+            u.billing,
+            u.garage,
+            COALESCE(COUNT(o.id), 0)::int as "totalOrders",
+            COALESCE(SUM(CASE WHEN o.status = 'paid' THEN o.total ELSE 0 END), 0)::int as "totalSpentCents"
+          FROM users u
+          LEFT JOIN orders o ON o.user_id = u.id
+          GROUP BY u.id
+          ORDER BY u.id ASC
         `);
         return res.json(usersRes.rows);
       }
@@ -5433,6 +5450,34 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           WHERE id = ${parseInt(targetUserId)}
         `);
         return res.json({ success: true });
+      }
+
+      case 'delete-user': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { userId: targetUserId } = req.body;
+        if (!targetUserId) return res.status(400).json({ error: 'Falta userId' });
+        await logAdminAction(req, 'delete-user', { targetUserId });
+        
+        try {
+          await db.execute(sql`DELETE FROM users WHERE id = ${parseInt(targetUserId)}`);
+        } catch (err) {
+          // Si tiene pedidos asociados y restricciones FK, anonimizar los datos del usuario
+          await db.execute(sql`
+            UPDATE users SET
+              username = ${`eliminado_${targetUserId}`},
+              email = ${`eliminado_${targetUserId}@escapesymas.com`},
+              first_name = 'Usuario',
+              last_name = 'Eliminado',
+              password_hash = '',
+              avatar_url = '',
+              billing = null,
+              garage = null,
+              cart = null,
+              role = 'customer'
+            WHERE id = ${parseInt(targetUserId)}
+          `);
+        }
+        return res.json({ success: true, message: 'Cliente eliminado correctamente' });
       }
 
       case 'moderate-thread': {
