@@ -28,6 +28,36 @@ pushRouter.post('/push/subscribe', async (req, res) => {
   }
 });
 
+// GET /api/push/preferences
+pushRouter.get('/push/preferences', async (req, res) => {
+  try {
+    const endpoint = req.query.endpoint as string;
+    if (!endpoint) return res.status(400).json({ error: 'Endpoint requerido' });
+
+    const { getSubscriptionPreferences } = await import('../pushService.js');
+    const prefs = await getSubscriptionPreferences(endpoint);
+    return res.json({ preferences: prefs });
+  } catch (err: any) {
+    console.error('[PUSH GET PREFERENCES ERROR]:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/push/preferences
+pushRouter.post('/push/preferences', async (req, res) => {
+  try {
+    const { endpoint, preferences } = req.body;
+    if (!endpoint || !preferences) return res.status(400).json({ error: 'Endpoint y preferencias requeridos' });
+
+    const { updatePreferences } = await import('../pushService.js');
+    await updatePreferences(endpoint, preferences);
+    return res.json({ success: true, message: 'Preferencias actualizadas' });
+  } catch (err: any) {
+    console.error('[PUSH UPDATE PREFERENCES ERROR]:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/push/unsubscribe
 pushRouter.post('/push/unsubscribe', async (req, res) => {
   try {
