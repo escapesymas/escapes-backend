@@ -4351,6 +4351,79 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         return res.json({ success: true });
       }
 
+      case 'update-order-items': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { orderId, items } = req.body;
+        if (!orderId || !Array.isArray(items)) return res.status(400).json({ error: 'Faltan datos o ítems inválidos' });
+
+        const parsedOrderId = parseInt(orderId);
+        if (isNaN(parsedOrderId)) return res.status(400).json({ error: 'orderId no es válido' });
+
+        // Obtener el pedido actual para preservar shipping_cost y discount_amount
+        const existingOrderRes = await db.execute(sql`SELECT shipping_cost, discount_amount FROM orders WHERE id = ${parsedOrderId}`);
+        if (existingOrderRes.rows.length === 0) {
+          return res.status(404).json({ error: 'Pedido no encontrado' });
+        }
+        const existingOrder = existingOrderRes.rows[0] as any;
+        const shippingCost = parseFloat(existingOrder.shipping_cost || 0);
+        const discountAmount = parseFloat(existingOrder.discount_amount || 0);
+
+        // Recalcular subtotal y costTotal
+        let subtotal = 0;
+        let costTotal = 0;
+        for (const item of items) {
+          const qty = Math.max(1, parseInt(item.quantity) || 1);
+          const price = parseFloat(item.price) || 0;
+          subtotal += (price * qty);
+
+          if (item.product_id) {
+            const pRes = await db.execute(sql`SELECT cost FROM products WHERE id = ${item.product_id}`);
+            if (pRes.rows[0] && (pRes.rows[0] as any).cost) {
+              costTotal += (parseFloat((pRes.rows[0] as any).cost as string) * qty);
+            }
+          }
+        }
+
+        const newTotal = Math.max(0, subtotal + shippingCost - discountAmount);
+
+        // Borrar items antiguos e insertar los nuevos
+        await db.execute(sql`DELETE FROM order_items WHERE order_id = ${parsedOrderId}`);
+        for (const item of items) {
+          const qty = Math.max(1, parseInt(item.quantity) || 1);
+          const price = parseFloat(item.price) || 0;
+          const productId = item.product_id ? parseInt(item.product_id) : null;
+          await db.execute(sql`
+            INSERT INTO order_items (order_id, product_id, quantity, price)
+            VALUES (${parsedOrderId}, ${productId}, ${qty}, ${price})
+          `);
+        }
+
+        // Actualizar order
+        await db.execute(sql`
+          UPDATE orders
+          SET subtotal = ${subtotal},
+              total = ${newTotal},
+              cost_total = ${costTotal}
+          WHERE id = ${parsedOrderId}
+        `);
+
+        // Devolver los items actualizados con los nombres de productos
+        const itemsRes = await db.execute(sql`
+          SELECT oi.*, p.name as product_name
+          FROM order_items oi
+          LEFT JOIN products p ON oi.product_id = p.id
+          WHERE oi.order_id = ${parsedOrderId}
+        `);
+
+        return res.json({ 
+          success: true, 
+          subtotal, 
+          total: newTotal, 
+          costTotal, 
+          items: itemsRes.rows 
+        });
+      }
+
       case 'bulk-update-orders': {
         if (req.method !== 'POST') return res.status(405).end();
         const { orderIds, status } = req.body;
@@ -4515,7 +4588,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
                price_data: {
                  currency: 'eur',
                  product_data: { name: it.name },
-                 unit_amount: Math.round(it.price)
+                 unit_amount: Math.round((parseFloat(it.price) || 0) * 100)
                },
                quantity: it.quantity
              }));
