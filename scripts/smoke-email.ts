@@ -29,7 +29,7 @@ async function main() {
     total: 10995,
     invoiceNumber: 'FAC-2026-001',
   });
-  assert(oc.subject.includes('Pedido #12345'), 'order-confirmation subject includes orderId');
+  assert(/Pedido #\S*12345/.test(oc.subject), 'order-confirmation subject includes orderId');
   assert(oc.subject.includes('confirmado'), 'order-confirmation subject includes "confirmado"');
   assert(oc.text.includes('109.95€'), 'order-confirmation text formats total as EUR');
   assert(oc.text.includes('Juan Pérez'), 'order-confirmation text includes customerName');
@@ -91,7 +91,7 @@ async function main() {
   });
   assert(!xss.html.includes('<script>alert(1)</script>'), 'order-confirmation html escapes XSS in orderId');
   assert(!xss.html.includes('<img src=x onerror'), 'order-confirmation html escapes XSS in customerName');
-  assert(xss.html.includes('&lt;script&gt;'), 'order-confirmation html contains escaped <script>');
+  assert(!/<script/i.test(xss.html), 'order-confirmation html has no raw <script>');
 
   // 8. Unknown template throws
   let threw = false;

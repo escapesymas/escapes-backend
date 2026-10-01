@@ -1,0 +1,18 @@
+# Configuración de gitleaks para la CI. Usa las reglas por defecto y excluye
+# valores de ejemplo / de CI que no son secretos reales.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Valores de ejemplo y de CI"
+regexes = [
+  '''sk_test_ci_dummy''',
+  '''whsec_ci_dummy''',
+  '''ci-only-jwt-secret''',
+  '''sk_test_dummy''',
+  '''whsec_test_dummy''',
+]
+paths = [
+  '''\.env\.example$''',
+  '''scripts/\.env\.example$''',
+]
