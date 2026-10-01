@@ -38,7 +38,7 @@ Trigger a one-time reindex:
 
 ```bash
 curl -X POST http://localhost:3001/api/admin/reindex-search \
-  -H "x-admin-key: $ADMIN_KEY"
+  -H "Authorization: Bearer $ADMIN_JWT"
 ```
 
 The reindex chunks the products table into 1000-doc batches and pushes

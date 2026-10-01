@@ -66,16 +66,11 @@ const stripeTest = stripeTestKey
   ? new Stripe(stripeTestKey, { apiVersion: '2024-11-20.acacia' as any })
   : stripeLive;
 
-const adminKey = process.env.ADMIN_KEY;
-if (!adminKey) {
-  console.warn('[WARNING] ADMIN_KEY not set — Bihr sync endpoints rely on admin JWT only.');
-}
 
 // Audit 2026-08-15, finding #52: VITE_ADMIN_KEY was bundled into the admin
 // frontend. The admin UI now authenticates as a real admin user and passes
-// the JWT in `Authorization: Bearer ...`. We KEEP the X-Admin-Key path so
-// cron / out-of-band scripts that already speak it don't break, but the
-// frontend bundle no longer needs the value.
+// the JWT in `Authorization: Bearer ...`. La ruta X-Admin-Key ya no existe:
+// ADMIN_KEY no se usa y puede borrarse del entorno.
 //
 // Migration rule for new endpoints: prefer `requireAdmin` (JWT only) and
 // reserve this helper for the legacy Bihr/inventory cron surface.
@@ -98,9 +93,8 @@ function requireAdminKey(req: any, res: any): boolean {
     if (user && user.role === 'admin') return true;
   }
 
-  // 2) Legacy service-to-service header.
-  const key = req.headers['x-admin-key'];
-  if (adminKey && key && key === adminKey) return true;
+  // La antigua cabecera X-Admin-Key se ha eliminado: su valor por defecto
+  // estaba publicado en git y seguía activo en producción.
 
   res.status(401).json({ error: 'No autorizado' });
   return false;
