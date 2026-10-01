@@ -18,3 +18,9 @@ infra/RECOVERY.md
 infra/escapes-post-deploy.sh
 **/secrets/
 *.env.build
+# Ficheros locales con secretos o datos (no versionar)
+ecosystem.config.cjs
+escapesymas-infra-reference.md
+.audit_routes.txt
+_audit_routes.txt
+*.dump
