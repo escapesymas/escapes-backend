@@ -1,6 +1,6 @@
 # Recovery procedure after a backend redeploy
 
-> Variables: exporta `VPS_IP` (IP del VPS) y `ADMIN_KEY` (del gestor de secretos) antes de ejecutar estos comandos.
+> Variables: exporta `VPS_IP` (IP del VPS) y `ADMIN_JWT` (token de una sesión de admin) antes de ejecutar estos comandos.
 
 Each Coolify redeploy of `escapes-backend` wipes the container's filesystem.
 Two things that aren't (yet) on a persistent volume must be restored by hand:
@@ -44,7 +44,7 @@ EOF
 chmod 0644 /etc/cron.d/escapes-post-deploy"
 
 # 4. Restart the image downloader
-curl -X POST -H "X-Admin-Key: $ADMIN_KEY" \
+curl -X POST -H "Authorization: Bearer $ADMIN_JWT" \
   -H "Content-Type: application/json" \
   -d '{"batch":5000,"concurrency":20,"loopAll":true}' \
   https://api.escapesymas.com/api/bihr/sync-images-v4/start
