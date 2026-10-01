@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pool } from './db.js';
+import { refreshCompatModels } from './lib/compat.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -708,6 +709,9 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
   }
   
   console.log(`[BIHR SERVICE]: Importación completada. Nuevos: ${totalInserted}, Actualizados: ${totalUpdated}`);
+
+  // Las compatibilidades pueden haber cambiado: recalcular la tabla de modelos.
+  refreshCompatModels().catch(e => console.error('[BIHR SERVICE] Error refrescando compat_vehicle_models:', e));
   
   updateCatalogSyncState({
     status: 'completed',

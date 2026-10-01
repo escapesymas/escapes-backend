@@ -220,7 +220,7 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
     await client.query('BEGIN');
 
     // Update order status, payment metadata and paid_at timestamp
-    await client.query(
+    const updated = await client.query(
       `UPDATE orders
        SET status = 'paid',
            payment_id = $1,
@@ -231,6 +231,14 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
        WHERE id = $4 AND status IN ('pending', 'payment_failed')`,
       [paymentIntentId, stripeChargeId, paymentMethod, orderId]
     );
+
+    // Si /api/orders/finalize ya procesó el pedido entre la comprobación de
+    // arriba y este UPDATE, no se vuelve a descontar stock.
+    if (updated.rowCount === 0) {
+      await client.query('COMMIT');
+      console.log(`[STRIPE WEBHOOK] Pedido #${orderId} ya procesado por otra vía. Sin cambios de stock.`);
+      return;
+    }
 
     // Fetch order items and decrement actual stock
     const itemsRes = await client.query(

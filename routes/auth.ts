@@ -408,14 +408,14 @@ authRouter.post('/auth', async (req, res) => {
     if (action === 'inactivity-notification') {
       try {
         const auth = authenticateRequest(req);
-        const { sessionToken, userId: bodyUserId } = body;
+        const { sessionToken } = body;
 
         let cartItems: any[] = [];
         let customerName = 'Invitado';
         let entityId = 0;
 
         // 1. Intentar obtener usuario registrado
-        const targetUserId = (auth && auth.user_id) || (bodyUserId ? parseInt(bodyUserId) : null);
+        const targetUserId = auth ? auth.user_id : null;
         if (targetUserId) {
           const userRes = await db.execute(sql`SELECT id, first_name, last_name, username, email, cart FROM users WHERE id = ${targetUserId}`);
           if (userRes.rows.length > 0) {

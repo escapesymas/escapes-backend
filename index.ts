@@ -42,6 +42,7 @@ import { authRouter } from './routes/auth.js';
 import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
+import { ensureCompatModels } from './lib/compat.js';
 
 // Initialize Sentry as early as possible so subsequent unhandled errors are
 // captured. No-op when SENTRY_DSN is unset (local dev).
@@ -307,9 +308,12 @@ const db = drizzle(pool);
       );
     `);
     console.log('✅ Database schema aligned successfully!');
-    // Cargar mapa de categorías e índice de compatibilidades en segundo plano
+    // Cargar mapa de categorías en segundo plano. (El antiguo índice de
+    // compatibilidades en memoria, ~1 GB con el catálogo actual, solo lo usaba
+    // una copia muerta de /api/vehicles y se ha eliminado.)
     initCategoryMap().catch(e => console.error('[CATEGORY MAP INITIAL LOAD ERROR]:', e));
-    initCompatIndex().catch(e => console.error('[COMPAT INDEX INITIAL LOAD ERROR]:', e));
+    // Vista de modelos compatibles (lib/compat.ts). Solo tarda la primera vez.
+    ensureCompatModels().catch(e => console.error('[COMPAT MODELS INIT ERROR]:', e));
   } catch (err) {
     console.error('❌ Failed to align database schema:', err);
   }
@@ -619,32 +623,46 @@ app.use('/api', bihrRouter);
 app.use('/api', adminRouter);
 app.use('/api', pushRouter);
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `avatar-${Date.now()}${ext}`);
-  }
+// Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
+// /uploads se sirve como estático en el mismo origen, así que nunca se debe
+// conservar la extensión que manda el cliente (.html, .svg → XSS almacenado).
+const AVATAR_MIME_EXT: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+};
+const avatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadDir),
+    filename: (_req, file, cb) => cb(null, `avatar-${crypto.randomUUID()}${AVATAR_MIME_EXT[file.mimetype] || '.bin'}`),
+  }),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => cb(null, Boolean(AVATAR_MIME_EXT[file.mimetype])),
 });
-const upload = multer({ storage });
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, _file, cb) => cb(null, `upload-${crypto.randomUUID()}.zip`),
+  }),
+  limits: { fileSize: 300 * 1024 * 1024, files: 1 },
+});
+// requireAdminKey como middleware, para comprobar ANTES de que multer escriba.
+const requireAdminKeyMw = (req: any, res: any, next: any) => {
+  if (requireAdminKey(req, res)) next();
+};
 
-app.post('/api/upload/avatar', upload.single('avatar'), async (req: any, res: any) => {
+app.post('/api/upload/avatar', requireAuth, avatarUpload.single('avatar'), async (req: any, res: any) => {
   try {
     const file = req.file;
-    if (!file) return res.status(400).json({ error: 'No se ha subido ningún archivo' });
+    if (!file) return res.status(400).json({ error: 'Sube una imagen JPG, PNG o WebP de máximo 5 MB' });
 
-    const { userId } = req.body;
     const url = `/uploads/${file.filename}`;
-
-    if (userId) {
-      await db.execute(sql`
-        UPDATE users
-        SET avatar_url = ${url}
-        WHERE id = ${parseInt(userId)}
-      `);
-    }
+    // Siempre el avatar del usuario autenticado, nunca un userId del body.
+    await db.execute(sql`
+      UPDATE users
+      SET avatar_url = ${url}
+      WHERE id = ${req.user.user_id}
+    `);
 
     return res.json({ success: true, url });
   } catch (err: any) {
@@ -660,16 +678,18 @@ app.post('/api/upload/avatar', upload.single('avatar'), async (req: any, res: an
 // Optional form field: "clean" = "1" to wipe the dir before extracting.
 app.post(
   '/api/admin/upload-csv-zip',
+  requireAdminKeyMw,
   upload.single('file'),
   async (req: any, res: any) => {
-    if (!requireAdminKey(req, res)) return;
     const file = req.file;
     if (!file) return res.status(400).json({ error: 'No se ha subido ningún archivo (campo "file")' });
     if (!/\.zip$/i.test(file.originalname)) {
       try { fs.unlinkSync(file.path); } catch {}
       return res.status(400).json({ error: 'El archivo debe ser un .zip' });
     }
-    const csvDir = String(req.body?.csvDir || resolveCsvDir());
+    // El destino lo decide el servidor: con 'clean' activo, un csvDir arbitrario
+    // permitiría borrar cualquier directorio escribible.
+    const csvDir = resolveCsvDir();
     const shouldClean = req.body?.clean === '1' || req.body?.clean === 'true';
 
     try {
@@ -1002,53 +1022,6 @@ app.get('/api/admin/trace-image', async (req: any, res: any) => {
   }
 });
 
-// Quick catalog stats using the multi-line-aware parser.
-// Returns the real catalog map size (matching what the downloader sees).
-app.get('/api/admin/catalog-stats', async (_req: any, res: any) => {
-  if (!requireAdminKey(_req, res)) return;
-  try {
-    const csvDir = resolveCsvDir();
-    const map = new Map<string, string>();
-    let totalRows = 0;
-    let rowsWithPicture = 0;
-    let files = 0;
-    const start = Date.now();
-    if (fs.existsSync(csvDir)) {
-      for (const file of fs.readdirSync(csvDir).filter((f: string) => f.endsWith('.csv'))) {
-        files++;
-        const txt = fs.readFileSync(path.join(csvDir, file), 'utf-8');
-        const rows = parseCsvText(txt);
-        if (rows.length < 2) continue;
-        const header = rows[0];
-        const partIdx = header.indexOf('PartNumber');
-        const picIdx = header.indexOf('Picture1');
-        const supIdx = header.indexOf('SupplierProductCode');
-        if (partIdx === -1 || picIdx === -1) continue;
-        for (let i = 1; i < rows.length; i++) {
-          const r = rows[i];
-          totalRows++;
-          const part = (r[partIdx] || '').trim();
-          const pic = (r[picIdx] || '').trim();
-          const sup = supIdx !== -1 ? (r[supIdx] || '').trim() : '';
-          if (part && pic) rowsWithPicture++;
-          if (part && pic && !map.has(part)) map.set(part, pic);
-          if (sup && pic && !map.has(sup)) map.set(sup, pic);
-        }
-      }
-    }
-    return res.json({
-      csvDir,
-      files,
-      totalRows,
-      rowsWithPicture,
-      mapSize: map.size,
-      elapsedMs: Date.now() - start,
-    });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
 // ================================================================
 // SISTEMA DE CACHÉ EN MEMORIA (SWR - Stale While Revalidate)
 app.get('/api/admin/image-regen-state', async (_req: any, res: any) => {
@@ -1125,139 +1098,6 @@ app.get('/api/admin/image-downloader-log-self', async (_req: any, res: any) => {
     res.json({ exists: true, sizeBytes: stat.size, truncated: stat.size > maxBytes, content: buf.toString('utf-8') });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/admin/disk-usage', async (_req: any, res: any) => {
-  if (!requireAdminKey(_req, res)) return;
-  try {
-    // 1. `df -h` overall
-    let dfOutput = '';
-    try {
-      const { stdout } = await execPromise('df -h', { timeout: 10_000 });
-      dfOutput = stdout;
-    } catch (e: any) {
-      dfOutput = 'df failed: ' + (e?.message || String(e));
-    }
-    // 2. `du` of every top-level item we care about
-    const targets = [
-      '/app/server',
-      '/app/server/uploads',
-      '/app/server/uploads/optimized',
-      '/app/server/uploads/catalog-csv',
-      '/app/server/uploads/image-dl-v5.log',
-      '/app/server/uploads/image-dl-v5-self.log',
-      '/app/server/uploads/bihr-zip-index.json',
-      '/app/server/uploads/bihr-failed-brands.json',
-      '/tmp',
-      '/tmp/image-proxy-cache',
-    ];
-    const duResults: { path: string; size: string; raw: string }[] = [];
-    for (const p of targets) {
-      try {
-        const { stdout } = await execPromise(`du -sh ${p} 2>/dev/null || echo "0\t${p}"`, { timeout: 10_000 });
-        const out = stdout.trim();
-        const parts = out.split(/\s+/);
-        duResults.push({ path: p, size: parts[0] || '0', raw: out });
-      } catch (e: any) {
-        duResults.push({ path: p, size: 'err', raw: e?.message || String(e) });
-      }
-    }
-    // 3. Docker image sizes
-    let dockerImages = '';
-    try {
-      const { stdout } = await execPromise('docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}" 2>/dev/null', { timeout: 10_000 });
-      dockerImages = stdout;
-    } catch (e: any) {
-      dockerImages = 'docker not available: ' + (e?.message || String(e));
-    }
-    // 4. Docker container sizes
-    let dockerContainers = '';
-    try {
-      const { stdout } = await execPromise('docker ps -a --format "{{.Names}} {{.Size}}" 2>/dev/null', { timeout: 10_000 });
-      dockerContainers = stdout;
-    } catch (e: any) {
-      dockerContainers = 'docker not available: ' + (e?.message || String(e));
-    }
-    // 5. Docker dangling images count
-    let danglingImages = '';
-    try {
-      const { stdout } = await execPromise('docker images -f "dangling=true" --format "{{.ID}} {{.Size}}" 2>/dev/null', { timeout: 10_000 });
-      danglingImages = stdout;
-    } catch (e: any) {
-      danglingImages = 'docker not available: ' + (e?.message || String(e));
-    }
-    res.json({
-      ok: true,
-      df: dfOutput,
-      du: duResults,
-      dockerImages: dockerImages || '(empty)',
-      dockerContainers: dockerContainers || '(empty)',
-      danglingImages: danglingImages || '(empty)',
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message, code: err.code });
-  }
-});
-
-// Remove dangling images to free disk. Use with caution.
-app.post('/api/admin/docker-prune', async (req: any, res: any) => {
-  if (!requireAdminKey(req, res)) return;
-  try {
-    const action = String(req.body?.action || 'images'); // 'images' | 'all' | 'containers' | 'builder'
-    let cmd = '';
-    if (action === 'images') {
-      cmd = 'docker image prune -f';
-    } else if (action === 'all') {
-      cmd = 'docker system prune -f --volumes';
-    } else if (action === 'containers') {
-      cmd = 'docker container prune -f';
-    } else if (action === 'builder') {
-      cmd = 'docker builder prune -f --all';
-    } else {
-      return res.status(400).json({ error: 'action must be one of: images, all, containers, builder' });
-    }
-    const { stdout: output } = await execPromise(cmd, { timeout: 120_000 });
-    let dfAfter = '';
-    try {
-      const { stdout } = await execPromise('df -h /', { timeout: 10_000 });
-      dfAfter = stdout;
-    } catch {}
-    res.json({ ok: true, action, cmd, output: output || '(no output)', dfAfter });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message, code: err.code, stderr: err?.stderr?.toString() });
-  }
-});
-
-// Force-remove old stopped Docker images older than X. Be careful.
-app.post('/api/admin/docker-image-rm', async (req: any, res: any) => {
-  if (!requireAdminKey(req, res)) return;
-  try {
-    const id = String(req.body?.id || '').trim();
-    if (!id) return res.status(400).json({ error: 'id is required' });
-    if (!/^[a-f0-9]{6,64}$/.test(id)) return res.status(400).json({ error: 'invalid id format' });
-    const { stdout: output } = await execPromise(`docker rmi -f ${id}`, { timeout: 60_000 });
-    let dfAfter = '';
-    try {
-      const { stdout } = await execPromise('df -h /', { timeout: 10_000 });
-      dfAfter = stdout;
-    } catch {}
-    res.json({ ok: true, id, output: output || '(no output)', dfAfter });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message, code: err.code, stderr: err?.stderr?.toString() });
-  }
-});
-
-app.post('/api/admin/test-log-write', async (_req: any, res: any) => {
-  if (!requireAdminKey(_req, res)) return;
-  const logPath = '/app/server/uploads/test-write.log';
-  try {
-    fs.writeFileSync(logPath, `test write at ${new Date().toISOString()}\n`);
-    const stat = fs.statSync(logPath);
-    const content = fs.readFileSync(logPath, 'utf-8');
-    res.json({ ok: true, logPath, size: stat.size, content });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message, code: err.code });
   }
 });
 
@@ -1384,6 +1224,8 @@ import {
   generateJWT,
   verifyJWT,
   authenticateRequest,
+  requireAuth,
+  requireAdmin,
 } from './utils.js';
 
 function setAuthCookie(res: any, token: string) {
@@ -1432,7 +1274,7 @@ app.get('/api/health', async (_req, res) => {
 });
 
 // Diagnostic endpoint: shows env state without exposing secrets.
-app.get('/api/health/diag', async (_req, res) => {
+app.get('/api/health/diag', requireAdmin, async (_req, res) => {
   // Audit 2026-08-15, finding #52: this endpoint used to expose
   // `ADMIN_KEY_starts`, `ADMIN_KEY_matches_expected`, etc. — which let an
   // unauthenticated attacker confirm whether the bundled default
@@ -1444,7 +1286,6 @@ app.get('/api/health/diag', async (_req, res) => {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
       ADMIN_KEY_set: !!process.env.ADMIN_KEY,
-      ADMIN_KEY_matches_default: process.env.ADMIN_KEY === 'escapes-admin-sync-key-2026-change-me',
       REDIS_URL_set: !!process.env.REDIS_URL,
       DATABASE_URL_set: !!process.env.DATABASE_URL,
       BIHR_USERNAME_set: !!process.env.BIHR_USERNAME,
@@ -1467,8 +1308,6 @@ app.get('/api/health/stripe', async (_req: any, res: any) => {
     const balance = await stripeLive.balance.retrieve();
     res.json({
       stripe: 'ok',
-      keyPrefix: stripeLiveKey.substring(0, 12) + '...',
-      keyLastChars: stripeLiveKey.slice(-6),
       mode: stripeLiveKey.startsWith('sk_live_') ? 'live' : stripeLiveKey.startsWith('sk_test_') ? 'test' : 'unknown',
       livemode: balance.livemode,
       currency: balance.available?.[0]?.currency || 'unknown',
@@ -1480,7 +1319,6 @@ app.get('/api/health/stripe', async (_req: any, res: any) => {
     const isInvalid = msg.includes('Invalid API Key');
     res.status(isExpired || isInvalid ? 503 : 500).json({
       stripe: isExpired ? 'expired' : isInvalid ? 'invalid' : 'error',
-      keyPrefix: stripeLiveKey ? stripeLiveKey.substring(0, 12) + '...' : null,
       mode: stripeLiveKey?.startsWith('sk_live_') ? 'live' : stripeLiveKey?.startsWith('sk_test_') ? 'test' : 'unknown',
       message: msg,
       action: isExpired
@@ -1608,54 +1446,6 @@ app.get('/api/image-proxy', async (req, res) => {
   } catch (err: any) {
     console.error('[image-proxy] error:', err.message);
     res.status(502).json({ error: 'Proxy error' });
-  }
-});
-
-// ================================================================
-// BIHR API INTEGRATION ROUTES
-// ================================================================
-app.get('/api/bihr/stock', async (req: any, res: any) => {
-  const { productCode } = req.query;
-  if (!productCode) {
-    return res.status(400).json({ error: 'Falta el parámetro productCode (referencia de Bihr)' });
-  }
-  try {
-    const status = await getLiveStockLevel(productCode as string);
-    const quantity = await getLiveStockValue(productCode as string);
-    res.json({ productCode, status, quantity });
-  } catch (error: any) {
-    res.status(500).json({ error: 'Error al consultar stock en Bihr', details: error.message });
-  }
-});
-
-app.post('/api/bihr/check-stock', async (req: any, res: any) => {
-  const { items } = req.body;
-  if (!items || !Array.isArray(items)) {
-    return res.status(400).json({ error: 'Falta la lista de items o no es un array válido' });
-  }
-  try {
-    const results = await checkProductsInfo(items);
-    res.json({ results });
-  } catch (error: any) {
-    res.status(500).json({ error: 'Error al consultar disponibilidad en lote', details: error.message });
-  }
-});
-
-app.post('/api/bihr/order', async (req: any, res: any) => {
-  const { deliveryAddress, items, customerOrderReference, isDropshipping } = req.body;
-  if (!deliveryAddress || !items || !customerOrderReference) {
-    return res.status(400).json({ error: 'Faltan campos obligatorios para emitir el pedido' });
-  }
-  try {
-    const orderResult = await createBihrOrder({
-      deliveryAddress,
-      items,
-      customerOrderReference,
-      isDropshipping: !!isDropshipping
-    });
-    res.json({ success: true, orderResult });
-  } catch (error: any) {
-    res.status(500).json({ error: 'Error al emitir pedido en Bihr', details: error.message });
   }
 });
 
@@ -1934,27 +1724,6 @@ app.get('/api/bihr/sync-images-v2/status', async (req: any, res: any) => {
 });
 
 // ---------------------------------------------------------------------------
-// Bihr stock sync — periodic refresh of products.stock for dropshipping /
-// ondemand products. Triggered automatically every 6h via the cron registered
-// in lib/bihr-stock-sync.ts (see startBihrStockCron() at boot); this endpoint
-// is the manual override used by the admin.
-// ---------------------------------------------------------------------------
-app.post('/api/admin/sync-bihr-stock', async (req: any, res: any) => {
-  if (!requireAdminKey(req, res)) return;
-  try {
-    const result = await syncBihrStock();
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: 'Error al sincronizar stock con Bihr', details: err?.message || String(err) });
-  }
-});
-
-app.get('/api/admin/sync-bihr-stock/status', async (req: any, res: any) => {
-  if (!requireAdminKey(req, res)) return;
-  res.json(lastBihrStockSync() || { running: false, message: 'never run' });
-});
-
-// ---------------------------------------------------------------------------
 // Meilisearch reindex (admin-only, P2 #10)
 // Pushes every published product into the Meilisearch index so the catalog
 // search endpoint can serve typo-tolerant queries. The index name defaults to
@@ -2217,65 +1986,6 @@ async function initCategoryMap() {
   }
 }
 
-// Compat index uses a double-buffer pattern:
-//   - `currentCompatIndex` is the immutable snapshot that in-flight requests read from.
-//   - `initCompatIndex` builds a NEW index off to the side; once complete, it is atomically
-//     swapped in. This way no request ever sees a half-built index, and we avoid the
-//     request-time spikes the previous `setInterval` refresh caused every 15 minutes.
-let currentCompatIndex: Map<string, Map<number, Array<{ sku: string, model: string }>>> | null = null;
-let isIndexLoading = false;
-
-const REDIS_COMPAT_INDEX_KEY = 'compat:index:v2';
-
-async function initCompatIndex() {
-  if (isIndexLoading) return;
-  isIndexLoading = true;
-  console.log('⚡ Loading compatibility index into memory...');
-  const start = Date.now();
-  try {
-    const res = await pool.query(
-      `SELECT sku, compatibility FROM products WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'`
-    );
-    const newCompatIndex = new Map<string, Map<number, Array<{ sku: string, model: string }>>>();
-
-    for (const row of res.rows) {
-      if (!row.compatibility) continue;
-      for (const item of row.compatibility) {
-        if (!item.brand) continue;
-        const bKey = item.brand.toLowerCase();
-        const yKey = Number(item.year);
-        if (isNaN(yKey)) continue;
-
-        let yearMap = newCompatIndex.get(bKey);
-        if (!yearMap) {
-          yearMap = new Map();
-          newCompatIndex.set(bKey, yearMap);
-        }
-
-        let list = yearMap.get(yKey);
-        if (!list) {
-          list = [];
-          yearMap.set(yKey, list);
-        }
-
-        list.push({ sku: row.sku, model: item.model });
-      }
-    }
-
-    currentCompatIndex = newCompatIndex;
-    console.log(`✅ Compatibility index ready! Loaded ${newCompatIndex.size} brands in ${Date.now() - start}ms`);
-  } catch (err) {
-    console.error('❌ Failed to build compatibility index:', err);
-  } finally {
-    isIndexLoading = false;
-  }
-}
-
-// NOTE: The previous `setInterval(15min)` auto-refresh of the compat index was removed.
-// It produced request-time spikes every 15 minutes and risked races where in-flight
-// requests observed a half-built map. The index is now built ONCE at startup; redeploys
-// or a manual call to `initCompatIndex()` are the supported ways to refresh it.
-
 // ================================================================
 // VEHICLE DISCOVERY & COMPATIBILITY
 // ================================================================
@@ -2319,292 +2029,6 @@ function getCatalog() {
   catalog = { hierarchy: {}, compatibility: {} };
   return catalog;
 }
-
-app.get('/api/vehicles', async (req, res) => {
-  const { action, brand, model, year } = req.query as any;
-
-  try {
-    if (action === 'compatible-products') {
-      const redisKey = `compat:products:v4:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
-      const cachedProducts = await cacheGet<any[]>(redisKey);
-      if (cachedProducts) {
-        return res.json(cachedProducts);
-      }
-
-      const skusSet = new Set<string>();
-      const { hierarchy, compatibility } = getCatalog();
-
-      if (brand) {
-        const bKey = brand.toLowerCase();
-        const mKey = model ? model.toLowerCase() : '';
-        const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
-
-        const mClean = mKey.replace(/\(.*\)/g, '').trim();
-        const mTokens = mClean.split(/\s+/).filter(Boolean);
-
-        if (currentCompatIndex) {
-          const yearMap = currentCompatIndex.get(bKey);
-          if (yearMap) {
-            if (yNum) {
-              const list = yearMap.get(yNum);
-              if (list) {
-                for (const item of list) {
-                  if (mClean) {
-                    const cModel = item.model?.toLowerCase() || '';
-                    const isMatch = mTokens.length === 0 || mTokens.every(t => cModel.includes(t)) || cModel.includes(mClean) || mClean.includes(cModel);
-                    if (!isMatch) continue;
-                  }
-                  skusSet.add(item.sku);
-                }
-              }
-            } else {
-              for (const list of yearMap.values()) {
-                for (const item of list) {
-                  if (mClean) {
-                    const cModel = item.model?.toLowerCase() || '';
-                    const isMatch = mTokens.length === 0 || mTokens.every(t => cModel.includes(t)) || cModel.includes(mClean) || mClean.includes(cModel);
-                    if (!isMatch) continue;
-                  }
-                  skusSet.add(item.sku);
-                }
-              }
-            }
-          }
-        } else {
-          const params: any[] = [brand];
-          let queryStr = `
-            SELECT DISTINCT sku 
-            FROM products 
-            WHERE status = 'published' 
-              AND compatibility IS NOT NULL 
-              AND compatibility != '[]'
-              AND EXISTS (
-                SELECT 1 FROM jsonb_array_elements(compatibility) elem
-                WHERE LOWER(elem->>'brand') = LOWER($1)
-          `;
-          let paramIdx = 2;
-          if (yNum) {
-            queryStr += ` AND (elem->>'year')::int = $${paramIdx++}`;
-            params.push(yNum);
-          }
-          if (mClean) {
-            queryStr += ` AND (
-              LOWER(elem->>'model') LIKE $${paramIdx}
-              OR $${paramIdx + 1} LIKE CONCAT('%', LOWER(elem->>'model'), '%')
-            )`;
-            params.push(`%${mClean}%`);
-            params.push(mClean);
-          }
-          queryStr += `)`;
-          try {
-            const dbRes = await pool.query(queryStr, params);
-            dbRes.rows.forEach((r: any) => {
-              if (r.sku) skusSet.add(r.sku);
-            });
-          } catch (dbErr) {
-            console.error('[VEHICLES DB COMPATIBILITY ERROR]:', dbErr);
-          }
-        }
-      }
-
-      if (brand && hierarchy[brand]) {
-        let codes: string[] = [];
-        if (model) {
-          if (year && year !== 'General' && year !== '') {
-            codes = hierarchy[brand][model]?.[year] || [];
-          } else if (hierarchy[brand][model]) {
-            Object.values(hierarchy[brand][model]).forEach((cList: any) => {
-              codes.push(...cList);
-            });
-          }
-        } else {
-          Object.values(hierarchy[brand]).forEach((modelsObj: any) => {
-            if (modelsObj) {
-              Object.values(modelsObj).forEach((cList: any) => {
-                codes.push(...cList);
-              });
-            }
-          });
-        }
-        codes.forEach(code => {
-          const vehicleSkus = compatibility[code] || [];
-          vehicleSkus.forEach((sku: string) => skusSet.add(sku));
-        });
-      }
-
-      const skusList = Array.from(skusSet).slice(0, 500);
-      if (skusList.length === 0) {
-        await cacheSet(redisKey, [], 600);
-        return res.json([]);
-      }
-
-      const productsRes = await pool.query(
-        `SELECT * FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
-        [skusList]
-      );
-      const products = productsRes.rows.map(mapProductToFrontend);
-      await cacheSet(redisKey, products, 600);
-      return res.json(products);
-    }
-
-    const cacheKey = `/api/vehicles?action=${action || ''}&brand=${brand || ''}&model=${model || ''}&year=${year || ''}`;
-    const redisQuery = JSON.stringify({
-      action: action || '',
-      brand: brand || '',
-      model: model || '',
-      year: year || '',
-    });
-    const redisKey = `cache:v3:vehicles:${crypto.createHash('sha256').update(redisQuery).digest('hex')}`;
-    const cached = await cacheGet<any[]>(redisKey);
-    if (cached) {
-      return res.json(cached);
-    }
-
-    // Cachar jerarquía de vehículos por 5 min fresca, 30 min grace (SWR)
-    const result = await executeSWR(cacheKey, async () => {
-      try {
-        const { hierarchy, compatibility } = getCatalog();
-
-        if (action === 'brands') {
-          return Object.keys(hierarchy).sort();
-        }
-
-        if (action === 'models') {
-          return Object.keys(hierarchy[brand] || {}).sort();
-        }
-
-        if (action === 'years') {
-          return Object.keys(hierarchy[brand]?.[model] || {}).sort((a: any, b: any) => b - a);
-        }
-
-        if (action === 'compatible-skus') {
-          const skusSet = new Set<string>();
-
-          // 1. Obtener SKUs compatibles desde la base de datos (compatibilidades sincronizadas) usando el índice en memoria
-          if (brand) {
-            const bKey = brand.toLowerCase();
-            const mKey = model ? model.toLowerCase() : '';
-            const yNum = year && year !== 'General' && year !== '' ? parseInt(year) : null;
-
-            if (currentCompatIndex) {
-              const yearMap = currentCompatIndex.get(bKey);
-              if (yearMap) {
-                if (yNum) {
-                  const list = yearMap.get(yNum);
-                  if (list) {
-                    for (const item of list) {
-                      if (mKey) {
-                        const cModel = item.model?.toLowerCase() || '';
-                        if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
-                      }
-                      skusSet.add(item.sku);
-                    }
-                  }
-                } else {
-                  // Si no hay año, recorremos todos los años para esta marca
-                  for (const list of yearMap.values()) {
-                    for (const item of list) {
-                      if (mKey) {
-                        const cModel = item.model?.toLowerCase() || '';
-                        if (!cModel.includes(mKey) && !mKey.includes(cModel)) continue;
-                      }
-                      skusSet.add(item.sku);
-                    }
-                  }
-                }
-              }
-            } else {
-              // Fallback directo a la base de datos si el índice no está listo aún
-              console.warn('[VEHICLES COMPATIBILITY]: Index not ready, falling back to slow DB query');
-              const params: any[] = [brand];
-              let queryStr = `
-                SELECT DISTINCT sku 
-                FROM products 
-                WHERE status = 'published' 
-                  AND compatibility IS NOT NULL 
-                  AND compatibility != '[]'
-                  AND EXISTS (
-                    SELECT 1 FROM jsonb_array_elements(compatibility) elem
-                    WHERE LOWER(elem->>'brand') = LOWER($1)
-              `;
-              
-              let paramIdx = 2;
-              if (yNum) {
-                queryStr += ` AND (elem->>'year')::int = $${paramIdx++}`;
-                params.push(yNum);
-              }
-              if (mKey) {
-                queryStr += ` AND (
-                  LOWER(elem->>'model') LIKE $${paramIdx}
-                  OR $${paramIdx + 1} LIKE CONCAT('%', LOWER(elem->>'model'), '%')
-                )`;
-                params.push(`%${mKey}%`);
-                params.push(mKey);
-              }
-              queryStr += `)`; // cierra EXISTS
-              
-              try {
-                const dbRes = await pool.query(queryStr, params);
-                dbRes.rows.forEach((r: any) => {
-                  if (r.sku) skusSet.add(r.sku);
-                });
-              } catch (dbErr) {
-                console.error('[VEHICLES DB COMPATIBILITY ERROR]:', dbErr);
-              }
-            }
-          }
-
-          // 2. Obtener SKUs compatibles desde moto_catalog.json (compatibilidades estáticas)
-          if (brand && hierarchy[brand]) {
-            let codes: string[] = [];
-            if (model) {
-              if (year && year !== 'General' && year !== '') {
-                codes = hierarchy[brand][model]?.[year] || [];
-              } else if (hierarchy[brand][model]) {
-                Object.values(hierarchy[brand][model]).forEach((cList: any) => {
-                  codes.push(...cList);
-                });
-              }
-            } else {
-              Object.values(hierarchy[brand]).forEach((modelsObj: any) => {
-                if (modelsObj) {
-                  Object.values(modelsObj).forEach((cList: any) => {
-                    codes.push(...cList);
-                  });
-                }
-              });
-            }
-
-            codes.forEach(code => {
-              const vehicleSkus = compatibility[code] || [];
-              vehicleSkus.forEach((sku: string) => skusSet.add(sku));
-            });
-          }
-
-          return Array.from(skusSet);
-        }
-
-        throw new Error('Acción no válida');
-      } catch (swrErr: any) {
-        console.error('[VEHICLES SWR ERROR]:', swrErr);
-        if (action === 'brands') {
-          const result = await db.execute(sql`SELECT DISTINCT brand FROM products WHERE brand IS NOT NULL AND brand != '' ORDER BY brand`);
-          return result.rows.map((r: any) => r.brand);
-        }
-        if (action === 'models' || action === 'years' || action === 'compatible-skus') {
-          return [];
-        }
-        throw new Error('Acción no válida');
-      }
-    }, 300, 1800);
-
-    await cacheSet(redisKey, result, 600);
-    return res.json(result);
-  } catch (err: any) {
-    console.error('[VEHICLES ERROR]:', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
 
 // ================================================================
 // CATÁLOGO PÚBLICO (sin autenticación)
@@ -2675,95 +2099,6 @@ const authLimiter = rateLimit({
   message: { error: 'Demasiados intentos. Por favor, espera 15 minutos.' }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SITEMAP ENDPOINT
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/catalog/sitemap-skus', async (req, res) => {
-  try {
-    const page = parseInt((req.query.page as string) || '1', 10);
-    const limit = parseInt((req.query.limit as string) || '10000', 10);
-    const offset = (page - 1) * limit;
-
-    const result = await db.execute(sql`
-      SELECT id, slug, updated_at 
-      FROM products 
-      WHERE status = 'published'
-      ORDER BY id ASC
-      LIMIT ${limit} OFFSET ${offset}
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error('[SITEMAP SKUS ERROR]:', error);
-    res.status(500).json({ error: 'Failed to fetch sitemap SKUs' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SEARCH SUGGESTIONS ENDPOINT
-// ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/search/suggestions', async (req, res) => {
-  try {
-    const { q, limit = '5' } = req.query;
-
-    if (!q || typeof q !== 'string' || q.length < 2) {
-      res.json({ results: [] });
-      return;
-    }
-
-    const searchTerm = sanitizeLike(q);
-    const limitNum = Math.min(parseInt(limit as string) || 5, 10);
-
-    const exactResult = await db.execute(sql`
-      SELECT name, sku, brand
-      FROM products
-      WHERE status = 'published'
-        AND name NOT LIKE 'Aplicaciones:%'
-        AND name NOT LIKE 'Applications:%'
-        AND (
-          LOWER(name) LIKE LOWER('%' || ${searchTerm} || '%') ESCAPE '\'
-          OR LOWER(sku) LIKE LOWER('%' || ${searchTerm} || '%') ESCAPE '\'
-        )
-      ORDER BY
-        CASE WHEN LOWER(name) LIKE LOWER(${searchTerm} || '%') THEN 0 ELSE 1 END,
-        name ASC
-      LIMIT ${limitNum}
-    `);
-
-    if (exactResult.rows.length > 0) {
-      const results = exactResult.rows.map(row => ({
-        name: row.name,
-        slug: row.sku,
-        category: row.brand || '',
-      }));
-      return res.json({ results });
-    }
-
-    const fuzzyResult = await db.execute(sql`
-      SELECT name, sku, brand,
-             GREATEST(similarity(LOWER(name), LOWER(${searchTerm})),
-                      similarity(LOWER(COALESCE(sku, '')), LOWER(${searchTerm}))) AS sim
-      FROM products
-      WHERE status = 'published'
-        AND name NOT LIKE 'Aplicaciones:%'
-        AND name NOT LIKE 'Applications:%'
-        AND similarity(LOWER(name), LOWER(${searchTerm})) > 0.2
-      ORDER BY sim DESC
-      LIMIT ${limitNum}
-    `);
-
-    const fuzzyResults = fuzzyResult.rows.map(row => ({
-      name: row.name,
-      slug: row.sku,
-      category: row.brand || '',
-    }));
-    return res.json({ results: fuzzyResults });
-  } catch (err: any) {
-    console.error('[SEARCH SUGGESTIONS ERROR]:', err);
-    res.status(500).json({ error: 'Failed to fetch search suggestions', results: [] });
-  }
-});
-
 
 // ================================================================
 // FILTER OPTIONS
@@ -2775,110 +2110,6 @@ const FILTER_ATTR_KEYS = new Set([
   'Composición', 'Homologación', 'Colección',
   'Tipo de pieza de repuesto'
 ]);
-
-app.get('/api/catalog/filters', async (req, res) => {
-  try {
-    const { category_id, search, universal } = req.query as any;
-
-    const cacheKey = `/api/catalog/filters?category_id=${category_id || ''}&search=${search || ''}&universal=${universal || ''}`;
-    const redisQuery = JSON.stringify({
-      category_id: category_id || '',
-      search: search || '',
-      universal: universal || '',
-    });
-    const redisKey = redisQuery.length > 200
-      ? `cache:filters:${crypto.createHash('sha256').update(redisQuery).digest('hex')}`
-      : `cache:filters:${redisQuery}`;
-    const cached = await cacheGet<{
-      brands: string[];
-      price_min: number;
-      price_max: number;
-      attributes: Record<string, string[]>;
-    }>(redisKey);
-    if (cached) {
-      return res.json(cached);
-    }
-
-    const result = await executeSWR(cacheKey, async () => {
-      const conditions = sql`WHERE status = 'published'`;
-
-      if (universal === 'true') {
-        conditions.append(sql` AND (compatibility IS NULL OR compatibility = '[]'::jsonb OR compatibility::text = '[]')`);
-      }
-
-      if (search) {
-        const searchPattern = `%${sanitizeLike(search)}%`;
-        conditions.append(sql` AND (LOWER(name) LIKE LOWER(${searchPattern}) ESCAPE '\\' OR LOWER(sku) LIKE LOWER(${searchPattern}) ESCAPE '\\')`);
-      }
-
-      if (category_id) {
-        const catId = parseInt(category_id);
-        if (!isNaN(catId)) {
-          conditions.append(sql` AND category_id IN (
-            WITH RECURSIVE descendants AS (
-              SELECT id FROM categories WHERE id = ${catId}
-              UNION ALL
-              SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-            )
-            SELECT id FROM descendants
-          )`);
-        }
-      }
-
-      const attrKeysArr = Array.from(FILTER_ATTR_KEYS);
-
-      const [brandsRes, priceRes, attrsRes] = await Promise.all([
-        db.execute(sql`SELECT DISTINCT brand FROM products ${conditions} AND brand IS NOT NULL AND brand != '' ORDER BY brand`),
-        db.execute(sql`SELECT MIN(price) as min_p, MAX(price) as max_p FROM products ${conditions}`),
-        db.execute(sql`
-          SELECT att.key, JSON_AGG(DISTINCT att.value) AS values
-          FROM products p, jsonb_each_text(p.attributes) AS att(key, value)
-          ${conditions}
-            AND att.value IS NOT NULL AND att.value != ''
-            AND att.key IN (${buildInClause(attrKeysArr)})
-          GROUP BY att.key
-          ORDER BY att.key
-        `)
-      ]);
-
-      const brands = brandsRes.rows.map((r: any) => r.brand).filter(Boolean);
-      const priceMinRow: any = priceRes.rows[0] || {};
-      const priceMin = priceMinRow.min_p ? Math.round(Number(priceMinRow.min_p) / 100) : 0;
-      const priceMax = priceMinRow.max_p ? Math.round(Number(priceMinRow.max_p) / 100) : 1000;
-
-      const attributes: Record<string, string[]> = {};
-      for (const row of attrsRes.rows) {
-        const r: any = row;
-        attributes[r.key] = r.values;
-      }
-
-      return { brands, price_min: priceMin, price_max: priceMax, attributes };
-    }, 300, 1800);
-
-    await cacheSet(redisKey, result, 300);
-    res.json(result);
-  } catch (err: any) {
-    console.error('[FILTERS ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/catalog/product/:id', async (req, res) => {
-  try {
-    const result = await db.execute(sql`
-      SELECT p.*,
-             COALESCE(rs.avg_rating, 0) AS avg_rating,
-             COALESCE(rs.review_count, 0) AS review_count
-      FROM products p
-      LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
-      WHERE p.id = ${parseInt(req.params.id)} AND p.status = 'published'
-    `);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
-    res.json(mapProductToFrontend(result.rows[0]));
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ---------------------------------------------------------------------------
 // /api/products/[id]/image — on-the-fly image cache (P2 #9)
@@ -2907,120 +2138,6 @@ const PLACEHOLDER_JPEG = Buffer.from(
   'base64',
 );
 
-app.get('/api/products/:id(\\d+)/image', async (req: any, res: any) => {
-  try {
-    const productId = parseInt(req.params.id, 10);
-    if (!Number.isFinite(productId) || productId <= 0) {
-      return servePlaceholder(res, 'bad-id');
-    }
-
-    // Width whitelist: clamps untrusted values AND dodges sharp variants we
-    // haven't optimized for. The set is intentionally small — frontend can
-    // request 800 (product page), 400 (catalog card), 200 (mini thumbnail).
-    const wRaw = parseInt(String(req.query.w || '800'), 10);
-    const w: 200 | 400 | 800 = (ALLOWED_IMAGE_WIDTHS.has(wRaw) ? wRaw : 800) as 200 | 400 | 800;
-
-    // Picture number: 1..6. We don't have a per-picture DB column; the
-    // existing `images` JSONB holds a list of URLs in the same order Bihr
-    // gave us, so we index into it directly.
-    const nRaw = parseInt(String(req.query.n || '1'), 10);
-    const n = Math.max(1, Math.min(6, Number.isFinite(nRaw) ? nRaw : 1));
-
-    // 1) Local fast path: /uploads/optimized/{sku}-{w}.webp
-    const skuRes = await db.execute(sql`SELECT sku, images FROM products WHERE id = ${productId} LIMIT 1`);
-    if (skuRes.rows.length === 0) return servePlaceholder(res, 'no-product');
-    const sku = (skuRes.rows[0] as any).sku;
-    const safeSku = sanitizeSkuForFilename(sku);
-    if (safeSku) {
-      const localPath = path.join(OPTIMIZED_DIR, `${safeSku}-${w}.webp`);
-      if (fs.existsSync(localPath)) {
-        // Long cache: this URL is keyed by SKU + width, so a successful
-        // download is safe to serve for 24h. We don't promise
-        // `immutable` because the downloader could regenerate the file
-        // under us (e.g. better source material).
-        res.set('Content-Type', 'image/webp');
-        res.set('Cache-Control', 'public, max-age=86400');
-        res.set('X-Image-Cache', 'HIT');
-        return fs.createReadStream(localPath).pipe(res);
-      }
-    }
-
-    // 2) Bihr fallback: pick the nth image URL from products.images
-    const imgs: any[] = (() => {
-      let parsed: any[] = [];
-      try {
-        parsed = typeof (skuRes.rows[0] as any).images === 'string'
-          ? JSON.parse((skuRes.rows[0] as any).images)
-          : ((skuRes.rows[0] as any).images || []);
-      } catch {}
-      return Array.isArray(parsed) ? parsed : [];
-    })();
-
-    const picked = imgs[n - 1];
-    const remoteUrl: string | undefined = picked && (typeof picked === 'string' ? picked : picked.src || picked.url);
-    if (!remoteUrl || !/^https?:\/\//i.test(remoteUrl)) {
-      return servePlaceholder(res, 'no-remote-url');
-    }
-
-    // Fetch from upstream. We tolerate ANY host here (not just mybihr.com)
-    // because the field can contain third-party URLs after manual admin
-    // uploads. We DO cap the body to 15 MB so a malicious upstream can't
-    // exhaust our memory.
-    let upstream: Response;
-    try {
-      upstream = await fetch(remoteUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; EscapesYMas/1.0; +https://escapesymas.com)',
-          'Accept': 'image/jpeg,image/png,image/webp,image/*',
-        },
-      });
-    } catch (err: any) {
-      console.warn(`[product-image] upstream fetch failed for product ${productId} url=${remoteUrl}: ${err?.message || err}`);
-      return servePlaceholder(res, 'fetch-error');
-    }
-    if (!upstream.ok) {
-      console.warn(`[product-image] upstream ${upstream.status} for product ${productId}`);
-      return servePlaceholder(res, `upstream-${upstream.status}`);
-    }
-
-    const ab = await upstream.arrayBuffer();
-    if (ab.byteLength > 15 * 1024 * 1024) {
-      console.warn(`[product-image] upstream too large (${ab.byteLength}B) for product ${productId}`);
-      return servePlaceholder(res, 'upstream-too-large');
-    }
-    const original = Buffer.from(ab);
-
-    let optimized: Buffer;
-    try {
-      optimized = await sharp(original)
-        .resize({ width: w, withoutEnlargement: true, fit: 'inside' })
-        .webp({ quality: 80, effort: 4 })
-        .toBuffer();
-    } catch (sharpErr: any) {
-      console.error(`[product-image] sharp error for product ${productId}: ${sharpErr?.message || sharpErr}`);
-      return servePlaceholder(res, 'sharp-error');
-    }
-
-    // Persist to disk (fire & forget) so subsequent requests hit the
-    // local fast path. We key on SKU + width only (no `n`) because the
-    // picture-number ordering is already preserved in the order we
-    // fetch from the JSONB list — the same SKU at the same width always
-    // corresponds to the same image slot in our own optimized set.
-    if (safeSku) {
-      const localPath = path.join(OPTIMIZED_DIR, `${safeSku}-${w}.webp`);
-      fs.promises.writeFile(localPath, optimized).catch(() => {});
-    }
-
-    res.set('Content-Type', 'image/webp');
-    res.set('Cache-Control', 'public, max-age=86400');
-    res.set('X-Image-Cache', 'MISS');
-    return res.end(optimized);
-  } catch (err: any) {
-    console.error('[product-image] unexpected error:', err?.message || err);
-    return servePlaceholder(res, 'internal-error');
-  }
-});
-
 function servePlaceholder(res: any, reason: string): void {
   res.set('Content-Type', 'image/jpeg');
   res.set('Cache-Control', 'public, max-age=300');
@@ -3030,292 +2147,6 @@ function servePlaceholder(res: any, reason: string): void {
 
 const fbCache = new Map<string, { data: any[]; expiresAt: number }>();
 const FB_TTL_MS = 5 * 60 * 1000;
-
-app.get('/api/catalog/frequently-bought-together/:productId', async (req, res) => {
-  try {
-    const productId = parseInt(req.params.productId);
-    if (isNaN(productId)) return res.json([]);
-
-    const cached = fbCache.get(String(productId));
-    if (cached && cached.expiresAt > Date.now()) {
-      res.setHeader('X-Cache', 'HIT');
-      return res.json(cached.data);
-    }
-
-    const result = await db.execute(sql`
-      WITH related AS (
-        SELECT oi2.product_id AS related_id, COUNT(*) AS co_count
-        FROM order_items oi1
-        JOIN order_items oi2 ON oi1.order_id = oi2.order_id
-        WHERE oi1.product_id = ${productId} AND oi2.product_id != ${productId}
-        GROUP BY oi2.product_id
-        ORDER BY co_count DESC
-        LIMIT 6
-      )
-      SELECT p.id, p.sku, p.name, p.brand, p.price, p.sale_price, p.stock, p.images,
-             r.co_count
-      FROM related r
-      JOIN products p ON p.id = r.related_id
-      WHERE p.status = 'published' AND p.stock > 0
-      ORDER BY r.co_count DESC
-      LIMIT 6
-    `);
-
-    const items = (result.rows as any[]).map((row) => {
-      let imgs: any[] = [];
-      try {
-        imgs = typeof row.images === 'string' ? JSON.parse(row.images) : (row.images || []);
-      } catch {}
-      let firstImage: string = imgs[0]?.src || imgs[0]?.url || '';
-      if (firstImage && /^https?:\/\/(api\.|cdn\.)?mybihr\.com\//i.test(firstImage)) {
-        firstImage = `/api/image-proxy?w=400&url=${encodeURIComponent(firstImage)}`;
-      }
-      return {
-        id: row.id,
-        sku: row.sku,
-        name: row.name,
-        brand: row.brand,
-        price: row.price,
-        sale_price: row.sale_price,
-        stock: row.stock,
-        image: firstImage,
-        co_count: row.co_count,
-      };
-    });
-
-    fbCache.set(String(productId), { data: items, expiresAt: Date.now() + FB_TTL_MS });
-    res.json(items);
-  } catch (err: any) {
-    console.error('[FREQ BOUGHT ERROR]:', err);
-    res.json([]);
-  }
-});
-
-app.get('/api/catalog/product-by-slug/:slug', async (req, res) => {
-  try {
-    const slugStr = String(req.params.slug || '');
-    const skuStr = slugStr.replace(/-/g, '');
-    const rawId = parseInt(slugStr, 10);
-    const validId = (!isNaN(rawId) && rawId >= 1 && rawId <= 2147483647 && String(rawId) === slugStr) ? rawId : null;
-
-    const result = await db.execute(sql`
-      SELECT p.*,
-             COALESCE(rs.avg_rating, 0) AS avg_rating,
-             COALESCE(rs.review_count, 0) AS review_count
-      FROM products p
-      LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
-      WHERE (p.sku = ${slugStr} OR p.sku = ${skuStr} ${validId !== null ? sql`OR p.id = ${validId}` : sql``}) AND p.status = 'published'
-      LIMIT 1
-    `);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
-    res.json(mapProductToFrontend(result.rows[0]));
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/catalog/product-by-sku/:sku/variants', async (req, res) => {
-  try {
-    const sku = req.params.sku;
-    const productRes = await db.execute(sql`SELECT * FROM products WHERE sku = ${sku}`);
-    if (productRes.rows.length === 0) return res.json([]);
-    
-    const product = productRes.rows[0];
-    let parentSku = '';
-    
-    if (product.attributes) {
-      let attrs: any = {};
-      try {
-        attrs = typeof product.attributes === 'string' ? JSON.parse(product.attributes) : product.attributes;
-      } catch (e) {}
-      parentSku = attrs.parent_sku || '';
-    }
-    
-    if (parentSku) {
-      const variantsRes = await db.execute(sql`
-        SELECT * FROM products 
-        WHERE attributes->>'parent_sku' = ${parentSku} 
-          AND status = 'published'
-        ORDER BY price ASC
-      `);
-      return res.json(variantsRes.rows.map(mapProductToFrontend));
-    }
-    
-    const baseName = (product as any).name?.split(',')[0].trim() || '';
-    if (baseName.length > 8) {
-      const variantsRes = await db.execute(sql`
-        SELECT * FROM products 
-        WHERE name LIKE ${baseName + '%'} 
-          AND status = 'published'
-        ORDER BY price ASC
-        LIMIT 100
-      `);
-      return res.json(variantsRes.rows.map(mapProductToFrontend));
-    }
-    
-    return res.json([mapProductToFrontend(product)]);
-  } catch (err: any) {
-    console.error('[VARIANTS ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/catalog/product-compatibility/:id', async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.json([]);
-    
-    const productRes = await db.execute(sql`SELECT compatibility FROM products WHERE id = ${id}`);
-    if (productRes.rows.length === 0) return res.json([]);
-    
-    const row = productRes.rows[0];
-    let compatibility: any[] = [];
-    try {
-      if (row.compatibility) {
-        compatibility = typeof row.compatibility === 'string' ? JSON.parse(row.compatibility) : row.compatibility;
-      }
-    } catch (e) {}
-    
-    return res.json(compatibility);
-  } catch (err: any) {
-    console.error('[COMPATIBILITY ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/catalog/stock-check', async (req, res) => {
-  try {
-    const { ids } = req.query as any;
-    if (!ids) return res.status(400).json({ error: 'Falta ids' });
-    const idsList = ids.split(',').map((id: string) => parseInt(id)).filter((id: number) => !isNaN(id) && id > 0);
-    if (idsList.length === 0) return res.json({ checks: [] });
-
-    const result = await db.execute(sql`
-      SELECT id, sku, name, stock
-      FROM products
-      WHERE id IN (${sql.join(idsList.map((id: number) => sql`${id}`), sql`, `)})
-    `);
-
-    const checks = (result.rows as any[]).map((row) => ({
-      id: row.id,
-      sku: row.sku,
-      name: row.name,
-      stock: typeof row.stock === 'string' ? parseInt(row.stock) : (row.stock || 0),
-      available: (typeof row.stock === 'string' ? parseInt(row.stock) : (row.stock || 0)) > 0,
-    }));
-
-    return res.json({ checks });
-  } catch (err: any) {
-    console.error('[STOCK CHECK ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/catalog/products-by-skus', async (req, res) => {
-  try {
-    const { skus, ids, category_id } = req.query as any;
-
-    const conditions = sql`WHERE status = 'published'`;
-
-    if (ids) {
-      const idsList = ids.split(',').map((id: string) => parseInt(id)).filter((id: number) => !isNaN(id));
-      if (idsList.length === 0) return res.json([]);
-      conditions.append(sql` AND id IN (${buildInClause(idsList)})`);
-    } else if (skus) {
-      const skusList = skus.split(',').map((s: string) => sanitizeString(s.trim()));
-      if (skusList.length === 0) return res.json([]);
-      conditions.append(sql` AND sku IN (${buildInClause(skusList)})`);
-    } else {
-      return res.json([]);
-    }
-
-    if (category_id) {
-      const catId = parseInt(category_id);
-      if (!isNaN(catId)) {
-        const parentId = Math.floor(catId / 100);
-        conditions.append(sql`
-          AND (
-            category_id IN (
-              WITH RECURSIVE descendants AS (
-                SELECT id FROM categories WHERE id = ${catId}
-                UNION ALL
-                SELECT c.id FROM categories c JOIN descendants d ON c.parent_id = d.id
-              )
-              SELECT id FROM descendants
-            )
-            OR category_id = ${parentId}
-          )`);
-      }
-    }
-
-    const productsRes = await db.execute(sql`
-      SELECT * FROM (
-        SELECT DISTINCT ON (split_part(name, ',', 1)) *
-        FROM products
-        ${conditions}
-        ORDER BY split_part(name, ',', 1), stock DESC, id ASC
-      ) distinct_products
-      ORDER BY price ASC
-    `);
-    const products = productsRes.rows.map(mapProductToFrontend);
-    return res.json(products);
-  } catch (err: any) {
-    console.error('[PRODUCTS BY SKUS ERROR]:', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/orders', async (req, res) => {
-  try {
-    // Auth required — caller must list their OWN orders. Admin role may list
-    // any user's orders by passing `userId`. Previously the endpoint accepted
-    // an arbitrary `userId`/`email` from the query string without auth, so any
-    // visitor could enumerate other customers' orders. See audit 2026-08-15,
-    // finding #17/#47.
-    const auth = authenticateRequest(req);
-    if (!auth) return res.status(401).json({ error: 'No autenticado' });
-
-    const { userId, email, status } = req.query as any;
-    let targetUserId: number | null = null;
-    if (auth.role === 'admin' && userId) {
-      targetUserId = parseIntSafe(userId);
-    } else if (auth.role === 'admin' && email) {
-      const uRes = await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = LOWER(${email as string}) LIMIT 1`);
-      targetUserId = uRes.rows.length ? (uRes.rows[0] as any).id : null;
-    } else {
-      targetUserId = auth.user_id;
-    }
-    if (!targetUserId) return res.status(400).json({ error: 'Falta userId' });
-
-    const conditions = sql`WHERE user_id = ${targetUserId}`;
-    if (status && status !== 'all') {
-      conditions.append(sql` AND status = ${status}`);
-    }
-    conditions.append(sql` ORDER BY created_at DESC LIMIT 5`);
-
-    const ordersRes = await db.execute(sql`SELECT * FROM orders ${conditions}`);
-    const result = ordersRes.rows.map((row: any) => {
-      let shippingDataObj = {};
-      try {
-        shippingDataObj = typeof row.shippingData === 'string' ? JSON.parse(row.shippingData) : row.shippingData;
-      } catch (e) {}
-
-      return {
-        id: row.id,
-        status: row.status,
-        total: row.total / 100,
-        payment_method: 'card',
-        billing: shippingDataObj,
-        created_at: row.createdAt
-      };
-    });
-
-    return res.json(result);
-  } catch (err: any) {
-    console.error('[ORDERS GET ERROR]:', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
 
 // ================================================================
 // COMPARTIDO & FACTURACIÓN PDF
@@ -3484,60 +2315,6 @@ async function createInvoiceForOrder(orderId: number) {
   const invRes = await db.execute(sql`SELECT * FROM invoices WHERE order_id = ${orderId}`);
   return invRes.rows[0];
 }
-
-app.get('/api/orders/download-invoice', async (req: any, res: any) => {
-  const { orderId, userEmail } = req.query as any;
-  if (!orderId) return res.status(400).json({ error: 'Falta orderId' });
-
-  try {
-    const orderRes = await db.execute(sql`SELECT * FROM orders WHERE id = ${parseInt(orderId)}`);
-    const order = orderRes.rows[0] as any;
-    if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
-
-    let isAuthorized = false;
-    if (userEmail) {
-      if (userEmail.toLowerCase() === 'info@escapesymas.com') {
-        isAuthorized = true;
-      } else {
-        const uRes = await db.execute(sql`SELECT id FROM users WHERE email = ${userEmail}`);
-        if (uRes.rows.length > 0 && uRes.rows[0].id === order.user_id) {
-          isAuthorized = true;
-        }
-      }
-    }
-
-    if (!isAuthorized) {
-      return res.status(401).json({ error: 'No autorizado para ver esta factura' });
-    }
-
-    const invRow = await db.execute(sql`SELECT * FROM invoices WHERE order_id = ${parseInt(orderId)}`);
-    if (!invRow.rows.length) {
-      return res.status(404).json({ error: 'Factura no generada todavía.' });
-    }
-
-    const inv = invRow.rows[0] as any;
-    const pdfFile = inv.pdf_path;
-
-    if (!pdfFile || !fs.existsSync(pdfFile)) {
-      return res.status(404).json({ error: 'Archivo PDF no encontrado en el servidor.' });
-    }
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${inv.invoice_number}.pdf"`);
-    fs.createReadStream(pdfFile).pipe(res);
-  } catch (err: any) {
-    console.error('[CUSTOMER INVOICE DOWNLOAD ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ADMIN (requiere autenticación)
-// ================================================================
-app.post('/api/auth/logout', (req: any, res: any) => {
-  clearAuthCookie(res);
-  res.json({ success: true });
-});
 
 app.all('/api/admin', adminLimiter, async (req, res) => {
   const { action, userId, email } = req.query as any;
@@ -6293,403 +5070,6 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 });
 
 // ================================================================
-// AUTH (Login/Register/Profile)
-// ================================================================
-app.get('/api/auth', async (req, res) => {
-  const { action, email, id } = req.query as any;
-
-  try {
-    if (action === 'get-profile') {
-      if (!email && !id) return res.status(400).json({ error: 'Falta email o id' });
-
-      let conditions = sql`WHERE 1=1`;
-      if (email) {
-        conditions.append(sql` AND LOWER(email) = LOWER(${email})`);
-      } else if (id) {
-        const safeId = parseIntSafe(id);
-        if (!safeId) return res.status(400).json({ error: 'ID inválido' });
-        conditions.append(sql` AND id = ${safeId}`);
-      }
-
-      const userRes = await db.execute(sql`SELECT * FROM users ${conditions}`);
-      if (userRes.rows.length === 0) {
-        return res.status(404).json({ error: 'Usuario no encontrado' });
-      }
-
-      const user = userRes.rows[0] as any;
-      
-      // Intentar decodificar metadatos o billing
-      let billing = { address_1: '', city: '', postcode: '', phone: '' };
-      try {
-        if (user.billing) {
-          billing = typeof user.billing === 'string' ? JSON.parse(user.billing) : user.billing;
-        }
-      } catch (e) {}
-
-      let garage: any[] = [];
-      try {
-        if (user.garage) {
-          garage = typeof user.garage === 'string' ? JSON.parse(user.garage) : user.garage;
-        }
-      } catch (e) {}
-
-      let cart: any[] = [];
-      try {
-        if (user.cart) {
-          cart = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
-        }
-      } catch (e) {}
-
-      return res.json({
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        firstName: user.first_name || '',
-        lastName: user.last_name || '',
-        avatarUrl: user.avatar_url || '',
-        role: user.role || 'customer',
-        rank: user.rank || 'Novato',
-        xp: user.xp || 0,
-        billing,
-        garage,
-        cart
-      });
-    } else if (action === 'search-users') {
-      const { q } = req.query as any;
-      if (!q) return res.json([]);
-
-      const userRes = await db.execute(sql`
-        SELECT id, username, first_name, last_name, avatar_url FROM users
-        WHERE LOWER(username) LIKE ${'%' + q.toLowerCase() + '%'}
-           OR LOWER(email) LIKE ${'%' + q.toLowerCase() + '%'}
-           OR LOWER(first_name) LIKE ${'%' + q.toLowerCase() + '%'}
-           OR LOWER(last_name) LIKE ${'%' + q.toLowerCase() + '%'}
-        LIMIT 5
-      `);
-
-      const list = userRes.rows.map((row: any) => ({
-        id: row.id,
-        name: row.first_name ? `${row.first_name} ${row.last_name || ''}`.trim() : row.username,
-        avatar: row.avatar_url || ''
-      }));
-
-      return res.json(list);
-    }
-
-    return res.status(400).json({ error: 'Acción no válida' });
-  } catch (err: any) {
-    console.error('[AUTH GET PROFILE ERROR]:', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/auth', authLimiter, async (req, res) => {
-  const { action } = req.query as any;
-  const body = req.body;
-
-  try {
-    if (action === 'login' || action === 'social-login') {
-      const { username, password } = body;
-      if (!username) return res.status(400).json({ error: 'Falta email o usuario' });
-
-      // Buscar por email o username en PostgreSQL
-      const userRes = await db.execute(sql`
-        SELECT * FROM users
-        WHERE LOWER(email) = LOWER(${username}) OR LOWER(username) = LOWER(${username})
-      `);
-
-      if (userRes.rows.length === 0) {
-        return res.status(401).json({ error: 'Usuario no encontrado' });
-      }
-
-      const user = userRes.rows[0] as any;
-
-      // Si es un login social (bypass de contraseña)
-      const isSocial = !!(body.provider && body.token);
-      
-      if (!isSocial) {
-        // Verificar contraseña
-        const isValid = await verifyPassword(password || '', user.password_hash);
-        if (!isValid) {
-          return res.status(401).json({ error: 'Contraseña incorrecta' });
-        }
-        
-        // Migrar hash legacy a bcrypt si es necesario
-        if (user.password_hash && isLegacyPasswordHash(user.password_hash)) {
-          const newHash = await hashPassword(password || '');
-          await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${user.id}`);
-          user.password_hash = newHash;
-        }
-      }
-
-      // Si el usuario no tiene contraseña establecida, se la guardamos con bcrypt
-      if (!user.password_hash) {
-        const newHash = await hashPassword(password || '');
-        await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${user.id}`);
-        user.password_hash = newHash;
-      }
-
-      // Generar JWT y respuesta de sesión
-      const token = generateJWT(user);
-      setAuthCookie(res, token);
-      const session = {
-        token,
-        user_id: user.id,
-        user_email: user.email,
-        user_nicename: user.username,
-        user_display_name: user.first_name || user.username,
-        avatarUrl: user.avatar_url || '',
-        role: user.role || 'customer'
-      };
-
-      return res.json(session);
-
-    } else if (action === 'get-profile') {
-      // Auth required. Admin role may look up another user by passing `id` in
-      // the body or query. Previously any caller could fetch any profile by
-      // passing `?email=foo` — full PII leak. See audit 2026-08-15, #25.
-      const auth = authenticateRequest(req);
-      if (!auth) return res.status(401).json({ error: 'No autenticado' });
-
-      let targetId: number | null = null;
-      if (auth.role === 'admin') {
-        const raw = body?.id || body?.userId || req.query?.id;
-        if (raw) targetId = parseIntSafe(raw);
-      }
-      if (!targetId) targetId = auth.user_id;
-      if (!targetId) return res.status(400).json({ error: 'ID inválido' });
-
-      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetId}`);
-      if (userRes.rows.length === 0) {
-        return res.status(404).json({ error: 'Usuario no encontrado' });
-      }
-
-      const user = userRes.rows[0] as any;
-
-      let billing = { address_1: '', city: '', postcode: '', phone: '' };
-      try {
-        if (user.billing) {
-          billing = typeof user.billing === 'string' ? JSON.parse(user.billing) : user.billing;
-        }
-      } catch (e) {}
-
-      let garage: any[] = [];
-      try {
-        if (user.garage) {
-          garage = typeof user.garage === 'string' ? JSON.parse(user.garage) : user.garage;
-        }
-      } catch (e) {}
-
-      let cart: any[] = [];
-      try {
-        if (user.cart) {
-          cart = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart;
-        }
-      } catch (e) {}
-
-      return res.json({
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        firstName: user.first_name || '',
-        lastName: user.last_name || '',
-        avatarUrl: user.avatar_url || '',
-        role: user.role || 'customer',
-        rank: user.rank || 'Novato',
-        xp: user.xp || 0,
-        billing,
-        garage,
-        cart
-      });
-
-    } else if (action === 'register') {
-      const { username, email, password, firstName, lastName, phone } = body;
-      if (!username || !email || !password) return res.status(400).json({ error: 'Faltan campos obligatorios' });
-
-      // Comprobar si ya existe
-      const existRes = await db.execute(sql`
-        SELECT id FROM users
-        WHERE LOWER(email) = LOWER(${email}) OR LOWER(username) = LOWER(${username})
-      `);
-
-      if (existRes.rows.length > 0) {
-        return res.status(400).json({ error: 'El email o nombre de usuario ya está registrado' });
-      }
-
-      const passHash = await hashPassword(password);
-      const role = 'customer';
-      const billingData = JSON.stringify({ address_1: '', city: '', postcode: '', phone: phone || '' });
-
-      const insertRes = await db.execute(sql`
-        INSERT INTO users (username, email, password_hash, first_name, last_name, role, billing)
-        VALUES (${username}, ${email}, ${passHash}, ${firstName || username}, ${lastName || ''}, ${role}, ${billingData})
-        RETURNING id
-      `);
-
-      const newId = insertRes.rows[0]?.id;
-
-      // Auto-login con JWT
-      const newUser = { id: newId, email, username, role };
-      const token = generateJWT(newUser);
-      setAuthCookie(res, token);
-      const session = {
-        token,
-        user_id: newId,
-        user_email: email,
-        user_nicename: username,
-        user_display_name: firstName || username,
-        avatarUrl: '',
-        role
-      };
-
-      return res.json(session);
-    } else if (action === 'update-profile') {
-      // Auth required. The body `userId` is now IGNORED — the caller can only
-      // modify their own profile. Admins can pass a different userId. The
-      // previous implementation let anyone rewrite any user's profile by
-      // passing `userId` in the body. See audit 2026-08-15, finding #26.
-      const auth = authenticateRequest(req);
-      if (!auth) return res.status(401).json({ error: 'No autenticado' });
-
-      const { username, firstName, lastName, email, billing, garage, avatarUrl } = body;
-      const requestedUserId = body.userId ? parseIntSafe(body.userId) : null;
-      const targetUserId = (auth.role === 'admin' && requestedUserId) ? requestedUserId : auth.user_id;
-      if (!targetUserId) return res.status(400).json({ error: 'ID inválido' });
-
-      // Cargar el usuario actual
-      const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetUserId}`);
-      if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-      const user = userRes.rows[0] as any;
-
-      // Validar unicidad del nombre de usuario (@username)
-      if (username && username.trim().toLowerCase() !== user.username.toLowerCase()) {
-        const cleanUsername = username.trim().toLowerCase().replace(/[^a-z0-9_.]/gi, '');
-        if (cleanUsername.length < 3) {
-          return res.status(400).json({ error: 'El nombre de usuario (@username) debe tener al menos 3 caracteres.' });
-        }
-        const existUsernameRes = await db.execute(sql`
-          SELECT id FROM users
-          WHERE LOWER(username) = LOWER(${cleanUsername}) AND id != ${targetUserId}
-        `);
-        if (existUsernameRes.rows.length > 0) {
-          return res.status(400).json({ error: `El nombre de usuario (@${cleanUsername}) ya está reservado por otro piloto.` });
-        }
-      }
-
-      if (email && email.toLowerCase() !== user.email.toLowerCase()) {
-        const existRes = await db.execute(sql`
-          SELECT id FROM users
-          WHERE LOWER(email) = LOWER(${email}) AND id != ${targetUserId}
-        `);
-        if (existRes.rows.length > 0) {
-          return res.status(400).json({ error: 'El correo electrónico ya está registrado por otro usuario' });
-        }
-      }
-
-      let billingJson: string | null = null;
-      if (billing !== undefined) {
-        billingJson = typeof billing === 'string' ? billing : JSON.stringify(billing);
-      } else if (user.billing) {
-        billingJson = typeof user.billing === 'string' ? user.billing : JSON.stringify(user.billing);
-      }
-
-      let garageJson: string | null = null;
-      if (garage !== undefined) {
-        garageJson = typeof garage === 'string' ? garage : JSON.stringify(garage);
-      } else if (user.garage) {
-        garageJson = typeof user.garage === 'string' ? user.garage : JSON.stringify(user.garage);
-      }
-
-      const cleanUsernameToSave = username ? username.trim().toLowerCase().replace(/[^a-z0-9_.]/gi, '') : null;
-
-      await db.execute(sql`
-        UPDATE users
-        SET
-          username = COALESCE(${cleanUsernameToSave || null}, username),
-          first_name = COALESCE(${firstName || null}, first_name),
-          last_name = COALESCE(${lastName || null}, last_name),
-          email = COALESCE(${email || null}, email),
-          billing = ${billingJson},
-          garage = ${garageJson},
-          avatar_url = COALESCE(${avatarUrl || null}, avatar_url)
-        WHERE id = ${targetUserId}
-      `);
-
-      return res.json({ success: true });
-    } else if (action === 'save-cart') {
-      // Auth required; the cart being saved must belong to the caller.
-      const auth = authenticateRequest(req);
-      if (!auth) return res.status(401).json({ error: 'No autenticado' });
-      const { cart } = body;
-      const requestedUserId = body.userId ? parseIntSafe(body.userId) : null;
-      const targetUserId = (auth.role === 'admin' && requestedUserId) ? requestedUserId : auth.user_id;
-      if (!targetUserId) return res.status(400).json({ error: 'Falta userId' });
-      await db.execute(sql`
-        UPDATE users
-        SET cart = ${cart ? JSON.stringify(cart) : null}
-        WHERE id = ${targetUserId}
-      `);
-      return res.json({ success: true });
-    } else if (action === 'delete-account') {
-      // Auth required; only admins can delete someone else.
-      const auth = authenticateRequest(req);
-      if (!auth) return res.status(401).json({ error: 'No autenticado' });
-      const { userId } = body;
-      const requestedId = parseIntSafe(userId);
-      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
-      if (!targetId) return res.status(400).json({ error: 'Falta userId' });
-
-      try {
-        await db.execute(sql`DELETE FROM users WHERE id = ${targetId}`);
-      } catch (err) {
-        await db.execute(sql`
-          UPDATE users
-          SET
-            username = ${`eliminado_${targetId}`},
-            email = ${`eliminado_${targetId}@escapesymas.com`},
-            first_name = 'Usuario',
-            last_name = 'Eliminado',
-            password_hash = '',
-            avatar_url = '',
-            billing = null,
-            garage = null,
-            cart = null,
-            role = 'customer'
-          WHERE id = ${targetId}
-        `);
-      }
-    } else if (action === 'change-password') {
-      // Auth required; can only change own password unless admin.
-      const auth = authenticateRequest(req);
-      if (!auth) return res.status(401).json({ error: 'No autenticado' });
-      const { currentPassword, newPassword } = body;
-      const requestedId = body.userId ? parseIntSafe(body.userId) : null;
-      const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
-      if (!targetId || !currentPassword || !newPassword) return res.status(400).json({ error: 'Faltan campos obligatorios' });
-
-      const userRes = await db.execute(sql`SELECT password_hash FROM users WHERE id = ${targetId}`);
-      if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-      const user = userRes.rows[0] as any;
-      const isValid = await verifyPassword(currentPassword, user.password_hash);
-      if (!isValid) {
-        return res.status(401).json({ error: 'La contraseña actual es incorrecta' });
-      }
-
-      const newHash = await hashPassword(newPassword);
-      await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${targetId}`);
-      return res.json({ success: true });
-    }
-
-    res.status(400).json({ error: 'Acción no válida' });
-  } catch (err: any) {
-    console.error('[AUTH ERROR]:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
 // FORUM (Paddock)
 // ================================================================
 const RANKS = [
@@ -6703,8 +5083,15 @@ const RANKS = [
 const XP = { POST: 15, REPLY: 10, RECV_LIKE: 5, GIVE_LIKE: 1 };
 const calcRank = (xp: number) => { for (let i = RANKS.length - 1; i >= 0; i--) { if (xp >= RANKS[i].xpRequired) return RANKS[i]; } return RANKS[0]; };
 
-app.all('/api/forum', async (req, res) => {
+app.all('/api/forum', async (req: any, res) => {
   const { action, category_id, thread_id } = req.query as any;
+
+  // Escrituras: solo con sesión, y el autor es siempre el usuario del JWT
+  // (antes se aceptaban userId/replyUserId/currentUserId del body).
+  if (req.method !== 'GET') {
+    if (!req.user) return res.status(401).json({ error: 'Inicia sesión para participar' });
+    req.body = { ...(req.body || {}), userId: req.user.user_id, replyUserId: req.user.user_id, currentUserId: req.user.user_id };
+  }
 
   try {
     switch (action) {
@@ -6851,14 +5238,11 @@ app.get('/api/user/:id/rank', async (req, res) => {
 // ================================================================
 // GARAGE
 // ================================================================
-app.all('/api/garage', async (req, res) => {
-  const userEmail = (req.query.userEmail || req.body?.userEmail) as string;
-  if (!userEmail) return res.status(401).json({ error: 'No autorizado' });
-
+app.all('/api/garage', requireAuth, async (req: any, res) => {
   try {
-    const user = await db.select().from(users).where(eq(users.email, userEmail)).limit(1);
-    if (user.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-    const userId = user[0].id;
+    // El garaje es siempre el del usuario autenticado (antes bastaba con
+    // conocer su email).
+    const userId = req.user.user_id;
 
     if (req.method === 'GET') {
       const vehicles = await db.select().from(garage).where(eq(garage.userId, userId));
@@ -7027,14 +5411,26 @@ app.post('/api/shipping-estimate', async (req: any, res: any) => {
 // ================================================================
 app.post('/api/orders/create', async (req: any, res: any) => {
   try {
-    const { userEmail, cart, shippingData, paymentMethod, promoCode } = req.body;
-    if (!cart || cart.length === 0) return res.status(400).json({ error: 'El carrito está vacío' });
+    const { cart, shippingData, paymentMethod, promoCode } = req.body;
+    if (!Array.isArray(cart) || cart.length === 0) return res.status(400).json({ error: 'El carrito está vacío' });
+    if (cart.length > 100) return res.status(400).json({ error: 'Demasiados productos en el carrito' });
     if (!shippingData) return res.status(400).json({ error: 'Faltan datos de envío' });
 
-    let dbUserId = null;
-    if (userEmail) {
-      const uRes = await db.execute(sql`SELECT id FROM users WHERE email = ${userEmail}`);
-      if (uRes.rows.length > 0) dbUserId = uRes.rows[0].id;
+    // El pedido se asocia al usuario del JWT; los invitados quedan con user_id NULL.
+    // Nunca se acepta userEmail/userId del body (permitía atribuir pedidos a otros).
+    const dbUserId: number | null = req.user?.user_id ?? null;
+    const userEmail: string | undefined = req.user?.email || shippingData?.email;
+
+    // Cantidades: enteros entre 1 y 99. Una cantidad negativa restaba su
+    // precio del total y permitía pagar un pedido caro por céntimos.
+    for (const item of cart) {
+      const q = Number(item?.quantity);
+      if (!Number.isInteger(q) || q < 1 || q > 99) {
+        return res.status(400).json({ error: 'Cantidad inválida en el carrito' });
+      }
+      if (!Number.isInteger(Number(item?.id)) || Number(item.id) <= 0) {
+        return res.status(400).json({ error: 'Producto inválido en el carrito' });
+      }
     }
 
     // Calcular total seguro en céntimos consultando los productos en la BD
@@ -7145,27 +5541,28 @@ app.post('/api/orders/create', async (req: any, res: any) => {
     if (promoCode) {
       const codeUpper = promoCode.trim().toUpperCase();
       const coupRes = await db.execute(sql`
-        SELECT * FROM coupons WHERE UPPER(code) = ${codeUpper} AND active = 1
+        SELECT id FROM coupons WHERE UPPER(code) = ${codeUpper} AND active = 1
       `);
       if (coupRes.rows.length > 0) {
-        const c = coupRes.rows[0] as any;
-        const now = new Date();
-        const expiry = c.expires_at ? new Date(c.expires_at) : null;
-        const underLimit = c.max_uses === null || c.times_used < c.max_uses;
-
-        if ((!expiry || expiry > now) && underLimit) {
+        // Canje atómico: comprobar límite/caducidad e incrementar en una sola
+        // sentencia, para que dos pedidos simultáneos no superen max_uses.
+        const redeemed = await db.execute(sql`
+          UPDATE coupons SET times_used = times_used + 1
+          WHERE id = ${(coupRes.rows[0] as any).id}
+            AND active = 1
+            AND (max_uses IS NULL OR times_used < max_uses)
+            AND (expires_at IS NULL OR expires_at > NOW())
+          RETURNING type, value
+        `);
+        if (redeemed.rows.length > 0) {
+          const c = redeemed.rows[0] as any;
           if (c.type === 'percent') {
-            promoDiscountPercent = c.value;
+            promoDiscountPercent = Number(c.value) || 0;
           } else if (c.type === 'fixed') {
-            promoFixedDiscountCents = c.value; // en céntimos
+            promoFixedDiscountCents = Number(c.value) || 0; // en céntimos
           } else if (c.type === 'free_shipping') {
             promoFreeShipping = true;
           }
-          
-          // Incrementar contador de usos
-          await db.execute(sql`
-            UPDATE coupons SET times_used = times_used + 1 WHERE id = ${c.id}
-          `);
         }
       } else {
         // Fallbacks legacy
@@ -7179,8 +5576,12 @@ app.post('/api/orders/create', async (req: any, res: any) => {
       }
     }
 
-    const totalDiscountPercent = discountPercent + promoDiscountPercent;
-    let discountCents = Math.round((subtotalCents * totalDiscountPercent) / 100) + promoFixedDiscountCents;
+    // Los descuentos acumulados nunca superan el subtotal.
+    const totalDiscountPercent = Math.min(100, Math.max(0, discountPercent + promoDiscountPercent));
+    const discountCents = Math.min(
+      subtotalCents,
+      Math.round((subtotalCents * totalDiscountPercent) / 100) + Math.max(0, promoFixedDiscountCents)
+    );
     
     if (promoFreeShipping) {
       shippingCents = 0;
@@ -7218,20 +5619,30 @@ app.post('/api/orders/create', async (req: any, res: any) => {
       }
     }
 
-    const orderInsert = await db.execute(sql`
-      INSERT INTO orders (user_id, total, status, shipping_data, subtotal, discount_amount, shipping_cost, promo_code)
-      VALUES (${dbUserId}, ${totalCents}, 'pending', ${shippingJson}, ${subtotalCents}, ${discountCents}, ${shippingCents}, ${upperPromo})
-      RETURNING id
-    `);
-    
-    const newOrderId = orderInsert.rows[0].id;
-
-    // Insertar items de la orden
-    for (const item of itemsToInsert) {
-      await db.execute(sql`
-        INSERT INTO order_items (order_id, product_id, quantity, price)
-        VALUES (${newOrderId}, ${item.productId}, ${item.quantity}, ${item.price})
-      `);
+    // Pedido + líneas en una única transacción: si falla una línea no queda
+    // un pedido huérfano sin productos.
+    const txClient = await pool.connect();
+    let newOrderId: number;
+    try {
+      await txClient.query('BEGIN');
+      const orderInsert = await txClient.query(
+        `INSERT INTO orders (user_id, total, status, shipping_data, subtotal, discount_amount, shipping_cost, promo_code)
+         VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7) RETURNING id`,
+        [dbUserId, totalCents, shippingJson, subtotalCents, discountCents, shippingCents, upperPromo]
+      );
+      newOrderId = orderInsert.rows[0].id;
+      for (const item of itemsToInsert) {
+        await txClient.query(
+          'INSERT INTO order_items (order_id, product_id, quantity, price) VALUES ($1, $2, $3, $4)',
+          [newOrderId, item.productId, item.quantity, item.price]
+        );
+      }
+      await txClient.query('COMMIT');
+    } catch (txErr) {
+      await txClient.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      txClient.release();
     }
 
     res.status(201).json({
@@ -7248,14 +5659,9 @@ app.post('/api/orders/create', async (req: any, res: any) => {
   }
 });
 
-app.get('/api/orders/my-orders', async (req: any, res: any) => {
-  const { userEmail } = req.query as any;
-  if (!userEmail) return res.status(400).json({ error: 'Falta userEmail' });
-
+app.get('/api/orders/my-orders', requireAuth, async (req: any, res: any) => {
   try {
-    const uRes = await db.execute(sql`SELECT id FROM users WHERE email = ${userEmail}`);
-    if (uRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-    const userId = uRes.rows[0].id;
+    const userId = req.user.user_id;
 
     const ordersRes = await db.execute(sql`
       SELECT * FROM orders WHERE user_id = ${userId} ORDER BY created_at DESC
@@ -7325,9 +5731,10 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
     }
 
     // Ownership check before touching Stripe (avoids leaking PI existence).
-    const ownerRes = await db.execute(sql`SELECT user_id FROM orders WHERE id = ${parsedOrderId}`);
+    const ownerRes = await db.execute(sql`SELECT user_id, total FROM orders WHERE id = ${parsedOrderId}`);
     if (!ownerRes.rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
     const ownerId = (ownerRes.rows[0] as any).user_id;
+    const expectedCents = Number((ownerRes.rows[0] as any).total) || 0;
     if (ownerId !== auth.user_id && auth.role !== 'admin') {
       return res.status(403).json({ error: 'No autorizado' });
     }
@@ -7344,22 +5751,34 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
         return res.status(400).json({ error: 'El pago ha sido rechazado o cancelado. Por favor, inténtalo de nuevo o prueba con otro método de pago.' });
       }
       const piOrderId = (paymentIntent.metadata && (paymentIntent.metadata.order_id || paymentIntent.metadata.orderId)) || null;
-      if (piOrderId && String(piOrderId) !== String(parsedOrderId)) {
+      if (!piOrderId || String(piOrderId) !== String(parsedOrderId)) {
         console.warn(`[SECURITY] /api/orders/finalize rejected: paymentIntent ${paymentId} metadata.order_id=${piOrderId} does not match request orderId=${parsedOrderId}`);
         return res.status(400).json({ error: 'El paymentIntent no corresponde a esta orden.' });
+      }
+      // El importe del PaymentIntent debe coincidir con el total del pedido
+      // (mismo criterio que el webhook).
+      if (Number(paymentIntent.amount) !== expectedCents) {
+        console.warn(`[SECURITY] /api/orders/finalize rejected: PI ${paymentId} amount=${paymentIntent.amount} != order total ${expectedCents}`);
+        await db.execute(sql`UPDATE orders SET status = 'payment_amount_mismatch', last_payment_error = ${`PI ${paymentIntent.amount} vs expected ${expectedCents}`} WHERE id = ${parsedOrderId}`);
+        return res.status(400).json({ error: 'El importe del pago no coincide con el del pedido.' });
       }
     } catch (stripeErr: any) {
       console.error('[ORDER FINALIZE STRIPE VERIFY ERROR]:', stripeErr);
       return res.status(400).json({ error: 'No se pudo verificar el estado del pago con Stripe.' });
     }
 
-    await db.execute(sql`
+    // Transición idempotente: solo desde pending/payment_failed. Si el webhook
+    // de Stripe ya marcó el pedido como pagado, no se vuelve a tocar ni se
+    // descuenta stock dos veces.
+    const transition = await db.execute(sql`
       UPDATE orders
       SET status = ${paymentStatus}, payment_id = ${paymentId}
-      WHERE id = ${parsedOrderId}
+      WHERE id = ${parsedOrderId} AND status IN ('pending', 'payment_failed')
+      RETURNING id
     `);
+    const transitioned = transition.rows.length > 0;
 
-    if (paymentStatus === 'processing') {
+    if (paymentStatus === 'processing' && transitioned) {
       const itemsRes = await db.execute(sql`
         SELECT product_id, quantity FROM order_items WHERE order_id = ${parsedOrderId}
       `);
@@ -7476,42 +5895,16 @@ processAbandonedCartEmails().catch(e => console.error('[ABANDONED CART CRON INIT
 // ================================================================
 app.post('/api/cart', async (req: any, res: any) => {
   try {
-    const { userId, sessionToken, items, userEmail, userFirstName, userLastName, userUsername } = req.body;
+    // La identidad sale SIEMPRE del JWT (cookie eym_jwt o Bearer). Antes se
+    // aceptaban userId/userEmail del body y además se hacía un UPDATE sobre
+    // users con esos datos, lo que permitía cambiar el email de cualquier
+    // cuenta sin autenticarse.
+    const { sessionToken, items } = req.body;
     if (!sessionToken) return res.status(400).json({ error: 'Falta sessionToken' });
     const itemsStr = JSON.stringify(items || []);
 
-    const safeUserId = userId && userId !== 'undefined' ? parseInt(userId) : null;
-
-    if (safeUserId) {
-      // Auto-sync WordPress customer profile to PostgreSQL users table
-      const emailVal = userEmail || `wp_user_${safeUserId}@escapesymas.com`;
-      const usernameVal = userUsername || `wp_user_${safeUserId}`;
-      const fnameVal = userFirstName || '';
-      const lnameVal = userLastName || '';
-
-      const userExists = await db.execute(sql`
-        SELECT id, wp_id FROM users WHERE wp_id = ${safeUserId} OR LOWER(email) = LOWER(${emailVal})
-      `);
-
-      if (userExists.rows.length > 0) {
-        const matched = userExists.rows[0] as any;
-        await db.execute(sql`
-          UPDATE users
-          SET wp_id = ${safeUserId}, email = ${emailVal}, username = ${usernameVal}, first_name = ${fnameVal}, last_name = ${lnameVal}, updated_at = CURRENT_TIMESTAMP
-          WHERE id = ${matched.id}
-        `);
-      } else {
-        const usernameExists = await db.execute(sql`
-          SELECT id FROM users WHERE LOWER(username) = LOWER(${usernameVal})
-        `);
-        const finalUsername = usernameExists.rows.length > 0 ? `${usernameVal}_${safeUserId}` : usernameVal;
-
-        await db.execute(sql`
-          INSERT INTO users (wp_id, username, email, first_name, last_name, role)
-          VALUES (${safeUserId}, ${finalUsername}, ${emailVal}, ${fnameVal}, ${lnameVal}, 'customer')
-        `);
-      }
-    }
+    const safeUserId: number | null = req.user?.user_id ?? null;
+    const userEmail: string | undefined = req.user?.email;
 
     const hasItems = Array.isArray(items) && items.length > 0;
 
@@ -7537,7 +5930,7 @@ app.post('/api/cart', async (req: any, res: any) => {
       try {
         await db.execute(sql`
           UPDATE users SET cart = ${itemsStr}::jsonb
-          WHERE id = ${safeUserId} OR wp_id = ${safeUserId}
+          WHERE id = ${safeUserId}
         `);
       } catch (errUserCart) {
         console.error('[USER CART COLUMN SYNC ERROR]:', errUserCart);
@@ -7699,12 +6092,12 @@ app.post('/api/cart/recover/:token', async (req: any, res: any) => {
 
 app.get('/api/cart', async (req: any, res: any) => {
   try {
-    const { sessionToken, userId } = req.query as any;
-    if (!sessionToken && (!userId || userId === 'undefined')) {
-      return res.status(400).json({ error: 'Falta sessionToken o userId' });
+    const { sessionToken } = req.query as any;
+    // El carrito de un usuario solo se puede leer con su propia sesión.
+    const parsedUserId: number | null = req.user?.user_id ?? null;
+    if (!sessionToken && !parsedUserId) {
+      return res.status(400).json({ error: 'Falta sessionToken' });
     }
-
-    const parsedUserId = userId && userId !== 'undefined' && !isNaN(parseInt(userId)) ? parseInt(userId) : null;
 
     let cartRes;
     if (parsedUserId) {
@@ -7757,20 +6150,24 @@ app.post('/api/create-payment-intent', async (req: any, res: any) => {
   // from the persisted order so the caller cannot pay a different total. The
   // body `amount` is kept only as a fallback for guest checkout flows that
   // have not yet created the order row. See audit 2026-08-15, finding #1/#46.
+  // El pedido tiene que existir siempre (el frontend lo crea antes de pagar):
+  // ya no hay camino que acepte el importe del cliente.
   let serverAmountCents: number;
   try {
-    const orderRes = await db.execute(sql`SELECT total, user_id, shipping_data FROM orders WHERE id = ${parseIntSafe(orderId)}`);
-    if (orderRes.rows.length === 0) {
-      // Guest pre-order flow: trust body amount but require it to be positive.
-      if (!amount || amount <= 0) return res.status(400).json({ error: 'Importe inválido' });
-      serverAmountCents = Math.round(Number(amount) * 100);
-    } else {
-      const order = orderRes.rows[0] as any;
-      serverAmountCents = Number(order.total) || 0;
-      if (serverAmountCents <= 0) return res.status(400).json({ error: 'Pedido sin importe válido' });
+    const orderRes = await db.execute(sql`SELECT total, user_id, status FROM orders WHERE id = ${parseIntSafe(orderId)}`);
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Pedido no encontrado' });
+    const order = orderRes.rows[0] as any;
+    if (order.user_id && order.user_id !== req.user?.user_id && req.user?.role !== 'admin') {
+      return res.status(404).json({ error: 'Pedido no encontrado' });
     }
+    if (!['pending', 'payment_failed'].includes(order.status)) {
+      return res.status(409).json({ error: 'Este pedido ya no admite pagos' });
+    }
+    serverAmountCents = Number(order.total) || 0;
+    if (serverAmountCents <= 0) return res.status(400).json({ error: 'Pedido sin importe válido' });
   } catch (e: any) {
-    return res.status(500).json({ error: 'Error consultando el pedido: ' + e.message });
+    console.error('[CREATE PI ORDER LOOKUP ERROR]:', e);
+    return res.status(500).json({ error: 'Error consultando el pedido' });
   }
 
   try {
@@ -7782,7 +6179,7 @@ app.post('/api/create-payment-intent', async (req: any, res: any) => {
     }
     const paymentIntent = await client.paymentIntents.create({
       amount: serverAmountCents,
-      currency: (currency || 'eur').toLowerCase(),
+      currency: 'eur',
       metadata,
       receipt_email: customerEmail || undefined,
       payment_method_types: ['card', 'bizum', 'klarna'],
@@ -8298,7 +6695,7 @@ setInterval(() => {
 
 // Admin endpoint for webhook stats (used by the dashboard to surface
 // duplicate events, queue depth, and oldest pending age).
-app.get('/api/admin/stripe-webhook-stats', async (req: any, res: any) => {
+app.get('/api/admin/stripe-webhook-stats', requireAdmin, async (req: any, res: any) => {
   try {
     const stats = await stripeWebhookStats();
     res.json(stats);
@@ -8330,7 +6727,7 @@ app.get('/api/email/track-open', async (req: any, res: any) => {
 });
 
 // Admin endpoint for email stats.
-app.get('/api/admin/email-stats', async (req: any, res: any) => {
+app.get('/api/admin/email-stats', requireAdmin, async (req: any, res: any) => {
   try {
     const stats = await emailStats();
     res.json(stats);
@@ -8348,8 +6745,13 @@ app.get('/api/checkout-session', async (req: any, res: any) => {
   if (!orderId) return res.status(400).json({ error: 'Missing orderId' });
 
   try {
-    const oRes = await db.execute(sql`SELECT payment_id FROM orders WHERE id = ${parseInt(orderId)}`);
+    const oRes = await db.execute(sql`SELECT payment_id, user_id FROM orders WHERE id = ${parseIntSafe(orderId)}`);
     if (oRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const owner = (oRes.rows[0] as any).user_id;
+    // Solo el dueño del pedido (o un admin) puede obtener el client_secret.
+    if (!req.user || (owner !== req.user.user_id && req.user.role !== 'admin')) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
     
     const paymentId = oRes.rows[0].payment_id;
     if (!paymentId) return res.status(400).json({ error: 'No payment session for this order' });

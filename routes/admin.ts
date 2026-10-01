@@ -74,15 +74,6 @@ adminRouter.get('/admin/disk-usage', requireAdmin, async (_req: any, res: any) =
   }
 });
 
-// POST /api/admin/docker-prune
-adminRouter.post('/admin/docker-prune', requireAdmin, async (_req: any, res: any) => {
-  try {
-    const output = execSync('docker system prune -af --volumes').toString();
-    res.json({ success: true, output });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // GET /api/admin/dashboard-stats
 adminRouter.get('/admin/dashboard-stats', requireAdmin, async (_req: any, res: any) => {

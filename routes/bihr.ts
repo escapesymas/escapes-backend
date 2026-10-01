@@ -1,11 +1,15 @@
 import { Router } from 'express';
 import { getLiveStockLevel, getLiveStockValue, checkProductsInfo, createBihrOrder } from '../bihrService.js';
 import { syncBihrStock, lastBihrStockSync } from '../lib/bihr-stock-sync.js';
+import { requireAdmin } from '../utils.js';
 
 export const bihrRouter = Router();
 
+// Todas las rutas de Bihr tocan la cuenta de proveedor de la tienda (stock en
+// vivo, pedidos dropshipping, sincronizaciones): solo administradores.
+
 // GET /api/bihr/stock
-bihrRouter.get('/bihr/stock', async (req: any, res: any) => {
+bihrRouter.get('/bihr/stock', requireAdmin, async (req: any, res: any) => {
   try {
     const sku = req.query.sku as string;
     if (!sku) return res.status(400).json({ error: 'Falta SKU' });
@@ -17,7 +21,7 @@ bihrRouter.get('/bihr/stock', async (req: any, res: any) => {
 });
 
 // POST /api/bihr/check-stock
-bihrRouter.post('/bihr/check-stock', async (req: any, res: any) => {
+bihrRouter.post('/bihr/check-stock', requireAdmin, async (req: any, res: any) => {
   try {
     const { skus } = req.body;
     if (!Array.isArray(skus)) return res.status(400).json({ error: 'skus debe ser un array' });
@@ -30,7 +34,7 @@ bihrRouter.post('/bihr/check-stock', async (req: any, res: any) => {
 });
 
 // POST /api/bihr/order
-bihrRouter.post('/bihr/order', async (req: any, res: any) => {
+bihrRouter.post('/bihr/order', requireAdmin, async (req: any, res: any) => {
   try {
     const { orderId, items, shippingData } = req.body;
     const bihrOrder = await createBihrOrder({
@@ -58,7 +62,7 @@ bihrRouter.post('/bihr/order', async (req: any, res: any) => {
 });
 
 // POST /api/admin/sync-bihr-stock
-bihrRouter.post('/admin/sync-bihr-stock', async (_req: any, res: any) => {
+bihrRouter.post('/admin/sync-bihr-stock', requireAdmin, async (_req: any, res: any) => {
   try {
     syncBihrStock().catch(e => console.error('[BIHR STOCK SYNC ROUTE ERROR]', e));
     return res.json({ message: 'Sincronización de stock Bihr iniciada en segundo plano' });
@@ -68,6 +72,6 @@ bihrRouter.post('/admin/sync-bihr-stock', async (_req: any, res: any) => {
 });
 
 // GET /api/admin/sync-bihr-stock/status
-bihrRouter.get('/admin/sync-bihr-stock/status', async (_req: any, res: any) => {
+bihrRouter.get('/admin/sync-bihr-stock/status', requireAdmin, async (_req: any, res: any) => {
   return res.json(lastBihrStockSync() || { status: 'idle' });
 });

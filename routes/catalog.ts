@@ -9,11 +9,17 @@ import sharp from 'sharp';
 import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
 import { getLiveStockValue } from '../bihrService.js';
+import { findCompatibleSkus } from '../lib/compat.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const catalogRouter = Router();
+
+// Columnas necesarias para pintar una tarjeta de producto en listados. Evita
+// enviar descripción HTML, atributos y compatibilidades (cientos de KB por
+// producto en algunos casos: la sección de compatibles llegaba a 17 MB).
+const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, stock, images, category_id, status, brand, dropshipping, ondemand`;
 
 const OPTIMIZED_DIR = path.join(process.cwd(), 'uploads', 'optimized');
 
@@ -184,14 +190,6 @@ function getCatalogData() {
   return catalogDataCache;
 }
 
-function cleanModelName(m: any): string {
-  return String(m || '')
-    .replace(/\(.*\)/g, '')
-    .replace(/\b(abs|cbs|dx|sx|sp|se|rr|r|i|ie|fi|euro\s*\d)\b/gi, '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ');
-}
 
 function parseTitleYears(title: string): [number, number] | null {
   let match = title.match(/\b(20\d{2})[-–](20\d{2})\b/);
@@ -216,79 +214,12 @@ function parseTitleYears(title: string): [number, number] | null {
   return null;
 }
 
-// Índice en memoria para la columna compatibility JSONB y rangos de título en PostgreSQL
-let dbCompatibilityIndex: Map<string, Set<string>> | null = null;
-let lastIndexBuildTime = 0;
-let isBuildingIndex = false;
-
-async function getDbCompatibilityIndex(): Promise<Map<string, Set<string>>> {
-  const now = Date.now();
-  if (dbCompatibilityIndex && (now - lastIndexBuildTime < 30 * 60 * 1000)) {
-    return dbCompatibilityIndex;
-  }
-  if (isBuildingIndex && dbCompatibilityIndex) {
-    return dbCompatibilityIndex;
-  }
-
-  isBuildingIndex = true;
-  const newIndex = new Map<string, Set<string>>();
-
-  try {
-    const res = await db.execute(sql`
-      SELECT sku, compatibility FROM products 
-      WHERE status = 'published' AND compatibility IS NOT NULL AND compatibility != '[]'
-    `);
-
-    for (const row of res.rows as any[]) {
-      if (!row.sku || !row.compatibility) continue;
-
-      let list: any[] = [];
-      if (typeof row.compatibility === 'string') {
-        try { list = JSON.parse(row.compatibility); } catch {}
-      } else if (Array.isArray(row.compatibility)) {
-        list = row.compatibility;
-      }
-
-      for (const item of list) {
-        if (!item.brand || !item.model) continue;
-        const b = String(item.brand).trim().toLowerCase();
-        const mClean = cleanModelName(item.model);
-        const mRaw = String(item.model).replace(/\(.*\)/g, '').trim().toLowerCase();
-        const y = item.year ? String(item.year).trim() : '';
-
-        if (y) {
-          const k1 = `${b}::${mClean}::${y}`;
-          if (!newIndex.has(k1)) newIndex.set(k1, new Set());
-          newIndex.get(k1)!.add(row.sku);
-
-          if (mRaw !== mClean) {
-            const k1raw = `${b}::${mRaw}::${y}`;
-            if (!newIndex.has(k1raw)) newIndex.set(k1raw, new Set());
-            newIndex.get(k1raw)!.add(row.sku);
-          }
-        }
-        const k2 = `${b}::${mClean}`;
-        if (!newIndex.has(k2)) newIndex.set(k2, new Set());
-        newIndex.get(k2)!.add(row.sku);
-      }
-    }
-
-    dbCompatibilityIndex = newIndex;
-    lastIndexBuildTime = now;
-  } catch (e) {
-    console.error('[COMPATIBILITY INDEX BUILD ERROR]:', e);
-  } finally {
-    isBuildingIndex = false;
-  }
-
-  return dbCompatibilityIndex || newIndex;
-}
 
 // GET /api/vehicles
 catalogRouter.get('/vehicles', async (req, res) => {
   const { action, brand, model, year } = req.query as any;
   try {
-    const redisKey = `cache:vehicles:v5:${action || ''}:${brand || ''}:${model || ''}:${year || ''}`;
+    const redisKey = `cache:vehicles:v6:${action || ''}:${brand || ''}:${model || ''}:${year || ''}`;
     const cached = await cacheGet<any>(redisKey);
     if (cached) return res.json(cached);
 
@@ -305,32 +236,12 @@ catalogRouter.get('/vehicles', async (req, res) => {
     } else if (action === 'compatible-skus') {
       const skusSet = new Set<string>();
 
-      // 1. SKUs desde el índice en memoria de productos en PostgreSQL (coincidencia exacta por marca, modelo y año)
+      // 1. SKUs compatibles según products.compatibility (consulta indexada, ver lib/compat.ts)
       if (brand && model) {
         try {
-          const indexMap = await getDbCompatibilityIndex();
-          const bLower = (brand || '').trim().toLowerCase();
-          const mLower = cleanModelName(model);
-          const mClean = mLower.replace(/\d+/g, '').trim(); // ej: 'pcx'
-          const yStr = year ? String(year).trim() : '';
-
-          const keysToTry: string[] = [];
-          if (yStr) {
-            keysToTry.push(`${bLower}::${mLower}::${yStr}`);
-            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}::${yStr}`);
-          } else {
-            keysToTry.push(`${bLower}::${mLower}`);
-            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}`);
-          }
-
-          for (const key of keysToTry) {
-            const matchedSkus = indexMap.get(key);
-            if (matchedSkus) {
-              matchedSkus.forEach((sku) => skusSet.add(sku));
-            }
-          }
+          (await findCompatibleSkus(brand, model, year)).forEach((sku) => skusSet.add(sku));
         } catch (e) {
-          console.error('Error fetching indexed DB compatibility:', e);
+          console.error('Error fetching DB compatibility:', e);
         }
       }
 
@@ -392,8 +303,9 @@ catalogRouter.get('/vehicles', async (req, res) => {
         } catch (e) {}
       }
 
+      responseData = Array.from(skusSet);
     } else if (action === 'compatible-products') {
-      const prodRedisKey = `compat:prod:v5:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+      const prodRedisKey = `compat:prod:v6:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
       const cachedProducts = await cacheGet<any[]>(prodRedisKey);
       if (cachedProducts) {
         return res.json(cachedProducts);
@@ -401,32 +313,12 @@ catalogRouter.get('/vehicles', async (req, res) => {
 
       const skusSet = new Set<string>();
 
-      // 1. SKUs desde el índice en memoria de productos en PostgreSQL
+      // 1. SKUs compatibles según products.compatibility (consulta indexada, ver lib/compat.ts)
       if (brand && model) {
         try {
-          const indexMap = await getDbCompatibilityIndex();
-          const bLower = (brand || '').trim().toLowerCase();
-          const mLower = cleanModelName(model);
-          const mClean = mLower.replace(/\d+/g, '').trim();
-          const yStr = year ? String(year).trim() : '';
-
-          const keysToTry: string[] = [];
-          if (yStr) {
-            keysToTry.push(`${bLower}::${mLower}::${yStr}`);
-            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}::${yStr}`);
-          } else {
-            keysToTry.push(`${bLower}::${mLower}`);
-            if (mClean && mClean !== mLower) keysToTry.push(`${bLower}::${mClean}`);
-          }
-
-          for (const key of keysToTry) {
-            const matchedSkus = indexMap.get(key);
-            if (matchedSkus) {
-              matchedSkus.forEach((sku) => skusSet.add(sku));
-            }
-          }
+          (await findCompatibleSkus(brand, model, year)).forEach((sku) => skusSet.add(sku));
         } catch (e) {
-          console.error('Error fetching indexed DB compatibility:', e);
+          console.error('Error fetching DB compatibility:', e);
         }
       }
 
@@ -495,7 +387,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
       }
 
       const productsRes = await pool.query(
-        `SELECT * FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
+        `SELECT ${PRODUCT_CARD_COLUMNS} FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
         [skusList]
       );
       const products = productsRes.rows.map(mapProductToFrontend);
