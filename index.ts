@@ -5712,12 +5712,10 @@ app.get('/api/orders/my-orders', requireAuth, async (req: any, res: any) => {
 
 app.post('/api/orders/finalize', async (req: any, res: any) => {
   try {
-    // Auth required: caller must own the order. Previously this endpoint
-    // accepted an arbitrary `status` from the body and applied it to any
-    // orderId, letting an attacker mark other users' orders as 'completed'
-    // and trigger stock decrements. See audit 2026-08-15, finding #28/#46.
-    const auth = authenticateRequest(req);
-    if (!auth) return res.status(401).json({ error: 'No autenticado' });
+    // No exige sesión: los invitados también pagan, y la autoridad es Stripe
+    // (el PaymentIntent tiene que estar cobrado, apuntar a este pedido y por
+    // el mismo importe). El estado nunca se toma del body.
+    const auth = req.user || null;
 
     const { orderId, paymentId } = req.body;
     if (!orderId) return res.status(400).json({ error: 'Falta orderId' });
@@ -5735,7 +5733,7 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
     if (!ownerRes.rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
     const ownerId = (ownerRes.rows[0] as any).user_id;
     const expectedCents = Number((ownerRes.rows[0] as any).total) || 0;
-    if (ownerId !== auth.user_id && auth.role !== 'admin') {
+    if (ownerId && auth && ownerId !== auth.user_id && auth.role !== 'admin') {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
@@ -5806,7 +5804,7 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
       await cacheBust('cache:filters');
     }
 
-    res.json({ success: true });
+    res.json({ success: true, orderId: parsedOrderId, alreadyProcessed: !transitioned });
   } catch (err: any) {
     console.error('[ORDER FINALIZE ERROR]:', err);
     res.status(500).json({ error: err.message });
