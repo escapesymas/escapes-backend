@@ -19,6 +19,7 @@
 import fs from 'fs';
 import path from 'path';
 import { pool } from '../db.js';
+import { applyTyreAttributes } from './tyres.js';
 
 export interface BihrRefLite {
   productCode: string;
@@ -27,7 +28,7 @@ export interface BihrRefLite {
   color?: string;
 }
 
-interface CsvInfo {
+export interface CsvInfo {
   nameEn: string;
   /** Nombre en español (columna Designation) */
   nameEs: string;
@@ -60,6 +61,10 @@ const FILTER_ATTRS = [
   'Homologación', 'Composición', 'Tipo de cierre', 'Estilo de casco', 'Modelo de casco',
   'Estilo de pintura', 'Acabado de la pintura', 'Colección', 'Uso', 'Gama',
   'Tipo de pieza de repuesto', 'Color de la lente', 'Interior desmontable',
+  // Neumáticos (medida y ficha técnica; ver lib/tyres.ts)
+  'Anchura del neumático', 'Altura del neumático (perfil)', 'Diámetro de la llanta', 'Posición',
+  'Estructura de neumático', 'Índice de carga del neumático (IC)', 'Índice de velocidad (CV)',
+  'Sin cámara o tipo de cámara', 'Categoría de neumático',
 ];
 
 export function normalizeVariantOptions(raw: Record<string, string | undefined>): Record<string, string> {
@@ -533,6 +538,8 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   console.log(`[ENRICH] ${categorized} productos colocados en su categoría`);
   const nb = await classifyByNeighbours();
   console.log(`[ENRICH] ${nb.classified} clasificados por similitud; ${nb.pending} pendientes de revisión manual`);
+  const ty = await applyTyreAttributes(csvIndex);
+  console.log(`[ENRICH] Neumáticos: ${ty.sized}/${ty.tyres} con medida, ${ty.updated} actualizados`);
   // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.
   await pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY catalog_words').catch((e) =>
     console.error('[ENRICH] No se pudo refrescar catalog_words:', e.message));

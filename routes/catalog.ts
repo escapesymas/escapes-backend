@@ -10,6 +10,7 @@ import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
 import { getLiveStockValue } from '../bihrService.js';
 import { findCompatibleSkus } from '../lib/compat.js';
+import { tyreOptions } from '../lib/tyres.js';
 import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -129,6 +130,12 @@ const PUBLIC_ATTRIBUTES: Record<string, string> = {
   Colección: 'Colección',
   Uso: 'Uso',
   Gama: 'Gama',
+  // Neumáticos
+  'Categoría de neumático': 'Tipo de neumático',
+  'Estructura de neumático': 'Estructura',
+  'Índice de carga del neumático (IC)': 'Índice de carga',
+  'Índice de velocidad (CV)': 'Índice de velocidad',
+  'Sin cámara o tipo de cámara': 'Montaje',
 };
 
 function rawAttributes(raw: any): Record<string, any> {
@@ -658,6 +665,26 @@ catalogRouter.get('/catalog/products', async (req, res) => {
 
 // GET /api/catalog/filters
 // Mismos parámetros que /catalog/products; recuentos por modelo.
+// GET /api/catalog/tyres/options — buscador de neumáticos por medida y tipo.
+catalogRouter.get('/catalog/tyres/options', async (req, res) => {
+  try {
+    const str = (v: unknown) => (typeof v === 'string' ? v.trim().slice(0, 20) : '') || undefined;
+    const categoryId = parseInt(String(req.query.category_id || ''), 10);
+    const posicion = str(req.query.posicion);
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json(await tyreOptions({
+      categoryId: Number.isFinite(categoryId) && categoryId > 0 ? categoryId : null,
+      ancho: str(req.query.ancho),
+      perfil: str(req.query.perfil),
+      llanta: str(req.query.llanta),
+      posicion: posicion === 'Delantero' || posicion === 'Trasero' ? posicion : undefined,
+    }));
+  } catch (err: any) {
+    console.error('[TYRE OPTIONS ERROR]:', err.message);
+    res.status(500).json({ error: 'No se pudieron cargar las medidas' });
+  }
+});
+
 catalogRouter.get('/catalog/filters', async (req, res) => {
   try {
     const query = req.query as any;
