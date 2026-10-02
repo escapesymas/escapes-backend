@@ -14,6 +14,7 @@
  */
 
 import Stripe from 'stripe';
+import { taxInTotal } from './tax.js';
 import { pool, db } from '../db.js';
 import { sql } from 'drizzle-orm';
 import { processStripeEvent } from './stripe-webhook.js';
@@ -112,7 +113,9 @@ async function getOrCreateInvoice(orderId: number): Promise<any> {
   }
 
   const subtotal = order.subtotal || order.total || 0;
-  const taxAmount = Math.round((order.total || 0) * 21 / 121);
+  const taxAmount = order.tax_amount != null
+    ? Number(order.tax_amount)
+    : taxInTotal(order.total || 0, order.tax_rate != null ? Number(order.tax_rate) : 21);
   const invIns = await db.execute(sql`
     INSERT INTO invoices (order_id, invoice_number, subtotal, tax_amount, shipping_cost, discount_amount, total)
     VALUES (${orderId}, ${invoiceNumber}, ${subtotal}, ${taxAmount}, ${order.shipping_cost || 0}, ${order.discount_amount || 0}, ${order.total || 0})

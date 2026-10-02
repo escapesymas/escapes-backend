@@ -526,6 +526,23 @@ export function loadBihrApiRefs(jsonPath: string): BihrRefLite[] {
     .map((p) => ({ productCode: String(p.ProductCode), partNumber: String(p.NewPartNumber), size: p.Size, color: p.Color }));
 }
 
+/**
+ * Productos publicados en una categoría desactivada (categories.status <> 'active',
+ * p. ej. Ciclismo) se archivan: el importador da de alta los nuevos como publicados.
+ */
+export async function archiveInInactiveCategories(): Promise<number> {
+  const r = await pool.query(`
+    UPDATE products p SET status = 'archived', updated_at = NOW()
+    WHERE p.status = 'published'
+      AND EXISTS (SELECT 1 FROM categories c
+                  WHERE c.status <> 'active'
+                    -- El árbol antiguo (old-*) está inactivo pero aún aloja productos
+                    -- pendientes de recolocar: esos no se tocan.
+                    AND c.slug NOT LIKE 'old-%'
+                    AND c.id IN (p.category_id, p.category2_id, p.category3_id))`);
+  return r.rowCount || 0;
+}
+
 export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<EnrichStats> {
   const refs = loadBihrApiRefs(jsonPath);
   const csvIndex = loadCsvIndex(csvDir);
@@ -538,6 +555,8 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   console.log(`[ENRICH] ${categorized} productos colocados en su categoría`);
   const nb = await classifyByNeighbours();
   console.log(`[ENRICH] ${nb.classified} clasificados por similitud; ${nb.pending} pendientes de revisión manual`);
+  const hidden = await archiveInInactiveCategories();
+  if (hidden) console.log(`[ENRICH] ${hidden} productos archivados por estar en categorías desactivadas (p. ej. Ciclismo)`);
   const ty = await applyTyreAttributes(csvIndex);
   console.log(`[ENRICH] Neumáticos y cámaras: ${ty.sized}/${ty.tyres + ty.tubes} con medida, ${ty.updated} actualizados`);
   // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.

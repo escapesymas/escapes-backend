@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { taxInTotal } from '../lib/tax.js';
 import { db } from '../db.js';
 import { sql } from 'drizzle-orm';
 import fs from 'fs';
@@ -49,7 +50,11 @@ export async function createInvoiceForOrder(orderId: number) {
     await db.execute(sql`UPDATE orders SET cost_total = ${calculatedCostTotal} WHERE id = ${orderId}`);
   }
 
-  const taxAmount = Math.round(totalCents * 21 / 121);
+  // Impuesto del destino guardado en el pedido (0 % en Canarias, Ceuta y Melilla);
+  // los pedidos anteriores a la migración 010 no lo tienen y llevan IVA 21 %.
+  const taxRate = order.tax_rate != null ? Number(order.tax_rate) : 21;
+  const taxAmount = order.tax_amount != null ? Number(order.tax_amount) : taxInTotal(totalCents, taxRate);
+  const taxLabel = order.tax_label || `IVA (${taxRate}%)`;
 
   const invoicesDir = path.join(process.cwd(), 'invoices');
   if (!fs.existsSync(invoicesDir)) fs.mkdirSync(invoicesDir, { recursive: true });
@@ -130,8 +135,12 @@ export async function createInvoiceForOrder(orderId: number) {
     if (discountAmount > 0) totalBlock('Descuento:', `-${(discountAmount / 100).toFixed(2)}€`);
     if (shippingCost > 0) totalBlock('Envío:', `${(shippingCost / 100).toFixed(2)}€`);
     totalBlock('Base imponible:', `${((totalCents - taxAmount) / 100).toFixed(2)}€`);
-    totalBlock('IVA (21%):', `${(taxAmount / 100).toFixed(2)}€`);
+    totalBlock(`${taxLabel}:`, `${(taxAmount / 100).toFixed(2)}€`);
     totalBlock('TOTAL:', `${(totalCents / 100).toFixed(2)}€`, true);
+    // Operaciones exentas (Canarias, Ceuta, Melilla): la factura debe indicar el motivo.
+    if (order.tax_note) {
+      doc.fontSize(7).font('Helvetica').fillColor('#555555').text(String(order.tax_note), 50, yPos + 10, { width: 495 });
+    }
 
     doc.fontSize(7).fillColor('#AAAAAA')
       .text('Gracias por tu confianza en Escapes y Más. Esta factura es el documento legal de tu compra.', 50, 760, { align: 'center', width: 495 });

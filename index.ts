@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { taxInTotal } from './lib/tax.js';
 import express from 'express';
 import nodemailer from 'nodemailer';
 import fs from 'fs';
@@ -36,6 +37,7 @@ import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-web
 import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import { quoteOrder } from './lib/order-pricing.js';
 import { isIP } from 'node:net';
 import { catalogRouter } from './routes/catalog.js';
 import { ordersRouter } from './routes/orders.js';
@@ -2233,8 +2235,11 @@ async function createInvoiceForOrder(orderId: number) {
     await db.execute(sql`UPDATE orders SET cost_total = ${calculatedCostTotal} WHERE id = ${orderId}`);
   }
 
-  // IVA 21% inverso del total bruto
-  const taxAmount = Math.round(totalCents * 21 / 121);
+  // Impuesto del destino guardado en el pedido (0 % en Canarias, Ceuta y Melilla);
+  // los pedidos anteriores a la migración 010 no lo tienen y llevan IVA 21 %.
+  const taxRate = order.tax_rate != null ? Number(order.tax_rate) : 21;
+  const taxAmount = order.tax_amount != null ? Number(order.tax_amount) : taxInTotal(totalCents, taxRate);
+  const taxLabel = order.tax_label || `IVA (${taxRate}%)`;
 
   // Generate PDF
   const invoicesDir = path.join(process.cwd(), 'invoices');
@@ -2323,8 +2328,12 @@ async function createInvoiceForOrder(orderId: number) {
     if (discountAmount > 0) totalBlock('Descuento:', `-${(discountAmount / 100).toFixed(2)}€`);
     if (shippingCost > 0) totalBlock('Envío:', `${(shippingCost / 100).toFixed(2)}€`);
     totalBlock('Base imponible:', `${((totalCents - taxAmount) / 100).toFixed(2)}€`);
-    totalBlock('IVA (21%):', `${(taxAmount / 100).toFixed(2)}€`);
+    totalBlock(`${taxLabel}:`, `${(taxAmount / 100).toFixed(2)}€`);
     totalBlock('TOTAL:', `${(totalCents / 100).toFixed(2)}€`, true);
+    // Operaciones exentas (Canarias, Ceuta, Melilla): la factura debe indicar el motivo.
+    if (order.tax_note) {
+      doc.fontSize(7).font('Helvetica').fillColor('#555555').text(String(order.tax_note), 50, yPos + 10, { width: 495 });
+    }
 
     // ── FOOTER ────────────────────────────────────────────────────
     doc.fontSize(7).fillColor('#AAAAAA')
@@ -5484,6 +5493,35 @@ app.post('/api/shipping-estimate', async (req: any, res: any) => {
 // ================================================================
 // PEDIDOS & CHECKOUT CUSTOM (PostgreSQL)
 // ================================================================
+// POST /api/cart/quote — lo que costará el pedido (mismo cálculo que al crearlo).
+app.post('/api/cart/quote', async (req: any, res: any) => {
+  try {
+    const { cart, country, postcode, promoCode } = req.body || {};
+    if (!Array.isArray(cart) || cart.length > 100) return res.status(400).json({ error: 'Carrito inválido' });
+    const lines = cart
+      .map((i: any) => ({ id: parseInt(i?.id), quantity: parseInt(i?.quantity) }))
+      .filter((l: any) => Number.isInteger(l.id) && l.id > 0 && Number.isInteger(l.quantity) && l.quantity >= 1 && l.quantity <= 99);
+    const q = await quoteOrder({ cart: lines, country, postcode, promoCode });
+    res.json({
+      subtotal: q.subtotalCents / 100,
+      discountPercent: q.discountPercent,
+      discount: q.discountCents / 100,
+      shipping: q.shippingCents / 100,
+      tax: q.taxCents / 100,
+      taxRate: q.taxRate,
+      taxLabel: q.taxLabel,
+      taxNote: q.taxNote,
+      total: q.totalCents / 100,
+      promo: q.promo,
+      nextTier: q.nextTier ? { ...q.nextTier, missing: q.nextTier.missingCents / 100 } : null,
+      stockErrors: q.stockErrors,
+    });
+  } catch (err: any) {
+    console.error('[CART QUOTE ERROR]:', err.message);
+    res.status(500).json({ error: 'No se pudo calcular el total' });
+  }
+});
+
 app.post('/api/orders/create', async (req: any, res: any) => {
   try {
     const { cart, shippingData, paymentMethod, promoCode } = req.body;
@@ -5508,161 +5546,26 @@ app.post('/api/orders/create', async (req: any, res: any) => {
       }
     }
 
-    // Calcular total seguro en céntimos consultando los productos en la BD
-    let subtotalCents = 0;
-    const itemsToInsert = [];
-    const stockErrors: any[] = [];
-
-    for (const item of cart) {
-      const pRes = await db.execute(sql`SELECT price, sale_price, stock FROM products WHERE id = ${parseInt(item.id as string)}`);
-      if (pRes.rows.length === 0) return res.status(400).json({ error: `Producto con ID ${item.id} no existe` });
-
-      const dbRow = pRes.rows[0] as any;
-      const dbPrice = dbRow.sale_price || dbRow.price || 0; // en céntimos
-      const reqQty = parseInt(item.quantity as string);
-      subtotalCents += (dbPrice as number) * reqQty;
-
-      const currentStock = typeof dbRow.stock === 'string' ? parseInt(dbRow.stock) : (dbRow.stock || 0);
-      if (currentStock < reqQty) {
-        stockErrors.push({ id: item.id, requested: reqQty, available: currentStock });
-      }
-
-      itemsToInsert.push({
-        productId: parseInt(item.id as string),
-        quantity: reqQty,
-        price: dbPrice
-      });
-    }
-
-    if (stockErrors.length > 0) {
-      console.warn(`[ORDER CREATE] Stock insuficiente:`, stockErrors);
+    // Importes calculados en el servidor (lib/order-pricing.ts, el mismo cálculo
+    // que /api/cart/quote muestra en el carrito), con el impuesto del destino.
+    const quote = await quoteOrder({
+      cart: cart.map((i: any) => ({ id: parseInt(i.id), quantity: parseInt(i.quantity) })),
+      country: shippingData.country || 'ES',
+      postcode: shippingData.postcode || shippingData.zipCode || '',
+      promoCode,
+    }, { redeemCoupon: true });
+    if (quote.missing.length) return res.status(400).json({ error: `Producto con ID ${quote.missing[0]} no existe` });
+    if (quote.stockErrors.length > 0) {
+      console.warn(`[ORDER CREATE] Stock insuficiente:`, quote.stockErrors);
       return res.status(409).json({
         error: 'Stock insuficiente para uno o más productos. Por favor, actualiza tu carrito.',
-        stockErrors
+        stockErrors: quote.stockErrors,
       });
     }
-
-    // Aplicar lógica de Tiers
-    let discountPercent = 0;
-    
-    // ================================================================
-    // LOGICA AVANZADA DE ENVÍOS (ZONAS Y TARIFAS)
-    // ================================================================
-    let shippingCents = 1500; // Fallback 15.00€
+    const itemsToInsert = quote.items;
+    const { subtotalCents, discountCents, shippingCents, totalCents } = quote;
     const subtotalEur = subtotalCents / 100;
-    
-    // Obtener zona y método
-    const reqCountry = shippingData.country || 'ES';
-    const reqZip = shippingData.postcode || shippingData.zipCode || '';
-    const prefix2 = reqZip.substring(0, 2);
-    
-    // Buscar la zona adecuada (intentar match exacto de país+prefijo, luego match de país, luego usar fallback)
-    const zonesRes = await db.execute(sql`SELECT * FROM shipping_zones`);
-    const methodsRes = await db.execute(sql`SELECT * FROM shipping_methods WHERE active = 1`);
-    
-    let matchedZoneId = null;
-    let exactMatch = false;
-    
-    // 1. Match exacto (ej. "ES-07")
-    for (const z of zonesRes.rows) {
-      const regions = z.regions as string[];
-      if (regions && regions.includes(`${reqCountry}-${prefix2}`)) {
-        matchedZoneId = z.id;
-        exactMatch = true;
-        break;
-      }
-    }
-    
-    // 2. Match general de país (ej. "ES" sin más sufijos) si no hubo match exacto
-    if (!exactMatch) {
-      for (const z of zonesRes.rows) {
-        const regions = z.regions as string[];
-        if (regions && regions.includes(reqCountry)) {
-          matchedZoneId = z.id;
-          break;
-        }
-      }
-    }
-    
-    if (matchedZoneId) {
-      // Buscar método de envío asociado
-      const zoneMethods = methodsRes.rows.filter((m: any) => m.zone_id === matchedZoneId);
-      if (zoneMethods.length > 0) {
-        const method = zoneMethods[0] as any;
-        shippingCents = method.cost;
-        if (method.free_shipping_threshold && subtotalEur >= method.free_shipping_threshold) {
-          shippingCents = 0;
-        }
-      }
-    }
-    // ================================================================
-
-    if (subtotalEur >= 500) {
-      discountPercent = 15;
-      shippingCents = 0;
-    } else if (subtotalEur >= 300) {
-      discountPercent = 10;
-      shippingCents = 0;
-    } else if (subtotalEur >= 150) {
-      discountPercent = 5;
-      shippingCents = 0;
-    }
-
-    // Aplicar lógica de Cupones/Promo Codes
-    let promoDiscountPercent = 0;
-    let promoFreeShipping = false;
-    let promoFixedDiscountCents = 0;
-
-    if (promoCode) {
-      const codeUpper = promoCode.trim().toUpperCase();
-      const coupRes = await db.execute(sql`
-        SELECT id FROM coupons WHERE UPPER(code) = ${codeUpper} AND active = 1
-      `);
-      if (coupRes.rows.length > 0) {
-        // Canje atómico: comprobar límite/caducidad e incrementar en una sola
-        // sentencia, para que dos pedidos simultáneos no superen max_uses.
-        const redeemed = await db.execute(sql`
-          UPDATE coupons SET times_used = times_used + 1
-          WHERE id = ${(coupRes.rows[0] as any).id}
-            AND active = 1
-            AND (max_uses IS NULL OR times_used < max_uses)
-            AND (expires_at IS NULL OR expires_at > NOW())
-          RETURNING type, value
-        `);
-        if (redeemed.rows.length > 0) {
-          const c = redeemed.rows[0] as any;
-          if (c.type === 'percent') {
-            promoDiscountPercent = Number(c.value) || 0;
-          } else if (c.type === 'fixed') {
-            promoFixedDiscountCents = Number(c.value) || 0; // en céntimos
-          } else if (c.type === 'free_shipping') {
-            promoFreeShipping = true;
-          }
-        }
-      } else {
-        // Fallbacks legacy
-        if (codeUpper === 'WELCOME10') {
-          promoDiscountPercent = 10;
-        } else if (codeUpper === 'RIDER20') {
-          promoDiscountPercent = 20;
-        } else if (codeUpper === 'ENVIOFREE') {
-          promoFreeShipping = true;
-        }
-      }
-    }
-
-    // Los descuentos acumulados nunca superan el subtotal.
-    const totalDiscountPercent = Math.min(100, Math.max(0, discountPercent + promoDiscountPercent));
-    const discountCents = Math.min(
-      subtotalCents,
-      Math.round((subtotalCents * totalDiscountPercent) / 100) + Math.max(0, promoFixedDiscountCents)
-    );
-    
-    if (promoFreeShipping) {
-      shippingCents = 0;
-    }
-
-    const totalCents = Math.max(0, subtotalCents + shippingCents - discountCents);
+    const totalDiscountPercent = quote.discountPercent;
 
     // Enriquecer shippingData con una traza financiera auditada de doble entrada
     const enrichedShippingData = {
@@ -5673,6 +5576,9 @@ app.post('/api/orders/create', async (req: any, res: any) => {
         discountAmount: discountCents / 100,
         shippingCost: shippingCents / 100,
         total: totalCents / 100,
+        taxRate: quote.taxRate,
+        taxLabel: quote.taxLabel,
+        tax: quote.taxCents / 100,
         promoCode: promoCode || null,
         timestamp: new Date().toISOString()
       }
@@ -5701,9 +5607,11 @@ app.post('/api/orders/create', async (req: any, res: any) => {
     try {
       await txClient.query('BEGIN');
       const orderInsert = await txClient.query(
-        `INSERT INTO orders (user_id, total, status, shipping_data, subtotal, discount_amount, shipping_cost, promo_code)
-         VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7) RETURNING id`,
-        [dbUserId, totalCents, shippingJson, subtotalCents, discountCents, shippingCents, upperPromo]
+        `INSERT INTO orders (user_id, total, status, shipping_data, subtotal, discount_amount, shipping_cost, promo_code,
+                             tax_rate, tax_amount, tax_label, tax_note)
+         VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+        [dbUserId, totalCents, shippingJson, subtotalCents, discountCents, shippingCents, upperPromo,
+         quote.taxRate, quote.taxCents, quote.taxLabel, quote.taxNote]
       );
       newOrderId = orderInsert.rows[0].id;
       for (const item of itemsToInsert) {
@@ -5726,7 +5634,9 @@ app.post('/api/orders/create', async (req: any, res: any) => {
       total: totalCents / 100, // en euros
       subtotal: subtotalEur,
       discount: discountCents / 100,
-      shipping: shippingCents / 100
+      shipping: shippingCents / 100,
+      tax: quote.taxCents / 100,
+      taxLabel: quote.taxLabel,
     });
   } catch (err: any) {
     console.error('[ORDER CREATE ERROR]:', err);
