@@ -4794,7 +4794,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           // salvo que se pida volver al precio automático (priceAuto).
           b.priceAuto === true
             ? sql`price_manual = FALSE`
-            : sql`price_manual = (price_manual OR price IS DISTINCT FROM ${priceInCents})`,
+            : sql`price_manual = (price_manual OR price IS DISTINCT FROM ${priceInCents} OR COALESCE(sale_price, 0) IS DISTINCT FROM COALESCE(${saleCents}, 0))`,
           sql`sale_price = ${saleCents}`,
           sql`stock = ${stock}`,
           sql`stock_status = ${stockStatus}`,

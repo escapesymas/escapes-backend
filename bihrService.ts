@@ -705,8 +705,10 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             brand = EXCLUDED.brand,
             supplier_code = EXCLUDED.supplier_code,
             old_part_number = EXCLUDED.old_part_number,
-            -- Coste (catálogo Prices) y precio (lib/pricing.ts) no se pisan aquí.
+            -- price es el PVP de Bihr (salvo precio manual); el coste llega con el
+            -- catálogo Prices y el precio de venta (sale_price) lo pone lib/pricing.ts.
             pvp = EXCLUDED.pvp,
+            price = CASE WHEN products.price_manual THEN products.price ELSE EXCLUDED.price END,
             stock = EXCLUDED.stock,
             barcode = EXCLUDED.barcode,
             description = EXCLUDED.description,

@@ -21,7 +21,7 @@ export const catalogRouter = Router();
 // Columnas necesarias para pintar una tarjeta de producto en listados. Evita
 // enviar descripción HTML, atributos y compatibilidades (cientos de KB por
 // producto en algunos casos: la sección de compatibles llegaba a 17 MB).
-const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, stock, images, category_id, status, brand, dropshipping, ondemand, family_code, variant_options`;
+const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, promo_id, stock, images, category_id, status, brand, dropshipping, ondemand, family_code, variant_options`;
 
 /** Agrupa filas de tarjeta por modelo: una tarjeta por familia con resumen de variantes. */
 function groupCardsByFamily(rows: any[]): any[] {
@@ -253,6 +253,8 @@ export function mapProductToFrontend(row: any) {
     regularPrice: priceEur,
     sale_price: salePriceEur,
     salePrice: salePriceEur,
+    // price = PVP; sale_price = DTO1 (precio habitual) o el de una promoción activa.
+    onPromotion: !!row.promo_id,
     stock: typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0),
     inStock: (typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0)) > 0,
     brand: row.brand || '',
