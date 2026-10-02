@@ -67,7 +67,7 @@ export function priceFor(pvpCents: number, costCents: number, rule: { discount: 
 
 export interface RepriceStats {
   candidates: number; changed: number; down: number; up: number;
-  avgOld: number; avgNew: number; avgMarginNew: number; belowPvp: number;
+  avgOld: number; avgNew: number; avgMarginNew: number; belowPvp: number; abovePvp: number;
   sample: { sku: string; name: string; old: number; new: number; pvp: number }[];
 }
 
@@ -82,7 +82,7 @@ export async function repriceProducts(opts: { dryRun?: boolean } = {}): Promise<
     FROM products
     WHERE status IN ('published', 'draft') AND NOT price_manual AND pvp > 0 AND cost > 0`);
   const ids: number[] = []; const pvps: number[] = []; const dto1s: number[] = []; const sales: (number | null)[] = [];
-  let sumOld = 0, sumNew = 0, sumMargin = 0, down = 0, up = 0, belowPvp = 0;
+  let sumOld = 0, sumNew = 0, sumMargin = 0, down = 0, up = 0, belowPvp = 0, abovePvp = 0;
   const sample: RepriceStats['sample'] = [];
   for (const p of res.rows as any[]) {
     const pvp = Number(p.pvp);
@@ -90,15 +90,20 @@ export async function repriceProducts(opts: { dryRun?: boolean } = {}): Promise<
     // Lo que paga hoy y lo que pagará: el precio de oferta si es menor que el PVP.
     const eff = (promo: number, sale: number, price: number) => promo > 0 ? promo : sale > 0 && sale < price ? sale : price;
     const oldEff = eff(Number(p.promo_price), Number(p.sale_price), Number(p.price));
+    // DTO1 por debajo del PVP: price = PVP (tachado) y sale_price = DTO1. Si ni el
+    // PVP cubre el margen mínimo (marcas sin margen de distribuidor), se vende al
+    // precio mínimo con margen, sin descuento: venderlo a PVP sería perder dinero.
     const sale = dto1 < pvp ? dto1 : null;
+    const listPrice = dto1 < pvp ? pvp : dto1;
     // La promoción activa (promo_price) se mantiene; applyPromotions la revisa después.
-    const newEff = eff(Number(p.promo_price), sale || 0, pvp);
+    const newEff = eff(Number(p.promo_price), sale || 0, listPrice);
     sumOld += oldEff; sumNew += newEff;
     sumMargin += (newEff / VAT - p.cost - (newEff * PAYMENT_FEE_PCT + PAYMENT_FEE_FIXED)) / (newEff / VAT);
     if (newEff < pvp) belowPvp++;
-    const changed = Number(p.price) !== pvp || Number(p.price_dto1) !== dto1 || (Number(p.sale_price) || null) !== (sale || null);
+    if (listPrice > pvp) abovePvp++;
+    const changed = Number(p.price) !== listPrice || Number(p.price_dto1) !== dto1 || (Number(p.sale_price) || null) !== (sale || null);
     if (changed) {
-      ids.push(p.id); pvps.push(pvp); dto1s.push(dto1); sales.push(sale);
+      ids.push(p.id); pvps.push(listPrice); dto1s.push(dto1); sales.push(sale);
       if (newEff < oldEff) down++; else if (newEff > oldEff) up++;
       if (sample.length < 12 && Math.abs(newEff - oldEff) > oldEff * 0.1) {
         sample.push({ sku: p.sku, name: String(p.name).slice(0, 80), old: oldEff / 100, new: newEff / 100, pvp: pvp / 100 });
@@ -119,7 +124,7 @@ export async function repriceProducts(opts: { dryRun?: boolean } = {}): Promise<
   return {
     candidates: res.rows.length, changed: ids.length, down, up,
     avgOld: Math.round(sumOld / n) / 100, avgNew: Math.round(sumNew / n) / 100,
-    avgMarginNew: Math.round((sumMargin / n) * 1000) / 10, belowPvp, sample,
+    avgMarginNew: Math.round((sumMargin / n) * 1000) / 10, belowPvp, abovePvp, sample,
   };
 }
 

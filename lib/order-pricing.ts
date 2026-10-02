@@ -71,7 +71,10 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
   for (const line of input.cart) {
     const row: any = byId.get(line.id);
     if (!row) { missing.push(line.id); continue; }
-    const price = Number(row.promo_price) || Number(row.sale_price) || Number(row.price) || 0;
+    // Lo mismo que muestra la web: promoción, si no la oferta (solo si es menor), si no el precio.
+    const list = Number(row.price) || 0;
+    const sale = Number(row.sale_price) || 0;
+    const price = Number(row.promo_price) || (sale > 0 && sale < list ? sale : list);
     subtotalCents += price * line.quantity;
     if (Number(row.promo_price) > 0) promoCents += price * line.quantity;
     const stock = Number(row.stock) || 0;

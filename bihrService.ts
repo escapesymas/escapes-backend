@@ -708,7 +708,9 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             -- price es el PVP de Bihr (salvo precio manual); el coste llega con el
             -- catálogo Prices y el precio de venta (sale_price) lo pone lib/pricing.ts.
             pvp = EXCLUDED.pvp,
-            price = CASE WHEN products.price_manual THEN products.price ELSE EXCLUDED.price END,
+            -- Si ni el PVP cubre el margen mínimo, se mantiene el precio mínimo (price_dto1).
+            price = CASE WHEN products.price_manual THEN products.price
+                         ELSE GREATEST(EXCLUDED.price, COALESCE(products.price_dto1, 0)) END,
             stock = EXCLUDED.stock,
             barcode = EXCLUDED.barcode,
             description = EXCLUDED.description,
