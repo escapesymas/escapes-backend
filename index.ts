@@ -441,7 +441,19 @@ const pricingRules = pgTable('pricing_rules', {
 // EXPRESS APP
 // ================================================================
 const app: any = express();
-app.set('trust proxy', 1);
+// IP real del cliente: se saltan los proxies propios (Traefik y la red interna de
+// Docker, y el propio VPS cuando el frontend reenvía /api). Con `1` todas las
+// peticiones que llegaban vía escapesymas.com compartían la IP del servidor y,
+// con ella, el mismo cupo del rate limit.
+app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal', '212.227.134.161']);
+app.disable('x-powered-by');
+app.use((_req: any, res: any, next: any) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
 
 const allowedOrigins = isProduction
   ? [
@@ -618,6 +630,10 @@ app.use(express.json({ limit: '10mb' }));
 
 app.use('/api', catalogRouter);
 app.use('/api', ordersRouter);
+// Login, registro y cambios de contraseña: límite estricto por IP (solo cuentan los fallos).
+const AUTH_LIMITED_ACTIONS = new Set(['login', 'register', 'social-login', 'change-password', 'delete-account']);
+app.post('/api/auth', (req: any, res: any, next: any) =>
+  AUTH_LIMITED_ACTIONS.has(String(req.query?.action || '')) ? authLimiter(req, res, next) : next());
 app.use('/api', authRouter);
 app.use('/api', bihrRouter);
 app.use('/api', adminRouter);
@@ -2094,6 +2110,7 @@ const formsLimiter = rateLimit({
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Demasiados intentos. Por favor, espera 15 minutos.' }
