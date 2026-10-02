@@ -23,7 +23,10 @@ function migrationsDir(): string {
     path.resolve(here, '../../migrations'),
     path.resolve(process.cwd(), 'migrations'),
   ];
-  return candidates.find((d) => fs.existsSync(d)) || candidates[0];
+  // dist/migrations existe (tsc compila ahí los .ts antiguos) pero no tiene los
+  // .sql: hay que elegir la carpeta que realmente los contiene.
+  const hasSql = (d: string) => fs.existsSync(d) && fs.readdirSync(d).some((f) => /^\d{3}_.+\.sql$/.test(f));
+  return candidates.find(hasSql) || candidates[0];
 }
 
 export async function runMigrations(): Promise<string[]> {
