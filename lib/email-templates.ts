@@ -274,7 +274,37 @@ export function generic(d: GenericData): RenderedEmail {
   return { subject: d.subject, text, html };
 }
 
+export interface VerifyEmailData {
+  name?: string;
+  url: string;
+}
+
+export function verifyEmail(d: VerifyEmailData): RenderedEmail {
+  const subject = `Confirma tu email en ${BRAND}`;
+  const text = `Hola${d.name ? ` ${d.name}` : ''},
+
+Gracias por registrarte en ${BRAND}. Para activar tu cuenta, confirma tu email abriendo este enlace:
+
+${d.url}
+
+El enlace caduca en 24 horas. Si no has creado tú esta cuenta, ignora este mensaje.
+
+El equipo de ${BRAND}.`;
+  const html = shell(`
+    <h2 style="color:${BRAND_COLOR};margin:0 0 12px">Confirma tu email</h2>
+    <p style="line-height:1.6">Hola${d.name ? ` <strong>${escapeHtml(d.name)}</strong>` : ''},</p>
+    <p style="line-height:1.6">Gracias por registrarte en ${BRAND}. Pulsa el botón para activar tu cuenta:</p>
+    <p style="margin:28px 0;text-align:center">
+      <a href="${escapeHtml(d.url)}" style="display:inline-block;background:${BRAND_COLOR};color:#0f172a;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700">Confirmar mi email</a>
+    </p>
+    <p style="line-height:1.6;color:#94a3b8;font-size:13px">Si el botón no funciona, copia este enlace en el navegador:<br><a href="${escapeHtml(d.url)}" style="color:${BRAND_COLOR};word-break:break-all">${escapeHtml(d.url)}</a></p>
+    <p style="line-height:1.6;color:#94a3b8;font-size:13px">El enlace caduca en 24 horas. Si no has creado tú esta cuenta, ignora este mensaje.</p>
+  `);
+  return { subject, text, html };
+}
+
 type TemplateMap = {
+  'verify-email': VerifyEmailData;
   'order-confirmation': OrderConfirmationData;
   'order-shipped': OrderShippedData;
   'order-cancelled': OrderCancelledData;
@@ -296,6 +326,7 @@ export function renderEmail<K extends keyof TemplateMap>(template: K, data: Temp
     case 'contact-reply':       return contactReply(data as any);
     case 'warranty':            return warranty(data as any);
     case 'generic':             return generic(data as any);
+    case 'verify-email':        return verifyEmail(data as any);
     default: {
       const unknown = (template as string) || 'unknown';
       throw new Error(`Unknown email template: ${unknown}`);
