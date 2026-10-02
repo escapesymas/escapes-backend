@@ -43,7 +43,10 @@ function groupCardsByFamily(rows: any[]): any[] {
       }
       for (const k of Object.keys(options)) options[k] = options[k].map((value) => ({ value })).sort(compareOptionValues).map((x) => x.value);
       const names = list.map((r) => r.name).sort();
-      mapped.name = mapped.title = familyTitle(names[0], names[names.length - 1], rep.name);
+      const freq = new Map<string, number>();
+      for (const n of names) freq.set(n, (freq.get(n) || 0) + 1);
+      const mostCommon = [...freq.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+      mapped.name = mapped.title = familyTitle(names[0], names[names.length - 1], rep.name, mostCommon);
       mapped.family = {
         code, variantCount: list.length,
         priceMin: Math.min(...list.map(eff)) / 100, priceMax: Math.max(...list.map(eff)) / 100,
@@ -390,7 +393,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
 
       responseData = Array.from(skusSet);
     } else if (action === 'compatible-products') {
-      const prodRedisKey = `compat:prod:v7:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+      const prodRedisKey = `compat:prod:v8:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
       const cachedProducts = await cacheGet<any[]>(prodRedisKey);
       if (cachedProducts) {
         return res.json(cachedProducts);
@@ -527,7 +530,7 @@ catalogRouter.get('/search/suggestions', async (req, res) => {
       const row: any = byId.get(f.rep_id);
       if (!row) return null;
       const m: any = mapProductToFrontend(row);
-      if (f.n > 1) m.name = m.title = familyTitle(f.nmin, f.nmax, row.name);
+      if (f.n > 1) m.name = m.title = familyTitle(f.nmin, f.nmax, row.name, f.nmode);
       return m;
     }).filter(Boolean);
 
@@ -598,7 +601,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     const sort: SortKey = (['relevance', 'price_asc', 'price_desc', 'name_asc', 'newest'] as SortKey[])
       .includes(sortParam as SortKey) ? (sortParam as SortKey) : (query.search || query.q ? 'relevance' : 'relevance');
 
-    const redisKey = cacheKeyFor('cache:products:v3', query);
+    const redisKey = cacheKeyFor('cache:products:v4', query);
     type Payload = { products: any[]; total: number; refs?: number; totalPages: number; fuzzy: boolean; corrected?: string | null };
     const cached = await cacheGet<Payload>(redisKey);
     const send = (data: Payload) => {
@@ -629,7 +632,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
       for (const [k, vals] of Object.entries(f.opts || {})) {
         options[k] = [...(vals as string[])].map((value) => ({ value })).sort(compareOptionValues).map((x) => x.value);
       }
-      const title = f.n > 1 ? familyTitle(f.nmin, f.nmax, row.name) : row.name;
+      const title = f.n > 1 ? familyTitle(f.nmin, f.nmax, row.name, f.nmode) : row.name;
       mapped.title = title;
       mapped.name = title;
       mapped.variantOptions = row.variant_options || null;
@@ -954,9 +957,12 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
           }
         }
         const names = variants.map((v: any) => v.name).sort();
+        const freq = new Map<string, number>();
+        for (const n of names) freq.set(n, (freq.get(n) || 0) + 1);
+        const mostCommon = [...freq.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
         product.family = {
           code: row.family_code,
-          title: familyTitle(names[0], names[names.length - 1], row.name),
+          title: familyTitle(names[0], names[names.length - 1], row.name, mostCommon),
           axes,
           variants: mappedVariants,
         };
