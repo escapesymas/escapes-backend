@@ -120,6 +120,7 @@ async function sendMail(to: string, subject: string, text: string, html?: string
       host: process.env.SMTP_HOST || "smtp.buzondecorreo.com",
       port: parseInt(process.env.SMTP_PORT || "465"),
       secure: true,
+      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
       auth: {
         user: process.env.SMTP_USER || "web@escapesymas.com",
         pass: process.env.SMTP_PASSWORD
@@ -4299,6 +4300,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             host: "smtp.buzondecorreo.com",
             port: 465,
             secure: true,
+            name: process.env.SMTP_HELO_NAME || "escapesymas.com",
             auth: {
               user: process.env.SMTP_USER || "web@escapesymas.com",
               pass: process.env.SMTP_PASSWORD
@@ -6260,6 +6262,7 @@ app.post('/api/contact', formsLimiter, async (req: any, res: any) => {
       host: "smtp.buzondecorreo.com",
       port: 465,
       secure: true,
+      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
       auth: {
         user: process.env.SMTP_USER || "web@escapesymas.com",
         pass: process.env.SMTP_PASSWORD
@@ -6315,6 +6318,7 @@ app.post('/api/warranty', formsLimiter, async (req: any, res: any) => {
       host: 'smtp.buzondecorreo.com',
       port: 465,
       secure: true,
+      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
       auth: {
         user: process.env.SMTP_USER || 'web@escapesymas.com',
         pass: process.env.SMTP_PASSWORD
@@ -6611,6 +6615,7 @@ async function sendShipmentNotificationEmail(orderId: number, email: string, fir
       host: "smtp.buzondecorreo.com",
       port: 465,
       secure: true,
+      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
       auth: {
         user: process.env.SMTP_USER || "web@escapesymas.com",
         pass: process.env.SMTP_PASSWORD
