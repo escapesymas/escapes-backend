@@ -383,7 +383,7 @@ export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page
         FROM base GROUP BY family_code
       ),
       page AS (
-        SELECT f.*, count(*) OVER()::int AS total FROM f
+        SELECT f.*, count(*) OVER()::int AS total, sum(f.n) OVER()::int AS refs FROM f
         ORDER BY ${order}
         LIMIT ${perPage} OFFSET ${offset}
       )
@@ -412,7 +412,9 @@ export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page
     fuzzy = true;
   }
   const total = res.rows[0]?.total || 0;
-  return { rows: res.rows as (FamilyRow & { total: number })[], total, fuzzy, corrected: null as string | null };
+  // Referencias (cada talla/color) además de modelos (tarjetas).
+  const refs = res.rows[0]?.refs || 0;
+  return { rows: res.rows as (FamilyRow & { total: number })[], total, refs, fuzzy, corrected: null as string | null };
 }
 
 /** Facetas: marcas, rango de precio y atributos, con recuento por modelo. */

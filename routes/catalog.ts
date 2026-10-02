@@ -598,11 +598,12 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     const sort: SortKey = (['relevance', 'price_asc', 'price_desc', 'name_asc', 'newest'] as SortKey[])
       .includes(sortParam as SortKey) ? (sortParam as SortKey) : (query.search || query.q ? 'relevance' : 'relevance');
 
-    const redisKey = cacheKeyFor('cache:products:v2', query);
-    type Payload = { products: any[]; total: number; totalPages: number; fuzzy: boolean; corrected?: string | null };
+    const redisKey = cacheKeyFor('cache:products:v3', query);
+    type Payload = { products: any[]; total: number; refs?: number; totalPages: number; fuzzy: boolean; corrected?: string | null };
     const cached = await cacheGet<Payload>(redisKey);
     const send = (data: Payload) => {
-      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages, X-Search-Fuzzy, X-Search-Corrected');
+      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages, X-Total-Refs, X-Search-Fuzzy, X-Search-Corrected');
+      res.setHeader('X-Total-Refs', String(data.refs ?? data.total));
       if (data.corrected) res.setHeader('X-Search-Corrected', encodeURIComponent(data.corrected));
       res.setHeader('X-WP-Total', String(data.total));
       res.setHeader('X-WP-TotalPages', String(data.totalPages));
@@ -612,7 +613,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     if (cached) return send(cached);
 
     const params = parseCatalogParams(query);
-    const { rows, total, fuzzy, corrected } = await listFamilies(params, sort, pageNum, perPage);
+    const { rows, total, refs, fuzzy, corrected } = await listFamilies(params, sort, pageNum, perPage);
 
     const repIds = rows.map((r) => r.rep_id);
     const repRes = repIds.length
@@ -643,7 +644,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
       return mapped;
     }).filter(Boolean);
 
-    const data = { products, total, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy, corrected };
+    const data = { products, total, refs, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy, corrected };
     await cacheSet(redisKey, data, 60);
     return send(data);
   } catch (err: any) {
