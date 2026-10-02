@@ -58,7 +58,7 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
 
   const ids = input.cart.map((l) => l.id);
   const rows = ids.length
-    ? (await pool.query('SELECT id, price, sale_price, stock, promo_id FROM products WHERE id = ANY($1)', [ids])).rows
+    ? (await pool.query('SELECT id, price, sale_price, promo_price, stock FROM products WHERE id = ANY($1)', [ids])).rows
     : [];
   const byId = new Map(rows.map((r: any) => [r.id, r]));
 
@@ -71,9 +71,9 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
   for (const line of input.cart) {
     const row: any = byId.get(line.id);
     if (!row) { missing.push(line.id); continue; }
-    const price = Number(row.sale_price) || Number(row.price) || 0;
+    const price = Number(row.promo_price) || Number(row.sale_price) || Number(row.price) || 0;
     subtotalCents += price * line.quantity;
-    if (row.promo_id) promoCents += price * line.quantity;
+    if (Number(row.promo_price) > 0) promoCents += price * line.quantity;
     const stock = Number(row.stock) || 0;
     if (stock < line.quantity) stockErrors.push({ id: line.id, requested: line.quantity, available: stock });
     items.push({ productId: line.id, quantity: line.quantity, price });

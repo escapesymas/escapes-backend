@@ -9,8 +9,8 @@
  * Nunca sube por encima del PVP salvo que el suelo lo exija (coste muy alto).
  * Los productos con price_manual no se tocan; sin PVP o sin coste, tampoco.
  *
- * Campos: price = PVP (precio tachado), sale_price = DTO1 o el de la promoción
- * activa, price_dto1 = DTO1 (para restaurarlo al acabar la promoción),
+ * Campos: price = PVP (precio tachado), sale_price = DTO1 (precio habitual),
+ * promo_price = precio de la promoción activa, price_dto1 = DTO1 calculado,
  * price_dto2 = mínimo sin pérdidas.
  */
 import { pool } from '../db.js';
@@ -78,7 +78,7 @@ export interface RepriceStats {
 export async function repriceProducts(opts: { dryRun?: boolean } = {}): Promise<RepriceStats> {
   const rules = await loadPricingRules();
   const res = await pool.query(`
-    SELECT id, sku, name, brand, category_id, pvp, cost, price, sale_price, price_dto1, promo_id
+    SELECT id, sku, name, brand, category_id, pvp, cost, price, sale_price, price_dto1, promo_price
     FROM products
     WHERE status IN ('published', 'draft') AND NOT price_manual AND pvp > 0 AND cost > 0`);
   const ids: number[] = []; const pvps: number[] = []; const dto1s: number[] = []; const sales: (number | null)[] = [];
@@ -88,10 +88,11 @@ export async function repriceProducts(opts: { dryRun?: boolean } = {}): Promise<
     const pvp = Number(p.pvp);
     const dto1 = priceFor(pvp, Number(p.cost), ruleFor(rules, p));
     // Lo que paga hoy y lo que pagará: el precio de oferta si es menor que el PVP.
-    const oldEff = Number(p.sale_price) > 0 && Number(p.sale_price) < Number(p.price) ? Number(p.sale_price) : Number(p.price);
-    // En promoción se mantiene su precio de promoción (applyPromotions lo revisa después).
-    const sale = p.promo_id ? Number(p.sale_price) : (dto1 < pvp ? dto1 : null);
-    const newEff = sale && sale < pvp ? sale : pvp;
+    const eff = (promo: number, sale: number, price: number) => promo > 0 ? promo : sale > 0 && sale < price ? sale : price;
+    const oldEff = eff(Number(p.promo_price), Number(p.sale_price), Number(p.price));
+    const sale = dto1 < pvp ? dto1 : null;
+    // La promoción activa (promo_price) se mantiene; applyPromotions la revisa después.
+    const newEff = eff(Number(p.promo_price), sale || 0, pvp);
     sumOld += oldEff; sumNew += newEff;
     sumMargin += (newEff / VAT - p.cost - (newEff * PAYMENT_FEE_PCT + PAYMENT_FEE_FIXED)) / (newEff / VAT);
     if (newEff < pvp) belowPvp++;
@@ -164,10 +165,10 @@ export async function refreshDto2(): Promise<number> {
 }
 
 /**
- * Aplica las promociones activas: sale_price = DTO2 (o DTO1 − %, sin bajar de
- * DTO2) en los productos de su ámbito; si un producto está en varias, gana el
- * precio más bajo. Los que ya no están en ninguna vuelven a DTO1. Los
- * productos con precio manual no se tocan.
+ * Aplica las promociones activas: promo_price = DTO2 (o DTO1 − %, sin bajar
+ * de DTO2) en los productos de su ámbito; si un producto está en varias, gana
+ * el precio más bajo. Los que ya no están en ninguna pierden promo_price (y
+ * vuelven a su DTO1, que está intacto en sale_price). Precios manuales: no.
  */
 export async function applyPromotions(): Promise<{ applied: number; removed: number }> {
   const client = await pool.connect();
@@ -177,7 +178,7 @@ export async function applyPromotions(): Promise<{ applied: number; removed: num
       CREATE TEMP TABLE promo_target ON COMMIT DROP AS
       SELECT DISTINCT ON (p.id) p.id, a.id AS promo,
              CASE WHEN a.level = 'dto2' THEN p.price_dto2
-                  ELSE GREATEST(p.price_dto2, ROUND(COALESCE(p.price_dto1, p.price) * (1 - a.percent / 100.0))::int) END AS sp
+                  ELSE GREATEST(p.price_dto2, ROUND(COALESCE(NULLIF(p.sale_price, 0), p.price) * (1 - a.percent / 100.0))::int) END AS sp
       FROM products p
       JOIN promotions a ON a.active
         AND NOW() >= COALESCE(a.starts_at, '-infinity') AND NOW() < COALESCE(a.ends_at, 'infinity')
@@ -186,16 +187,14 @@ export async function applyPromotions(): Promise<{ applied: number; removed: num
           OR (a.scope = 'brand' AND lower(p.brand) = lower(trim(a.target)))
           OR (a.scope = 'skus' AND p.sku = ANY (SELECT trim(x) FROM unnest(string_to_array(a.target, ',')) AS x)))
       WHERE p.status = 'published' AND NOT p.price_manual
-        AND p.price_dto2 > 0 AND p.price_dto2 < COALESCE(p.price_dto1, p.price)
+        AND p.price_dto2 > 0 AND p.price_dto2 < COALESCE(NULLIF(p.sale_price, 0), p.price)
       ORDER BY p.id, sp ASC`);
     const applied = await client.query(`
-      UPDATE products p SET sale_price = t.sp, promo_id = t.promo, updated_at = NOW()
+      UPDATE products p SET promo_price = t.sp, promo_id = t.promo, updated_at = NOW()
       FROM promo_target t
-      WHERE p.id = t.id AND (p.sale_price IS DISTINCT FROM t.sp OR p.promo_id IS DISTINCT FROM t.promo)`);
+      WHERE p.id = t.id AND (p.promo_price IS DISTINCT FROM t.sp OR p.promo_id IS DISTINCT FROM t.promo)`);
     const removed = await client.query(`
-      UPDATE products p
-      SET sale_price = CASE WHEN p.price_dto1 > 0 AND p.price_dto1 < p.price THEN p.price_dto1 END,
-          promo_id = NULL, updated_at = NOW()
+      UPDATE products p SET promo_price = NULL, promo_id = NULL, updated_at = NOW()
       WHERE p.promo_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM promo_target t WHERE t.id = p.id)`);
     await client.query('COMMIT');
     return { applied: applied.rowCount || 0, removed: removed.rowCount || 0 };

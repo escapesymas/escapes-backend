@@ -247,7 +247,7 @@ export function buildConditions(params: CatalogParams, opts: { fuzzy?: boolean; 
     q.add(`AND LOWER(p.brand) = ANY(?)`, params.brands.map((b) => b.toLowerCase()));
   }
 
-  const eff = `COALESCE(NULLIF(p.sale_price, 0), p.price)`;
+  const eff = `COALESCE(NULLIF(p.promo_price, 0), NULLIF(p.sale_price, 0), p.price)`;
   if (opts.exclude !== 'price') {
     if (params.minPriceCents != null) q.add(`AND ${eff} >= ?`, params.minPriceCents);
     if (params.maxPriceCents != null) q.add(`AND ${eff} <= ?`, params.maxPriceCents);
@@ -377,7 +377,7 @@ export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page
     const sqlText = `
       WITH base AS (
         SELECT p.id, COALESCE(p.family_code, p.sku) AS family_code, p.name, p.stock, p.created_at,
-               p.variant_options, COALESCE(NULLIF(p.sale_price, 0), p.price) AS eff, ${scoreExpr} AS score
+               p.variant_options, COALESCE(NULLIF(p.promo_price, 0), NULLIF(p.sale_price, 0), p.price) AS eff, ${scoreExpr} AS score
         FROM products p
         WHERE ${cond.text}
       ),
@@ -448,8 +448,8 @@ export async function facets(rawParams: CatalogParams) {
     q(`SELECT p.brand AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
                 FROM products p WHERE ${brandsQ.text} AND p.brand IS NOT NULL AND p.brand <> ''
                 GROUP BY p.brand ORDER BY count DESC, p.brand LIMIT 200`, brandsQ.values, fuzzy),
-    q(`SELECT min(COALESCE(NULLIF(p.sale_price, 0), p.price)) AS min,
-                       max(COALESCE(NULLIF(p.sale_price, 0), p.price)) AS max
+    q(`SELECT min(COALESCE(NULLIF(p.promo_price, 0), NULLIF(p.sale_price, 0), p.price)) AS min,
+                       max(COALESCE(NULLIF(p.promo_price, 0), NULLIF(p.sale_price, 0), p.price)) AS max
                 FROM products p WHERE ${priceQ.text}`, priceQ.values, fuzzy),
     q(`SELECT e.k AS key, e.v AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
                 FROM products p, jsonb_each_text(COALESCE(p.variant_options, '{}'::jsonb)) AS e(k, v)
@@ -507,7 +507,7 @@ export function compareOptionValues(a: { value: string }, b: { value: string }):
 /** Variantes de un modelo (para la ficha de producto). */
 export async function familyVariants(familyCode: string) {
   const res = await pool.query(
-    `SELECT id, sku, name, price, sale_price, stock, variant_options, images
+    `SELECT id, sku, name, price, sale_price, promo_price, promo_id, stock, variant_options, images
      FROM products WHERE family_code = $1 AND status = 'published' AND price > 0
      ORDER BY id LIMIT 300`, [familyCode]);
   return res.rows;
