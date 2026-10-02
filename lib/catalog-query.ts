@@ -299,19 +299,24 @@ export interface FamilyRow {
   any_stock: boolean;
   nmin: string;
   nmax: string;
+  nmode?: string;
   rep_id: number;
   opts: Record<string, string[]> | null;
 }
 
 /** Nombre común de un modelo: prefijo compartido por todas sus variantes. */
-export function familyTitle(nmin: string, nmax: string, fallback: string): string {
+export function familyTitle(nmin: string, nmax: string, fallback: string, mostCommon?: string): string {
   if (!nmin || !nmax || nmin === nmax) return fallback;
+  const reference = (mostCommon || fallback || '').replace(/\s+/g, ' ').trim();
   let i = 0;
   while (i < nmin.length && i < nmax.length && nmin[i] === nmax[i]) i++;
   let prefix = nmin.slice(0, i);
   // Cortar en límite de palabra y quitar separadores y "Talla"/"talla EU" colgando.
   prefix = prefix.replace(/\S*$/, '').replace(/[\s,\-–/(]+$/, '').replace(/\b(talla|size)(\s+eu)?$/i, '').trim();
-  return prefix.length >= 8 ? prefix : fallback;
+  // Si los nombres difieren pronto (doble espacio, palabra cambiada de sitio)
+  // el prefijo común se queda en "Casco modular": mejor el nombre más repetido.
+  if (prefix.length < 8 || prefix.length < reference.length * 0.6) return reference || fallback;
+  return prefix;
 }
 
 /**
@@ -379,6 +384,7 @@ export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page
         SELECT family_code, count(*)::int AS n, min(eff) AS pmin, max(eff) AS pmax,
                bool_or(stock > 0) AS any_stock, max(created_at) AS newest,
                min(name) AS nmin, max(name) AS nmax, max(score) AS score,
+               mode() WITHIN GROUP (ORDER BY name) AS nmode,
                (array_agg(id ORDER BY (stock > 0) DESC, eff ASC, id))[1] AS rep_id
         FROM base GROUP BY family_code
       ),
