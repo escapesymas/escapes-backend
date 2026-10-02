@@ -32,7 +32,7 @@ function groupCardsByFamily(rows: any[]): any[] {
   }
   const out: any[] = [];
   for (const [code, list] of groups) {
-    const eff = (r: any) => (r.promo_price > 0 ? r.promo_price : r.sale_price > 0 ? r.sale_price : r.price);
+    const eff = (r: any) => (r.promo_price > 0 ? r.promo_price : r.sale_price > 0 && r.sale_price < r.price ? r.sale_price : r.price);
     const rep = [...list].sort((a, b) => Number(b.stock > 0) - Number(a.stock > 0) || eff(a) - eff(b))[0];
     const mapped: any = mapProductToFrontend(rep);
     if (list.length > 1) {
