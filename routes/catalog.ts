@@ -55,9 +55,28 @@ function groupCardsByFamily(rows: any[]): any[] {
       };
     }
     mapped.variantOptions = rep.variant_options || null;
-    out.push(mapped);
+    out.push(cardView(mapped));
   }
   return out;
+}
+
+/**
+ * Tarjeta de listado: solo las 4 primeras fotos y en tamaño de tarjeta (400 px vía
+ * proxy o la versión optimizada local). Antes cada tarjeta llevaba todas sus fotos
+ * con 4-5 URL largas cada una (el 79 % del peso de la respuesta) y el original de
+ * 800 px de Bihr como imagen de tarjeta.
+ */
+function cardView(product: any): any {
+  const local = (u?: string) => (u && u.startsWith('/uploads/') ? u : undefined);
+  product.images = (product.images || []).slice(0, 4).map((img: any) => {
+    const card = img.srcMobile || img.src;
+    return {
+      src: card,
+      ...(local(img.srcCardDesktop) ? { srcCardDesktop: img.srcCardDesktop } : {}),
+      ...(local(img.srcCardMobile) ? { srcCardMobile: img.srcCardMobile } : {}),
+    };
+  });
+  return product;
 }
 
 const OPTIMIZED_DIR = path.join(process.cwd(), 'uploads', 'optimized');
@@ -336,7 +355,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
       // 1. SKUs compatibles según products.compatibility (consulta indexada, ver lib/compat.ts)
       if (brand && model) {
         try {
-          (await findCompatibleSkus(brand, model, year)).forEach((sku) => skusSet.add(sku));
+          (await findCompatibleSkus(brand, model, year, 3000)).forEach((sku) => skusSet.add(sku));
         } catch (e) {
           console.error('Error fetching DB compatibility:', e);
         }
@@ -402,7 +421,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
 
       responseData = Array.from(skusSet);
     } else if (action === 'compatible-products') {
-      const prodRedisKey = `compat:prod:v8:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+      const prodRedisKey = `compat:prod:v9:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
       const cachedProducts = await cacheGet<any[]>(prodRedisKey);
       if (cachedProducts) {
         return res.json(cachedProducts);
@@ -413,7 +432,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
       // 1. SKUs compatibles según products.compatibility (consulta indexada, ver lib/compat.ts)
       if (brand && model) {
         try {
-          (await findCompatibleSkus(brand, model, year)).forEach((sku) => skusSet.add(sku));
+          (await findCompatibleSkus(brand, model, year, 3000)).forEach((sku) => skusSet.add(sku));
         } catch (e) {
           console.error('Error fetching DB compatibility:', e);
         }
@@ -477,7 +496,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
         } catch (e) {}
       }
 
-      const skusList = Array.from(skusSet).slice(0, 500);
+      const skusList = Array.from(skusSet).slice(0, 3000);
       if (skusList.length === 0) {
         await cacheSet(prodRedisKey, [], 600);
         return res.json([]);
@@ -510,9 +529,21 @@ catalogRouter.get('/catalog/sitemap-skus', async (req, res) => {
     const offset = (page - 1) * limit;
 
     const result = await db.execute(sql`
-      SELECT sku, updated_at FROM products WHERE status = 'published' ORDER BY id ASC LIMIT ${limit} OFFSET ${offset}
+      SELECT sku, updated_at FROM products WHERE status = 'published' AND price > 0 ORDER BY id ASC LIMIT ${limit} OFFSET ${offset}
     `);
+    res.set('Cache-Control', 'public, max-age=3600');
     res.json(result.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/sitemap-count — cuántos productos entran en el sitemap.
+catalogRouter.get('/catalog/sitemap-count', async (_req, res) => {
+  try {
+    const r = await pool.query(`SELECT count(*)::int AS total FROM products WHERE status = 'published' AND price > 0`);
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json({ total: r.rows[0].total });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -525,7 +556,7 @@ catalogRouter.get('/search/suggestions', async (req, res) => {
     if (q.length < 2) return res.json({ suggestions: [], products: [] });
     const limit = Math.min(Math.max(parseInt(String(req.query.limit), 10) || 6, 1), 10);
 
-    const cacheKey = `cache:suggest:v2:${normalizeText(q)}:${limit}`;
+    const cacheKey = `cache:suggest:v3:${normalizeText(q)}:${limit}`;
     const cached = await cacheGet<any>(cacheKey);
     if (cached) return res.json(cached);
 
@@ -540,7 +571,7 @@ catalogRouter.get('/search/suggestions', async (req, res) => {
       if (!row) return null;
       const m: any = mapProductToFrontend(row);
       if (f.n > 1) m.name = m.title = familyTitle(f.nmin, f.nmax, row.name, f.nmode);
-      return m;
+      return cardView(m);
     }).filter(Boolean);
 
     // Marcas que coinciden con lo escrito, como sugerencia rápida.
@@ -610,7 +641,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     const sort: SortKey = (['relevance', 'price_asc', 'price_desc', 'name_asc', 'newest'] as SortKey[])
       .includes(sortParam as SortKey) ? (sortParam as SortKey) : (query.search || query.q ? 'relevance' : 'relevance');
 
-    const redisKey = cacheKeyFor('cache:products:v4', query);
+    const redisKey = cacheKeyFor('cache:products:v5', query);
     type Payload = { products: any[]; total: number; refs?: number; totalPages: number; fuzzy: boolean; corrected?: string | null };
     const cached = await cacheGet<Payload>(redisKey);
     const send = (data: Payload) => {
@@ -653,7 +684,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
         inStock: f.any_stock,
         options,
       };
-      return mapped;
+      return cardView(mapped);
     }).filter(Boolean);
 
     const data = { products, total, refs, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy, corrected };
