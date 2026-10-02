@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pool } from './db.js';
-import { repriceProducts, pricingAuto } from './lib/pricing.js';
+import { repriceProducts, pricingAuto, refreshDto2, applyPromotions } from './lib/pricing.js';
 import { refreshCompatModels } from './lib/compat.js';
 import { enrichCatalog } from './lib/catalog-enrich.js';
 
@@ -520,6 +520,10 @@ async function processPricesCatalog(catalog: any, catalogType: string, startTime
     console.log(`[BIHR SERVICE]: Precios recalculados: ${stats.changed} cambios (precio medio ${stats.avgOld} → ${stats.avgNew} €).`);
   } else {
     console.log('[BIHR SERVICE]: Recálculo automático de precios desactivado (admin → Márgenes).');
+    // DTO2 (mínimo sin pérdidas) depende solo del coste: se actualiza siempre.
+    const n = await refreshDto2();
+    const promos = await applyPromotions();
+    console.log(`[BIHR SERVICE]: DTO2 actualizado en ${n} productos; promociones: ${promos.applied} aplicadas, ${promos.removed} retiradas.`);
   }
   updateCatalogSyncState({ status: 'completed', catalogType, startTime, endTime: new Date().toISOString(), inserted: 0, updated });
 }
