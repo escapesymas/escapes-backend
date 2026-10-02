@@ -35,7 +35,8 @@ import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats 
 import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-webhook-service.js';
 import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
 import Stripe from 'stripe';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import { isIP } from 'node:net';
 import { catalogRouter } from './routes/catalog.js';
 import { ordersRouter } from './routes/orders.js';
 import { authRouter } from './routes/auth.js';
@@ -447,6 +448,19 @@ const app: any = express();
 // con ella, el mismo cupo del rate limit.
 app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal', '212.227.134.161']);
 app.disable('x-powered-by');
+
+// Las llamadas a /api desde la web pasan por Next (escapesymas.com/api → reescritura
+// → api.escapesymas.com) y Traefik descarta su X-Forwarded-For: llegan con la IP de
+// la red interna. src/proxy.ts del frontend envía la IP del cliente en X-Client-IP;
+// solo se acepta si la petición viene de la red interna (desde fuera, Traefik pone
+// siempre la IP real, así que nadie puede suplantarla).
+const INTERNAL_IP = /^(::ffff:)?(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.)|^::1$/;
+app.use((req: any, _res: any, next: any) => {
+  const forwarded = String(req.headers['x-client-ip'] || '').trim();
+  req.clientIp = INTERNAL_IP.test(req.ip || '') && isIP(forwarded) ? forwarded : req.ip;
+  next();
+});
+const clientKey = (req: any) => ipKeyGenerator(req.clientIp || req.ip || 'unknown');
 app.use((_req: any, res: any, next: any) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -580,7 +594,7 @@ app.use((req: any, res: any, next: any) => {
     return next();
   }
 
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const ip = req.clientIp || req.ip || req.connection.remoteAddress || 'unknown';
 
   checkRateLimit(`global:${ip}`, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS)
     .then(({ allowed, remaining, resetTime }) => {
@@ -2054,6 +2068,7 @@ function getCatalog() {
 // RATE LIMITING
 // ═══════════════════════════════════════════════════════════════════════════════
 const adminLimiter = rateLimit({
+  keyGenerator: clientKey,
   windowMs: 15 * 60 * 1000,
   max: 600,
   standardHeaders: true,
@@ -2062,6 +2077,7 @@ const adminLimiter = rateLimit({
 });
 
 const adminDestructiveLimiter = rateLimit({
+  keyGenerator: clientKey,
   windowMs: 60 * 60 * 1000,
   max: 10,
   standardHeaders: true,
@@ -2074,7 +2090,7 @@ async function logAdminAction(req: any, action: string, details: Record<string, 
     const admin = authenticateRequest(req);
     const adminEmail = admin?.email || 'unknown';
     const adminId = admin?.user_id || null;
-    const ip = req.ip || req.headers?.['x-forwarded-for'] || req.connection?.remoteAddress || '';
+    const ip = req.clientIp || req.ip || req.connection?.remoteAddress || '';
     console.log(`[ADMIN AUDIT] ${new Date().toISOString()} action=${action} admin_email=${adminEmail} admin_id=${adminId} ip=${ip}`, JSON.stringify(details));
   } catch {
     // no-op
@@ -2082,6 +2098,7 @@ async function logAdminAction(req: any, action: string, details: Record<string, 
 }
 
 const catalogLimiter = rateLimit({
+  keyGenerator: clientKey,
   windowMs: 60 * 1000,
   max: 120,
   standardHeaders: true,
@@ -2092,6 +2109,7 @@ const catalogLimiter = rateLimit({
 import { chatHandler, chatHealthHandler } from './chatbot/index.js';
 
 const chatLimiter = rateLimit({
+  keyGenerator: clientKey,
   windowMs: 10 * 60 * 1000,
   max: 30,
   standardHeaders: true,
@@ -2100,6 +2118,7 @@ const chatLimiter = rateLimit({
 });
 
 const formsLimiter = rateLimit({
+  keyGenerator: clientKey,
   windowMs: 15 * 60 * 1000,
   max: 5,
   standardHeaders: true,
@@ -2108,6 +2127,7 @@ const formsLimiter = rateLimit({
 });
 
 const authLimiter = rateLimit({
+  keyGenerator: clientKey,
   windowMs: 15 * 60 * 1000,
   max: 10,
   skipSuccessfulRequests: true,
@@ -5779,7 +5799,7 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
     if (!parsedOrderId) return res.status(400).json({ error: 'orderId inválido' });
 
     if (!paymentId || typeof paymentId !== 'string') {
-      console.warn(`[SECURITY] /api/orders/finalize rejected: missing paymentId. orderId=${orderId} ip=${req.ip}`);
+      console.warn(`[SECURITY] /api/orders/finalize rejected: missing paymentId. orderId=${orderId} ip=${req.clientIp || req.ip}`);
       return res.status(400).json({ error: 'Falta paymentId. La finalización de pedidos requiere verificación con Stripe.' });
     }
 
@@ -6050,7 +6070,7 @@ app.post('/api/cart', async (req: any, res: any) => {
           eventId: `add_to_cart_${safeEmailForTrack}_${itemProductId}_${Date.now()}`,
           userEmail: safeEmailForTrack,
           userAgent: req.headers['user-agent'] as string,
-          clientIp: req.ip,
+          clientIp: req.clientIp || req.ip,
           payload: {
             currency: 'EUR',
             value: cartTotalCents / 100,
