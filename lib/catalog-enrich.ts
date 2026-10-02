@@ -370,7 +370,10 @@ export async function completeFamilies(): Promise<number> {
  * Coloca en su categoría los productos sin subcategoría (p. ej. los que el
  * importador dejaba en la 1 "Cascos" por defecto), usando la categoría de Bihr
  * del CSV y la correspondencia categories.bihr_cat3 / bihr_cat2. Solo usa el
- * árbol vigente (no los slugs old-*) y elige la categoría más profunda.
+ * árbol vigente (no los slugs old-*). Si un código de Bihr corresponde a varias
+ * categorías, gana la MENOS profunda: las de tercer nivel con el mismo código
+ * son duplicados heredados (p. ej. "Cascos integrales" colgando de
+ * "Accesorios y recambios para cascos").
  * Guarda raíz, segundo nivel y hoja en category_id / category2_id / category3_id.
  */
 export async function assignCategories(csvIndex: Map<string, CsvInfo>): Promise<number> {
@@ -393,7 +396,7 @@ export async function assignCategories(csvIndex: Map<string, CsvInfo>): Promise<
   };
   const pick = (map: Map<string, number[]>, key: string) => {
     const ids = (map.get(key) || []).filter(isCurrent);
-    return ids.sort((a, b) => chainOf(b).length - chainOf(a).length)[0];
+    return ids.sort((a, b) => chainOf(a).length - chainOf(b).length || a - b)[0];
   };
   const by3 = new Map<string, number[]>();
   const by2 = new Map<string, number[]>();
@@ -410,8 +413,9 @@ export async function assignCategories(csvIndex: Map<string, CsvInfo>): Promise<
   };
 
   const targets = (await pool.query(`
-    SELECT id, sku, part_number FROM products
-    WHERE status = 'published' AND category3_id IS NULL AND category2_id IS NULL`)).rows as { id: number; sku: string; part_number: string | null }[];
+    SELECT id, sku, part_number, category3_id FROM products
+    WHERE status = 'published'`)).rows as { id: number; sku: string; part_number: string | null; category3_id: number | null }[];
+  const candidatesOf = (info: CsvInfo) => new Set([...(by3.get(info.cat3) || []), ...(by2.get(info.cat2) || [])]);
 
   const ids: number[] = []; const c1: number[] = []; const c2: number[] = []; const c3: number[] = [];
   for (const t of targets) {
@@ -419,6 +423,10 @@ export async function assignCategories(csvIndex: Map<string, CsvInfo>): Promise<
     if (!info) continue;
     const leaf = pickCached(by3, info.cat3, '3') ?? pickCached(by2, info.cat2, '2');
     if (!leaf) continue;
+    // Solo productos sin categoría o colocados en otra candidata de su mismo
+    // código de Bihr; los movidos a mano a otra categoría se respetan.
+    if (t.category3_id === leaf) continue;
+    if (t.category3_id !== null && !candidatesOf(info).has(t.category3_id)) continue;
     const chain = chainOf(leaf);
     ids.push(t.id); c1.push(chain[0]); c2.push(chain[1] ?? chain[0]); c3.push(leaf);
   }
@@ -427,8 +435,24 @@ export async function assignCategories(csvIndex: Map<string, CsvInfo>): Promise<
     const r = await pool.query(
       `UPDATE products p SET category_id = v.c1, category2_id = v.c2, category3_id = v.c3
        FROM unnest($1::int[], $2::int[], $3::int[], $4::int[]) AS v(id, c1, c2, c3)
-       WHERE p.id = v.id AND p.category3_id IS NULL AND p.category2_id IS NULL`,
+       WHERE p.id = v.id`,
       [ids.slice(i, i + 2000), c1.slice(i, i + 2000), c2.slice(i, i + 2000), c3.slice(i, i + 2000)]);
+    updated += r.rowCount || 0;
+  }
+
+  // Subcategorías duplicadas (mismo código de Bihr que otra menos profunda,
+  // p. ej. "Guantes › Guantes" o "Accesorios y recambios › Cascos integrales"):
+  // sus productos pasan a la categoría buena.
+  for (const [code, ids] of by3) {
+    const current = ids.filter(isCurrent);
+    if (current.length < 2) continue;
+    const preferred = pick(by3, code)!;
+    const dups = current.filter((x) => x !== preferred);
+    const chain = chainOf(preferred);
+    const r = await pool.query(
+      `UPDATE products SET category_id = $1, category2_id = $2, category3_id = $3
+       WHERE status = 'published' AND category3_id = ANY($4::int[])`,
+      [chain[0], chain[1] ?? chain[0], preferred, dups]);
     updated += r.rowCount || 0;
   }
 
@@ -455,6 +479,39 @@ export async function assignCategories(csvIndex: Map<string, CsvInfo>): Promise<
   return updated;
 }
 
+/**
+ * Productos que siguen sin categoría (no están en el catálogo de Bihr): se
+ * clasifican por votación entre los 10 productos ya clasificados con el texto
+ * más parecido (pg_trgm). Solo con consenso suficiente; el resto queda
+ * pendiente de revisión manual (category3_id NULL).
+ */
+export async function classifyByNeighbours(minVotes = 4, minSimilarity = 0.4): Promise<{ classified: number; pending: number }> {
+  const res = await pool.query(`
+    WITH u AS (
+      SELECT p.id, p.search_text FROM products p
+      WHERE p.status = 'published' AND p.category3_id IS NULL AND p.search_text IS NOT NULL
+    ), guess AS (
+      SELECT u.id, b.c3, b.votes, b.sim
+      FROM u CROSS JOIN LATERAL (
+        SELECT c3, count(*) AS votes, max(sim) AS sim FROM (
+          SELECT p.category3_id AS c3, similarity(p.search_text, u.search_text) AS sim
+          FROM products p
+          WHERE p.status = 'published' AND p.category3_id IS NOT NULL AND p.id <> u.id
+            AND p.search_text % u.search_text
+          ORDER BY p.search_text <-> u.search_text LIMIT 10) n
+        GROUP BY c3 ORDER BY count(*) DESC, max(sim) DESC LIMIT 1) b
+    )
+    UPDATE products p SET category_id = COALESCE(c.root, g.c3), category2_id = COALESCE(c.lvl2, g.c3), category3_id = g.c3
+    FROM guess g
+    LEFT JOIN LATERAL (
+      SELECT (SELECT x.category_id FROM products x WHERE x.category3_id = g.c3 LIMIT 1) AS root,
+             (SELECT x.category2_id FROM products x WHERE x.category3_id = g.c3 LIMIT 1) AS lvl2
+    ) c ON true
+    WHERE p.id = g.id AND g.votes >= $1 AND g.sim >= $2`, [minVotes, minSimilarity]);
+  const pending = await pool.query(`SELECT count(*)::int AS n FROM products WHERE status = 'published' AND category3_id IS NULL`);
+  return { classified: res.rowCount || 0, pending: pending.rows[0].n };
+}
+
 /** Lee el JSON de la API de Bihr y devuelve las referencias mínimas. */
 export function loadBihrApiRefs(jsonPath: string): BihrRefLite[] {
   const data = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
@@ -474,6 +531,8 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   console.log(`[ENRICH] ${completed} variantes completadas a partir de su modelo`);
   const categorized = await assignCategories(csvIndex);
   console.log(`[ENRICH] ${categorized} productos colocados en su categoría`);
+  const nb = await classifyByNeighbours();
+  console.log(`[ENRICH] ${nb.classified} clasificados por similitud; ${nb.pending} pendientes de revisión manual`);
   // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.
   await pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY catalog_words').catch((e) =>
     console.error('[ENRICH] No se pudo refrescar catalog_words:', e.message));
