@@ -33,6 +33,8 @@ interface CsvInfo {
   nameEs: string;
   variant: Record<string, string>;
   attrs: Record<string, string>;
+  /** Fotos del proveedor (Picture1…6), en orden */
+  pictures: string[];
 }
 
 // Columnas V-* → nombre del eje que verá el cliente.
@@ -121,7 +123,13 @@ export function loadCsvIndex(csvDir: string): Map<string, CsvInfo> {
         const i = idx(a);
         if (i >= 0 && cols[i]) attrs[a] = cols[i].trim();
       }
+      const pictures: string[] = [];
+      for (let k = 1; k <= 6; k++) {
+        const i = idx(`Picture${k}`);
+        if (i >= 0 && /^https?:\/\//.test(cols[i] || '')) pictures.push(cols[i].trim());
+      }
       index.set(pn, {
+        pictures,
         nameEn: iName >= 0 ? cols[iName] : '',
         nameEs: iEs >= 0 ? (cols[iEs] || '').trim() : '',
         variant: normalizeVariantOptions(raw),
@@ -131,6 +139,10 @@ export function loadCsvIndex(csvDir: string): Map<string, CsvInfo> {
   }
   return index;
 }
+
+/** SQL: ¿la columna images tiene al menos una foto válida? (jsonb) */
+const HAS_IMAGES = (col: string) =>
+  `(jsonb_typeof(${col}) = 'array' AND jsonb_array_length(${col}) > 0 AND COALESCE(${col}->0->>'src', ${col}->>0, '') <> '')`;
 
 export interface EnrichStats {
   matched: number;
@@ -147,11 +159,11 @@ export interface EnrichStats {
 export async function applyEnrichment(refs: BihrRefLite[], csvIndex: Map<string, CsvInfo>): Promise<Pick<EnrichStats, 'matched' | 'withVariants'>> {
   // Cada referencia se aplica a la ficha con SKU = ProductCode y también a la
   // antigua con SKU = NewPartNumber (si existe), para que ambas compartan modelo.
-  const rows: Array<[string, string, string, string, string, string]> = [];
+  const rows: Array<[string, string, string, string, string, string, string]> = [];
   const covered = new Set<string>();
   let withVariants = 0;
   const pushRow = (sku: string, partNumber: string, csv: CsvInfo | undefined, variant: Record<string, string>) => {
-    rows.push([sku, partNumber, JSON.stringify(variant), csv?.nameEn || '', JSON.stringify(csv?.attrs || {}), csv?.nameEs || '']);
+    rows.push([sku, partNumber, JSON.stringify(variant), csv?.nameEn || '', JSON.stringify(csv?.attrs || {}), csv?.nameEs || '', JSON.stringify(csv?.pictures || [])]);
     covered.add(sku);
   };
   for (const ref of refs) {
@@ -185,8 +197,20 @@ export async function applyEnrichment(refs: BihrRefLite[], csvIndex: Map<string,
          -- El nombre abreviado en inglés del proveedor se sustituye por el español.
          name = CASE WHEN v.es <> '' AND (p.name = v.en OR p.name ~ '^[A-Z0-9 ,./()&+-]+$') THEN v.es ELSE p.name END,
          attributes = (CASE WHEN jsonb_typeof(p.attributes) = 'object' THEN p.attributes ELSE '{}'::jsonb END)
-                      || v.attrs::jsonb || COALESCE(NULLIF(v.vo::jsonb, '{}'::jsonb), '{}'::jsonb)
-       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) AS v(sku, pn, vo, en, attrs, es)
+                      || v.attrs::jsonb || COALESCE(NULLIF(v.vo::jsonb, '{}'::jsonb), '{}'::jsonb),
+         -- Galería: se conservan las fotos ya guardadas (la primera suele estar
+         -- descargada y optimizada) y se añaden las demás del proveedor.
+         images = CASE
+           WHEN jsonb_array_length(v.pics::jsonb) = 0 THEN p.images
+           WHEN NOT ${HAS_IMAGES('p.images')} THEN
+             (SELECT jsonb_agg(jsonb_build_object('src', x, 'alt', p.name) ORDER BY i)
+              FROM jsonb_array_elements_text(v.pics::jsonb) WITH ORDINALITY t(x, i))
+           WHEN jsonb_array_length(v.pics::jsonb) > jsonb_array_length(p.images) THEN
+             p.images || (SELECT jsonb_agg(jsonb_build_object('src', x, 'alt', p.name) ORDER BY i)
+                          FROM jsonb_array_elements_text(v.pics::jsonb) WITH ORDINALITY t(x, i)
+                          WHERE i > jsonb_array_length(p.images))
+           ELSE p.images END
+       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[]) AS v(sku, pn, vo, en, attrs, es, pics)
        WHERE p.sku = v.sku
          -- Solo filas que cambian: las re-ejecuciones tras cada importación
          -- no reescriben (ni re-indexan) todo el catálogo.
@@ -194,8 +218,10 @@ export async function applyEnrichment(refs: BihrRefLite[], csvIndex: Map<string,
            OR p.variant_options IS DISTINCT FROM NULLIF(v.vo::jsonb, '{}'::jsonb)
            OR p.supplier_name IS DISTINCT FROM NULLIF(v.en, '')
            OR NOT (CASE WHEN jsonb_typeof(p.attributes) = 'object' THEN p.attributes ELSE '{}'::jsonb END) @> v.attrs::jsonb
-           OR (v.es <> '' AND p.name <> v.es AND (p.name = v.en OR p.name ~ '^[A-Z0-9 ,./()&+-]+$')))`,
-      [0, 1, 2, 3, 4, 5].map((i) => chunk.map((r) => r[i]))
+           OR (v.es <> '' AND p.name <> v.es AND (p.name = v.en OR p.name ~ '^[A-Z0-9 ,./()&+-]+$'))
+           OR (jsonb_array_length(v.pics::jsonb) > 0 AND (NOT ${HAS_IMAGES('p.images')}
+               OR jsonb_array_length(v.pics::jsonb) > jsonb_array_length(p.images))))`,
+      [0, 1, 2, 3, 4, 5, 6].map((i) => chunk.map((r) => r[i]))
     );
     matched += res.rowCount || 0;
   }
