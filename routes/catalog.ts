@@ -130,7 +130,8 @@ const PUBLIC_ATTRIBUTES: Record<string, string> = {
   Colección: 'Colección',
   Uso: 'Uso',
   Gama: 'Gama',
-  // Neumáticos
+  // Neumáticos, cámaras y mousses
+  Medida: 'Medida',
   'Categoría de neumático': 'Tipo de neumático',
   'Estructura de neumático': 'Estructura',
   'Índice de carga del neumático (IC)': 'Índice de carga',
@@ -150,7 +151,8 @@ export function publicAttributes(raw: any, variantOptions?: Record<string, strin
   const out: Record<string, string> = {};
   for (const [key, label] of Object.entries(PUBLIC_ATTRIBUTES)) {
     const v = (variantOptions && variantOptions[key]) ?? attrs[key];
-    if (v !== undefined && v !== null && String(v).trim() && !out[label]) out[label] = String(v).trim();
+    const text = Array.isArray(v) ? v.join(', ') : v;
+    if (text !== undefined && text !== null && String(text).trim() && !out[label]) out[label] = String(text).trim();
   }
   for (const [k, v] of Object.entries(variantOptions || {})) {
     if (!out[k] && v) out[k] = String(v);

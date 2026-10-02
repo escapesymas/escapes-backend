@@ -539,7 +539,7 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   const nb = await classifyByNeighbours();
   console.log(`[ENRICH] ${nb.classified} clasificados por similitud; ${nb.pending} pendientes de revisión manual`);
   const ty = await applyTyreAttributes(csvIndex);
-  console.log(`[ENRICH] Neumáticos: ${ty.sized}/${ty.tyres} con medida, ${ty.updated} actualizados`);
+  console.log(`[ENRICH] Neumáticos y cámaras: ${ty.sized}/${ty.tyres + ty.tubes} con medida, ${ty.updated} actualizados`);
   // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.
   await pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY catalog_words').catch((e) =>
     console.error('[ENRICH] No se pudo refrescar catalog_words:', e.message));

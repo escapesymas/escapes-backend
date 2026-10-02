@@ -13,6 +13,6 @@ import { pool } from '../db.js';
 const [csvDir] = process.argv.slice(2);
 const csv = csvDir ? loadCsvIndex(csvDir) : undefined;
 applyTyreAttributes(csv)
-  .then((r) => console.log(`[TYRES] ${r.sized}/${r.tyres} con medida, ${r.updated} actualizados`))
+  .then((r) => console.log(`[TYRES] ${r.tyres} neumáticos y ${r.tubes} cámaras/mousses; ${r.sized} con medida, ${r.updated} actualizados`))
   .catch((e) => { console.error('[TYRES] Error:', e); process.exitCode = 1; })
   .finally(() => pool.end());
