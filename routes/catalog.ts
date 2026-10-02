@@ -103,6 +103,63 @@ function localImageForSku(sku: string, variant: 'desktop' | 'mobile' | 'card', i
   return null;
 }
 
+// Atributos que se pueden mostrar al cliente (con su etiqueta en español).
+// Todo lo demás que trae el proveedor (precio de compra, stock del almacén,
+// códigos internos, URLs de su API…) NO sale de la API pública.
+const PUBLIC_ATTRIBUTES: Record<string, string> = {
+  Talla: 'Talla',
+  Color: 'Color',
+  'Modelo de casco': 'Modelo',
+  'Estilo de casco': 'Tipo de casco',
+  Homologación: 'Homologación',
+  Composición: 'Material',
+  Material: 'Material',
+  'Tipo de cierre': 'Cierre',
+  'Estilo de pintura': 'Decoración',
+  'Acabado de la pintura': 'Acabado',
+  Acabado: 'Acabado',
+  'Color de la lente': 'Color de la lente',
+  'Interior desmontable': 'Interior desmontable',
+  'Tipo de pieza de repuesto': 'Tipo de recambio',
+  Posición: 'Posición',
+  'Tipo de escape': 'Tipo de escape',
+  Colección: 'Colección',
+  Uso: 'Uso',
+  Gama: 'Gama',
+};
+
+function rawAttributes(raw: any): Record<string, any> {
+  if (!raw) return {};
+  if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch { return {}; } }
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+/** Atributos visibles para el cliente: { 'Material': 'Fibra de vidrio', … } */
+export function publicAttributes(raw: any, variantOptions?: Record<string, string> | null): Record<string, string> {
+  const attrs = rawAttributes(raw);
+  const out: Record<string, string> = {};
+  for (const [key, label] of Object.entries(PUBLIC_ATTRIBUTES)) {
+    const v = (variantOptions && variantOptions[key]) ?? attrs[key];
+    if (v !== undefined && v !== null && String(v).trim() && !out[label]) out[label] = String(v).trim();
+  }
+  for (const [k, v] of Object.entries(variantOptions || {})) {
+    if (!out[k] && v) out[k] = String(v);
+  }
+  return out;
+}
+
+/**
+ * Descripción a mostrar: la más completa entre la columna (a veces cortada a
+ * 2000 caracteres a mitad de etiqueta) y la HtmlDescription del proveedor.
+ */
+function bestDescription(row: any): string {
+  const attrs = rawAttributes(row.attributes);
+  const candidates = [row.description, attrs.HtmlDescription, attrs.Description]
+    .filter((d) => typeof d === 'string' && d.trim()) as string[];
+  const best = candidates.sort((a, b) => b.length - a.length)[0] || '';
+  return best.replace(/<[^>]*$/, '').trim(); // etiqueta cortada al final
+}
+
 export function mapProductToFrontend(row: any) {
   const priceEur = (row.price || 0) / 100;
   const salePriceEur = row.sale_price ? row.sale_price / 100 : null;
@@ -160,7 +217,7 @@ export function mapProductToFrontend(row: any) {
     slug,
     name: row.name,
     title: row.name,
-    description: row.description || '',
+    description: bestDescription(row),
     price: priceEur,
     regularPrice: priceEur,
     sale_price: salePriceEur,
@@ -173,7 +230,13 @@ export function mapProductToFrontend(row: any) {
     images,
     image: images[0]?.src || '',
     compatibility: row.compatibility || [],
-    attributes: row.attributes || {},
+    attributes: publicAttributes(row.attributes, row.variant_options),
+    barcode: row.barcode || '',
+    weight_g: row.weight_g || null,
+    category: row.category_name || '',
+    categorySlug: row.category_slug || '',
+    parentCategory: row.parent_category_name || '',
+    parentCategorySlug: row.parent_category_slug || '',
     status: row.status || 'published',
     avg_rating: row.avg_rating ? parseFloat(row.avg_rating) : 0,
     averageRating: row.avg_rating ? parseFloat(row.avg_rating) : 0,
@@ -632,9 +695,13 @@ catalogRouter.get('/catalog/product/:id', async (req, res) => {
     const result = await db.execute(sql`
       SELECT p.*,
              COALESCE(rs.avg_rating, 0) AS avg_rating,
-             COALESCE(rs.review_count, 0) AS review_count
+             COALESCE(rs.review_count, 0) AS review_count,
+             c.name AS category_name, c.slug AS category_slug,
+             pc.name AS parent_category_name, pc.slug AS parent_category_slug
       FROM products p
       LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
+      LEFT JOIN categories c ON c.id = COALESCE(p.category3_id, p.category2_id, p.category_id)
+      LEFT JOIN categories pc ON pc.id = c.parent_id
       WHERE p.id = ${id} AND p.status = 'published'
     `);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
@@ -813,9 +880,13 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
     const result = await db.execute(sql`
       SELECT p.*,
              COALESCE(rs.avg_rating, 0) AS avg_rating,
-             COALESCE(rs.review_count, 0) AS review_count
+             COALESCE(rs.review_count, 0) AS review_count,
+             c.name AS category_name, c.slug AS category_slug,
+             pc.name AS parent_category_name, pc.slug AS parent_category_slug
       FROM products p
       LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
+      LEFT JOIN categories c ON c.id = COALESCE(p.category3_id, p.category2_id, p.category_id)
+      LEFT JOIN categories pc ON pc.id = c.parent_id
       WHERE (p.sku = ${slugStr} OR p.sku = ${skuStr} ${validId !== null ? sql`OR p.id = ${validId}` : sql``})
         AND p.status IN ('published', 'duplicate')
       ORDER BY (p.status = 'published') DESC
@@ -854,6 +925,17 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
         for (const k of Object.keys(axes)) {
           axes[k] = axes[k].map((value) => ({ value })).sort(compareOptionValues).map((x) => x.value);
           if (axes[k].length < 2) delete axes[k];
+        }
+        // Variante sin foto: usar la de una hermana (mismo color si es posible).
+        if (!product.image) {
+          const color = row.variant_options?.Color;
+          const withImage = variants.filter((v: any) => v.id !== row.id && mapProductToFrontend(v).image);
+          const donor = withImage.find((v: any) => v.variant_options?.Color === color) || withImage[0];
+          if (donor) {
+            const d: any = mapProductToFrontend(donor);
+            product.images = d.images;
+            product.image = d.image;
+          }
         }
         const names = variants.map((v: any) => v.name).sort();
         product.family = {
