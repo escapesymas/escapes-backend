@@ -648,7 +648,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use('/api', catalogRouter);
 app.use('/api', ordersRouter);
 // Login, registro y cambios de contraseña: límite estricto por IP (solo cuentan los fallos).
-const AUTH_LIMITED_ACTIONS = new Set(['login', 'register', 'social-login', 'change-password', 'delete-account']);
+const AUTH_LIMITED_ACTIONS = new Set(['login', 'register', 'social-login', 'change-password', 'delete-account', 'verify-email', 'resend-verification']);
 app.post('/api/auth', (req: any, res: any, next: any) =>
   AUTH_LIMITED_ACTIONS.has(String(req.query?.action || '')) ? authLimiter(req, res, next) : next());
 app.use('/api', authRouter);

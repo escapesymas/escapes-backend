@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { db } from '../db.js';
 import { sql } from 'drizzle-orm';
 import bcrypt from 'bcryptjs';
+import crypto from 'node:crypto';
+import { sendTemplatedEmail } from '../lib/email.js';
 import {
   generateJWT,
   hashPasswordSHA256,
@@ -10,6 +12,45 @@ import {
   sanitizeString,
   authenticateRequest,
 } from '../utils.js';
+
+// ── Verificación del email en el registro ─────────────────────────────────
+const SITE_URL = process.env.PUBLIC_BASE_URL || 'https://escapesymas.com';
+const VERIFY_TTL_HOURS = 24;
+const VERIFY_RESEND_SECONDS = 60;
+const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
+
+/** Genera un enlace nuevo (el anterior deja de valer) y lo envía por correo. */
+async function sendVerificationEmail(user: { id: number; email: string; first_name?: string; username?: string }) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await db.execute(sql`
+    UPDATE users SET email_verify_token_hash = ${sha256(token)},
+                     email_verify_expires = NOW() + (${VERIFY_TTL_HOURS} || ' hours')::interval,
+                     email_verify_sent_at = NOW()
+    WHERE id = ${user.id}`);
+  const url = `${SITE_URL}/verificar-email?token=${token}`;
+  const result = await sendTemplatedEmail('verify-email', user.email, { name: user.first_name || user.username || '', url });
+  if (result.status !== 'sent') console.error(`[AUTH] No se pudo enviar la verificación a ${user.email}: ${result.lastError || result.status}`);
+  return result.status === 'sent';
+}
+
+/** Datos del usuario que se devuelven al iniciar sesión. */
+function sessionUser(user: any) {
+  const parse = (v: any, fallback: any) => { try { return typeof v === 'string' ? JSON.parse(v) : (v ?? fallback); } catch { return fallback; } };
+  return {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    firstName: user.first_name || '',
+    lastName: user.last_name || '',
+    avatarUrl: user.avatar_url || '',
+    role: user.role || 'customer',
+    rank: user.rank || 'Novato',
+    xp: user.xp || 0,
+    billing: parse(user.billing, {}) || {},
+    garage: parse(user.garage, []) || [],
+    cart: parse(user.cart, []) || [],
+  };
+}
 
 export const authRouter = Router();
 
@@ -501,6 +542,14 @@ authRouter.post('/auth', async (req, res) => {
         await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${user.id}`);
       }
 
+      if (user.email_verified === false) {
+        return res.status(403).json({
+          error: 'Confirma tu email para entrar: te enviamos un enlace al registrarte. Si no lo encuentras, pide otro.',
+          code: 'email_not_verified',
+          email: user.email,
+        });
+      }
+
       const token = generateJWT(user);
       setAuthCookie(res, token);
 
@@ -549,8 +598,10 @@ authRouter.post('/auth', async (req, res) => {
       `);
 
       const user = inserted.rows[0] as any;
-      const token = generateJWT(user);
-      setAuthCookie(res, token);
+      // Sin sesión hasta confirmar el email (ver action === 'verify-email'). El
+      // envío va en segundo plano: con reintentos puede tardar más de un minuto.
+      const emailSent = true;
+      sendVerificationEmail(user).catch((e) => console.error('[AUTH REGISTER VERIFY EMAIL ERROR]:', e.message));
 
       // Disparar Notificación Push para el Admin sobre nuevo usuario
       try {
@@ -564,23 +615,37 @@ authRouter.post('/auth', async (req, res) => {
         console.error('[AUTH REGISTER PUSH ERROR]:', pushErr.message);
       }
 
-      return res.json({
-        token,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          firstName: user.first_name || '',
-          lastName: user.last_name || '',
-          avatarUrl: user.avatar_url || '',
-          role: user.role || 'customer',
-          rank: 'Novato',
-          xp: 0,
-          billing: {},
-          garage: [],
-          cart: [],
-        }
-      });
+      return res.json({ verificationRequired: true, email: user.email, emailSent });
+    }
+
+    if (action === 'verify-email') {
+      const token = String(body.token || '');
+      if (!/^[a-f0-9]{64}$/.test(token)) return res.status(400).json({ error: 'Enlace no válido.', code: 'invalid_token' });
+      const found = await db.execute(sql`
+        UPDATE users SET email_verified = TRUE, email_verified_at = NOW(),
+                         email_verify_token_hash = NULL, email_verify_expires = NULL
+        WHERE email_verify_token_hash = ${sha256(token)} AND email_verify_expires > NOW()
+        RETURNING *`);
+      if (found.rows.length === 0) {
+        return res.status(400).json({ error: 'El enlace no es válido o ha caducado. Pide uno nuevo desde «Acceder».', code: 'invalid_token' });
+      }
+      const user = found.rows[0] as any;
+      const jwt = generateJWT(user);
+      setAuthCookie(res, jwt);
+      return res.json({ token: jwt, user: sessionUser(user) });
+    }
+
+    if (action === 'resend-verification') {
+      // Respuesta siempre igual: no revela si el email está registrado.
+      const email = String(body.email || '').trim();
+      if (email) {
+        const r = await db.execute(sql`
+          SELECT id, email, first_name, username FROM users
+          WHERE LOWER(email) = LOWER(${email}) AND email_verified = FALSE
+            AND (email_verify_sent_at IS NULL OR email_verify_sent_at < NOW() - (${VERIFY_RESEND_SECONDS} || ' seconds')::interval)`);
+        if (r.rows.length) sendVerificationEmail(r.rows[0] as any).catch((e) => console.error('[AUTH RESEND ERROR]:', e.message));
+      }
+      return res.json({ success: true, message: 'Si la cuenta existe y está pendiente de confirmar, te hemos enviado un enlace nuevo.' });
     }
 
     return res.status(400).json({ error: 'Acción no válida' });
