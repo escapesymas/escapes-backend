@@ -60,7 +60,8 @@ const nineDown = (c: number) => Math.max(9, Math.floor((c + 1) / 10) * 10 - 1);
 const nineUp = (c: number) => Math.ceil((c + 1) / 10) * 10 - 1;
 
 export function priceFor(pvpCents: number, costCents: number, rule: { discount: number; minMargin: number }): number {
-  const target = nineDown(Math.round(pvpCents * (1 - rule.discount / 100)));
+  // Sin descuento, el PVP exacto (redondear a ,x9 daría un "descuento" de céntimos).
+  const target = rule.discount > 0 ? nineDown(Math.round(pvpCents * (1 - rule.discount / 100))) : pvpCents;
   const floor = nineUp(floorPrice(costCents, rule.minMargin));
   return Math.max(target, floor);
 }
@@ -93,8 +94,9 @@ export async function repriceProducts(opts: { dryRun?: boolean } = {}): Promise<
     // DTO1 por debajo del PVP: price = PVP (tachado) y sale_price = DTO1. Si ni el
     // PVP cubre el margen mínimo (marcas sin margen de distribuidor), se vende al
     // precio mínimo con margen, sin descuento: venderlo a PVP sería perder dinero.
-    const sale = dto1 < pvp ? dto1 : null;
-    const listPrice = dto1 < pvp ? pvp : dto1;
+    // Un ahorro de menos del 1 % no se anuncia: se vende a PVP sin tachado.
+    const sale = dto1 < pvp * 0.99 ? dto1 : null;
+    const listPrice = sale ? pvp : Math.max(pvp, dto1);
     // La promoción activa (promo_price) se mantiene; applyPromotions la revisa después.
     const newEff = eff(Number(p.promo_price), sale || 0, listPrice);
     sumOld += oldEff; sumNew += newEff;
