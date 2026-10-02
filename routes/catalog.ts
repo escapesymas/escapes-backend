@@ -913,7 +913,9 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
           UNION ALL SELECT c.id, c.name, c.slug, c.parent_id, up.depth + 1
           FROM categories c JOIN up ON c.id = up.parent_id WHERE up.depth < 6
         ) SELECT name, slug FROM up ORDER BY depth DESC`, [leafId]);
-      product.categoryPath = path.rows;
+      // Productos aún en el árbol antiguo (p. ej. la 1 "Cascos" por defecto):
+      // mejor solo "Catálogo" que una categoría engañosa.
+      product.categoryPath = path.rows.some((c: any) => String(c.slug || '').startsWith('old-')) ? [] : path.rows;
     } else {
       product.categoryPath = [];
     }
