@@ -70,6 +70,20 @@ function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/**
+ * Botón "a prueba de clientes de correo": el fondo va en la celda y el relleno
+ * como borde del enlace, así toda la superficie es clicable también en Outlook,
+ * webmails y apps móviles (con padding solo era clicable el texto).
+ */
+function button(url: string, label: string): string {
+  const href = escapeHtml(url);
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:28px auto">
+      <tr><td align="center" bgcolor="${BRAND_COLOR}" style="background:${BRAND_COLOR};border-radius:8px">
+        <a href="${href}" target="_blank" rel="noopener" style="display:inline-block;background:${BRAND_COLOR};border:solid ${BRAND_COLOR};border-width:14px 28px;border-radius:8px;color:#0f172a;font-size:16px;font-weight:700;line-height:20px;text-decoration:none">${escapeHtml(label)}</a>
+      </td></tr>
+    </table>`;
+}
+
 function money(cents: number | string): number {
   return (typeof cents === 'string' ? parseInt(cents) : cents) / 100;
 }
@@ -157,9 +171,7 @@ El equipo de ${BRAND}.`;
       <tr><td style="padding:4px 12px 4px 0;color:#666">Seguimiento:</td><td><strong>${escapeHtml(d.trackingNumber)}</strong></td></tr>
       <tr><td style="padding:4px 12px 4px 0;color:#666">Carrier:</td><td>${escapeHtml(d.carrier || '—')}</td></tr>
     </table>
-    <p style="margin:24px 0">
-      <a href="${escapeHtml(d.trackingUrl)}" style="display:inline-block;background:${BRAND_COLOR};color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600">Seguir mi envío</a>
-    </p>
+    ${button(d.trackingUrl, 'Seguir mi envío')}
   `);
   return { subject, text, html };
 }
@@ -266,9 +278,7 @@ export function generic(d: GenericData): RenderedEmail {
   const html = shell(`
     <div style="white-space:pre-wrap;line-height:1.6">${escapeHtml(d.body).replace(/\n/g, '<br>')}</div>
     ${d.cta ? `
-      <p style="margin:24px 0">
-        <a href="${escapeHtml(d.cta.url)}" style="display:inline-block;background:${BRAND_COLOR};color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600">${escapeHtml(d.cta.label)}</a>
-      </p>
+      ${button(d.cta.url, d.cta.label)}
     ` : ''}
   `);
   return { subject: d.subject, text, html };
@@ -294,9 +304,7 @@ El equipo de ${BRAND}.`;
     <h2 style="color:${BRAND_COLOR};margin:0 0 12px">Confirma tu email</h2>
     <p style="line-height:1.6">Hola${d.name ? ` <strong>${escapeHtml(d.name)}</strong>` : ''},</p>
     <p style="line-height:1.6">Gracias por registrarte en ${BRAND}. Pulsa el botón para activar tu cuenta:</p>
-    <p style="margin:28px 0;text-align:center">
-      <a href="${escapeHtml(d.url)}" style="display:inline-block;background:${BRAND_COLOR};color:#0f172a;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:700">Confirmar mi email</a>
-    </p>
+    ${button(d.url, 'Confirmar mi email')}
     <p style="line-height:1.6;color:#94a3b8;font-size:13px">Si el botón no funciona, copia este enlace en el navegador:<br><a href="${escapeHtml(d.url)}" style="color:${BRAND_COLOR};word-break:break-all">${escapeHtml(d.url)}</a></p>
     <p style="line-height:1.6;color:#94a3b8;font-size:13px">El enlace caduca en 24 horas. Si no has creado tú esta cuenta, ignora este mensaje.</p>
   `);
