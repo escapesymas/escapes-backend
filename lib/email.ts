@@ -61,6 +61,9 @@ function getTransporter(): Transporter {
     host: process.env.SMTP_HOST || 'smtp.buzondecorreo.com',
     port: parseInt(process.env.SMTP_PORT || '465'),
     secure: true,
+    // Nombre del saludo EHLO: sin esto nodemailer usa el hostname del contenedor
+    // y el correo sale como "from [127.0.0.1]", señal negativa para los filtros.
+    name: process.env.SMTP_HELO_NAME || 'escapesymas.com',
     auth: {
       user: process.env.SMTP_USER || 'web@escapesymas.com',
       pass: process.env.SMTP_PASSWORD,
