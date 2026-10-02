@@ -38,6 +38,7 @@ import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { quoteOrder } from './lib/order-pricing.js';
+import { repriceProducts, pricingAuto } from './lib/pricing.js';
 import { isIP } from 'node:net';
 import { catalogRouter } from './routes/catalog.js';
 import { ordersRouter } from './routes/orders.js';
@@ -3848,11 +3849,15 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
       case 'save-pricing-rule': {
         if (req.method !== 'POST') return res.status(405).end();
-        const { id, ruleType, targetId, marginPercent, active } = req.body;
+        const { id, ruleType, targetId, active } = req.body;
         const activeVal = active === false || active === 0 ? 0 : 1;
+        const discount = Number(req.body.discountPercent ?? 0);
+        const minMargin = Number(req.body.minMarginPercent ?? 15);
+        const marginPercent = 0; // columna antigua (coste × margen), ya no se usa
 
-        if (!ruleType || marginPercent === undefined) {
-          return res.status(400).json({ error: 'Faltan parámetros obligatorios' });
+        if (!['global', 'category', 'brand'].includes(ruleType)
+            || !(discount >= 0 && discount <= 60) || !(minMargin >= 0 && minMargin <= 60)) {
+          return res.status(400).json({ error: 'Regla inválida: descuento y margen mínimo entre 0 y 60 %' });
         }
 
         if (id) {
@@ -3860,14 +3865,16 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             UPDATE pricing_rules
             SET rule_type = ${ruleType},
                 target_id = ${targetId || null},
-                margin_percent = ${parseInt(marginPercent)},
+                margin_percent = ${marginPercent},
+                discount_percent = ${discount},
+                min_margin_percent = ${minMargin},
                 active = ${activeVal}
             WHERE id = ${parseInt(id)}
           `);
         } else {
           await db.execute(sql`
-            INSERT INTO pricing_rules (rule_type, target_id, margin_percent, active)
-            VALUES (${ruleType}, ${targetId || null}, ${parseInt(marginPercent)}, ${activeVal})
+            INSERT INTO pricing_rules (rule_type, target_id, margin_percent, discount_percent, min_margin_percent, active)
+            VALUES (${ruleType}, ${targetId || null}, ${marginPercent}, ${discount}, ${minMargin}, ${activeVal})
           `);
         }
         return res.json({ success: true });
@@ -3884,58 +3891,28 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
       case 'recalculate-all-prices': {
         if (req.method !== 'POST') return res.status(405).end();
-        
-        const rulesRes = await db.execute(sql`SELECT * FROM pricing_rules WHERE active = 1`);
-        const rules = (rulesRes.rows || []) as any[];
- 
-        const productsRes = await db.execute(sql`SELECT id, brand, category_id, cost, price FROM products WHERE cost > 0`);
-        const products = (productsRes.rows || []) as any[];
- 
-        let updateCount = 0;
- 
-        const getPrice = (costVal: number, catId: number, brandName: string) => {
-          let margin = 20; // default margin
-          const brandRule = rules.find(r => r.rule_type === 'brand' && (r.target_id as string)?.toLowerCase() === brandName?.toLowerCase());
-          if (brandRule) {
-            margin = Number(brandRule.margin_percent);
-          } else {
-            const parentId = catId >= 100 ? Math.floor(catId / 100) : catId;
-            const categoryRule = rules.find(r => r.rule_type === 'category' && (r.target_id === String(catId) || r.target_id === String(parentId)));
-            if (categoryRule) {
-              margin = Number(categoryRule.margin_percent);
-            } else {
-              const globalRule = rules.find(r => r.rule_type === 'global');
-              if (globalRule) {
-                margin = Number(globalRule.margin_percent);
-              }
-            }
-          }
-          return Math.round(costVal * (1 + margin / 100));
-        };
- 
-        const batchSize = 200;
-        for (let idx = 0; idx < products.length; idx += batchSize) {
-          const pBatch = products.slice(idx, idx + batchSize);
-          const updateQueries = pBatch.map((p: any) => {
-            const newPrice = getPrice(Number(p.cost || 0), Number(p.category_id || 0), p.brand || '');
-            if (newPrice !== Number(p.price || 0)) {
-              updateCount++;
-              return db.execute(sql`UPDATE products SET price = ${newPrice}, updated_at = NOW() WHERE id = ${p.id}`);
-            }
-            return null;
-          }).filter(Boolean);
-
-          if (updateQueries.length > 0) {
-            await Promise.all(updateQueries);
-          }
-        }
-
-        // Bust product + filter cache: a mass price recalc touches most rows
-        // in the catalog listing and the min/max price filter facets.
+        // Motor de precios: PVP − descuento de la regla, con suelo de margen mínimo
+        // (lib/pricing.ts). Antes: coste × (1 + margen) sin IVA (con la tabla
+        // vacía, margen 20 %: todo el catálogo por debajo de coste).
+        const stats = await repriceProducts({ dryRun: false });
         await cacheBust('cache:products');
         await cacheBust('cache:filters');
+        await logAdminAction(req, 'recalculate-all-prices', { changed: stats.changed });
+        return res.json({ success: true, updatedCount: stats.changed, stats });
+      }
 
-        return res.json({ success: true, updatedCount: updateCount });
+      case 'pricing-preview': {
+        return res.json(await repriceProducts({ dryRun: true }));
+      }
+
+      case 'pricing-auto': {
+        if (req.method === 'POST') {
+          const on = req.body?.enabled === true;
+          await db.execute(sql`INSERT INTO catalog_meta (key, value) VALUES ('pricing_auto', ${on ? 'on' : 'off'})
+                               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`);
+          await logAdminAction(req, 'pricing-auto', { enabled: on });
+        }
+        return res.json({ enabled: await pricingAuto() });
       }
 
       case 'generate-invoice': {
@@ -4746,6 +4723,11 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           sql`name = ${safeName}`,
           sql`sku = ${safeSku}`,
           sql`price = ${priceInCents}`,
+          // Precio cambiado a mano: el motor de precios (lib/pricing.ts) ya no lo toca,
+          // salvo que se pida volver al precio automático (priceAuto).
+          b.priceAuto === true
+            ? sql`price_manual = FALSE`
+            : sql`price_manual = (price_manual OR price IS DISTINCT FROM ${priceInCents})`,
           sql`sale_price = ${saleCents}`,
           sql`stock = ${stock}`,
           sql`stock_status = ${stockStatus}`,

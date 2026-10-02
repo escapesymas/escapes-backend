@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pool } from './db.js';
+import { repriceProducts, pricingAuto } from './lib/pricing.js';
 import { refreshCompatModels } from './lib/compat.js';
 import { enrichCatalog } from './lib/catalog-enrich.js';
 
@@ -466,7 +467,8 @@ async function downloadAndProcessCatalog(downloadId: string, catalogType: string
       resolve(processCatalogJson(jsonFilePath, catalogType, startTime).then(() => {
         // Copia del último catálogo para poder relanzar el enriquecimiento
         // desde el admin (POST /api/admin/catalog/enrich).
-        try {
+        // (el de precios no: no tiene referencias y lo dejaría sin datos).
+        if (catalogType !== 'Prices') try {
           fs.mkdirSync(path.dirname(LATEST_CATALOG_JSON), { recursive: true });
           fs.copyFileSync(jsonFilePath, LATEST_CATALOG_JSON);
         } catch (e) {
@@ -489,9 +491,45 @@ async function downloadAndProcessCatalog(downloadId: string, catalogType: string
  */
 const BATCH_SIZE = 100;
 
+/**
+ * Catálogo "Prices": el precio neto de cliente (DealerPriceHT) es el coste real.
+ * El catálogo general solo trae el PVP y un "precio base distribuidor" que es el
+ * PVP sin IVA (con él como coste el margen salía a cero).
+ */
+async function processPricesCatalog(catalog: any, catalogType: string, startTime: string) {
+  const rows: any[] = catalog.Prices || [];
+  const parts: string[] = []; const codes: string[] = []; const costs: number[] = [];
+  for (const r of rows) {
+    const net = Number(r.DealerPriceHT);
+    if (!(net > 0)) continue;
+    parts.push(String(r.NewPartNumber || '')); codes.push(String(r.ProductId || '')); costs.push(Math.round(net * 100));
+  }
+  let updated = 0;
+  for (let i = 0; i < costs.length; i += 5000) {
+    const r = await pool.query(`
+      UPDATE products p SET cost = v.cost, updated_at = NOW()
+      FROM unnest($1::text[], $2::text[], $3::int[]) AS v(part, code, cost)
+      WHERE (p.part_number = v.part OR (p.part_number IS NULL AND p.sku = v.code))
+        AND p.cost IS DISTINCT FROM v.cost`,
+      [parts.slice(i, i + 5000), codes.slice(i, i + 5000), costs.slice(i, i + 5000)]);
+    updated += r.rowCount || 0;
+  }
+  console.log(`[BIHR SERVICE]: Catálogo de precios: ${costs.length} precios netos, ${updated} costes actualizados.`);
+  if (await pricingAuto()) {
+    const stats = await repriceProducts();
+    console.log(`[BIHR SERVICE]: Precios recalculados: ${stats.changed} cambios (precio medio ${stats.avgOld} → ${stats.avgNew} €).`);
+  } else {
+    console.log('[BIHR SERVICE]: Recálculo automático de precios desactivado (admin → Márgenes).');
+  }
+  updateCatalogSyncState({ status: 'completed', catalogType, startTime, endTime: new Date().toISOString(), inserted: 0, updated });
+}
+
 async function processCatalogJson(filePath: string, catalogType: string, startTime: string) {
   const rawData = fs.readFileSync(filePath, 'utf-8');
   const catalog = JSON.parse(rawData);
+  if (catalogType === 'Prices' || (Array.isArray(catalog.Prices) && !catalog.References && !catalog.Products)) {
+    return processPricesCatalog(catalog, catalogType, startTime);
+  }
   
   const references = catalog.References || catalog.Products || [];
   console.log(`[BIHR SERVICE]: Total de referencias encontradas en catálogo de Bihr: ${references.length}`);
@@ -558,32 +596,17 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
         // Número de pieza de Bihr: agrupa variantes (lib/catalog-enrich.ts).
         const partNumber = ref.NewPartNumber ? String(ref.NewPartNumber) : null;
 
-        let cost = 0;
+        // PVP (IVA incluido). El coste real llega con el catálogo "Prices"
+        // (processPricesCatalog); aquí solo se usa para dar de alta productos
+        // nuevos, que quedan a PVP hasta que se conozca su coste.
         let price = 0;
-        
-        // Obtener cost (precio base dealer sin IVA)
-        if (ref.BaseDealerPriceExcludingTax) {
-          cost = Math.round(parseFloat(ref.BaseDealerPriceExcludingTax) * 100);
-        } else if (ref.RetailPriceExcludingTax) {
-          cost = Math.round(parseFloat(ref.RetailPriceExcludingTax) * 100);
-        }
-        
-        // Obtener price (precio retail con IVA - este es el precio OFICIAL de Bihr)
         if (ref.RetailPriceIncludingTax) {
           price = Math.round(parseFloat(ref.RetailPriceIncludingTax) * 100);
         } else if (ref.RetailPriceExcludingTax) {
-          price = Math.round(parseFloat(ref.RetailPriceExcludingTax) * 100);
+          price = Math.round(parseFloat(ref.RetailPriceExcludingTax) * 121);
         }
-        
-        // Si no tenemos cost ni price, no procesamos este producto
-        if (cost === 0 && price === 0) {
-          continue;
-        }
-        
-        // Si tenemos price pero no cost, calculamos cost desde price (IVA20%)
-        if (cost === 0 && price > 0) {
-          cost = Math.round(price / 1.20);
-        }
+        if (price === 0) continue;
+        const cost = 0;
 
         const barcode = ref.BarCode || '';
         const stockVal = ref.StockValue ? parseInt(ref.StockValue) : 0;
@@ -661,14 +684,14 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             category_id, category2, category3, category2_id,
             weight_g, length_mm, width_mm, height_mm, volume_cm3,
             dropshipping, ondemand, delivery_plant, commodity_code,
-            attributes, part_number, status, created_at, updated_at
+            attributes, part_number, pvp, status, created_at, updated_at
           ) VALUES (
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9, $10,
             $11, $12, $13, $14,
             $15, $16, $17, $18, $19,
             $20, $21, $22, $23,
-            $24::jsonb, $25, 'published', NOW(), NOW()
+            $24::jsonb, $25, $7, 'published', NOW(), NOW()
           )
           -- Las categorías solo se fijan al crear el producto: el mapa fijo de
           -- abajo es muy grueso (por defecto la 1) y pisaba las asignadas por
@@ -678,8 +701,8 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             brand = EXCLUDED.brand,
             supplier_code = EXCLUDED.supplier_code,
             old_part_number = EXCLUDED.old_part_number,
-            cost = EXCLUDED.cost,
-            price = EXCLUDED.price,
+            -- Coste (catálogo Prices) y precio (lib/pricing.ts) no se pisan aquí.
+            pvp = EXCLUDED.pvp,
             stock = EXCLUDED.stock,
             barcode = EXCLUDED.barcode,
             description = EXCLUDED.description,
@@ -736,6 +759,11 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
 
   // Las compatibilidades pueden haber cambiado: recalcular la tabla de modelos.
   refreshCompatModels().catch(e => console.error('[BIHR SERVICE] Error refrescando compat_vehicle_models:', e));
+
+  // Costes reales (y recálculo de precios si está activado) con el catálogo de precios.
+  setTimeout(() => {
+    syncBihrCatalog('Prices').catch((e) => console.error('[BIHR SERVICE] Error con el catálogo de precios:', e));
+  }, 5000);
   
   updateCatalogSyncState({
     status: 'completed',
