@@ -258,7 +258,8 @@ export function buildConditions(params: CatalogParams, opts: { fuzzy?: boolean; 
   for (const [key, values] of Object.entries(params.attrs || {})) {
     if (!values.length) continue;
     if (opts.exclude && typeof opts.exclude === 'object' && opts.exclude.attr === key) continue;
-    q.add(`AND (p.variant_options ->> ? = ANY(?) OR p.attributes ->> ? = ANY(?))`, key, values, key, values);
+    // jsonb_exists_any: sirve para valores sueltos y para listas (Medida de una cámara: varias).
+    q.add(`AND (p.variant_options ->> ? = ANY(?) OR jsonb_exists_any(p.attributes -> ?, ?::text[]))`, key, values, key, values);
   }
   return q;
 }
