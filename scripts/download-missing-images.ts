@@ -22,6 +22,7 @@ interface ProductRow {
   id: number;
   sku: string;
   supplier_code: string;
+  part_number: string | null;
   images: unknown;
   name: string | null;
 }
@@ -193,7 +194,9 @@ async function processProduct(
   }
 
   const token = await getToken();
-  const imageUrl = await getImageUrl(row.supplier_code, token);
+  // La API espera la referencia Bihr; con un código de fabricante corto
+  // ("1689") devuelve la foto de la pieza Bihr que tenga ese número.
+  const imageUrl = await getImageUrl(row.part_number || row.supplier_code, token);
   const image = await downloadImage(imageUrl, token);
   await writeVariants(image, safeSku);
 
@@ -277,7 +280,7 @@ async function main(): Promise<void> {
   }
 
   const result = await db.execute(sql`
-    SELECT id, sku, supplier_code, images, name
+    SELECT id, sku, supplier_code, part_number, images, name
     FROM products
     WHERE (
       images IS NULL

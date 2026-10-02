@@ -31,6 +31,8 @@ interface ProductRow {
   id: number;
   sku: string;
   supplier_code: string;
+  part_number: string | null;
+  brand: string | null;
   images: unknown;
   name: string | null;
 }
@@ -161,6 +163,10 @@ async function loadCatalogMap(csvDir: string): Promise<{
     return rows;
   };
 
+  const partNumbers = new Set<string>();
+  const aliasOwner = new Map<string, string | null>();
+  const aliasPart = new Map<string, { brand: string; partNumber: string }>();
+  const aliasPic = new Map<string, { url: string; brand: string }>();
   for (const file of files) {
     const brand = brandFromCsvFilename(file);
     const text = await (await import('node:fs/promises')).readFile(path.join(finalDir, file), 'utf-8');
@@ -180,6 +186,7 @@ async function loadCatalogMap(csvDir: string): Promise<{
       const pic = (r[picIdx] || '').trim();
       const sup = supIdx !== -1 ? (r[supIdx] || '').trim() : '';
       const old = oldIdx !== -1 ? (r[oldIdx] || '').trim() : '';
+      if (part) partNumbers.add(part);
       if (part && pic && !urlMap.has(part)) {
         urlMap.set(part, { url: pic, brand });
         skuMap.set(part, { brand });
@@ -188,16 +195,26 @@ async function loadCatalogMap(csvDir: string): Promise<{
       }
       // Index by every alias we know about so product lookup (by sku or
       // supplier_code) resolves to the CSV's PartNumber (zip filename stem).
+      // An alias never overrides a real PartNumber, and an alias shared by
+      // several parts (e.g. RFX ref "23001" vs a LIQUI MOLY sku "23001") is
+      // dropped: guessing gave products the photo of an unrelated part.
       for (const alias of [sup, old]) {
-        if (alias && pic && !urlMap.has(alias)) {
-          urlMap.set(alias, { url: pic, brand });
-        }
-        if (alias) {
-          skuMap.set(alias, { brand });
-          partMap.set(alias, { brand, partNumber: part });
-        }
+        if (!alias || !part || partNumbers.has(alias)) continue;
+        const owner = aliasOwner.get(alias);
+        if (owner === undefined) aliasOwner.set(alias, part);
+        else if (owner !== part) aliasOwner.set(alias, null);
+        if (pic && !aliasPic.has(alias)) aliasPic.set(alias, { url: pic, brand });
+        if (!aliasPart.has(alias)) aliasPart.set(alias, { brand, partNumber: part });
       }
     }
+  }
+  for (const [alias, owner] of aliasOwner) {
+    if (owner === null || partNumbers.has(alias)) continue;
+    const pe = aliasPart.get(alias)!;
+    skuMap.set(alias, { brand: pe.brand });
+    partMap.set(alias, pe);
+    const pu = aliasPic.get(alias);
+    if (pu) urlMap.set(alias, pu);
   }
 
   console.log(`[CATALOG] urlMap size: ${urlMap.size}, skuMap size: ${skuMap.size}, partMap size: ${partMap.size}`);
@@ -498,6 +515,12 @@ async function getBihrToken(): Promise<string | null> {
   }
 }
 
+/** Código para la API de imágenes de Bihr: espera su PartNumber. Con un código
+ *  de fabricante corto ("1689") devuelve la foto de la pieza Bihr con ese número. */
+function apiCodeFor(row: ProductRow): string {
+  return row.part_number || row.supplier_code || row.sku;
+}
+
 async function fetchImageFromBihrApi(supplierCode: string): Promise<Buffer | null> {
   const token = await getBihrToken();
   if (!token) return null;
@@ -577,7 +600,7 @@ async function tryApiFallback(
   urlMap: Map<string, { url: string; brand: string }>,
 ): Promise<Buffer | null> {
   if (!isCircuitOpen()) {
-    const code = row.supplier_code || row.sku;
+    const code = apiCodeFor(row);
     if (code) {
       selfLog(`BIHR-API-TRY ${brand}/${code}`);
       const buf = await fetchImageFromBihrApi(code);
@@ -602,6 +625,7 @@ async function tryUrlFallback(
 ): Promise<Buffer | null> {
   // Look up by supplier_code or sku (the CSV indexes these as aliases).
   const urlEntry =
+    (row.part_number ? urlMap.get(row.part_number) : undefined) ||
     urlMap.get(row.supplier_code) ||
     urlMap.get(row.sku);
   if (!urlEntry?.url) return null;
@@ -670,14 +694,14 @@ async function processProduct(
 ): Promise<'downloaded' | 'no-image'> {
   const safeSku = sanitizeSku(row.sku);
   if (!safeSku) throw new Error('SKU empty');
-  const entry = skuMap.get(row.sku) || skuMap.get(row.supplier_code);
+  const entry = (row.part_number ? skuMap.get(row.part_number) : undefined) || skuMap.get(row.sku) || skuMap.get(row.supplier_code);
   if (!entry) {
     // No CSV row matched this product's sku or supplier_code. The Bihr CSV
     // is a snapshot — products added to Bihr AFTER the snapshot date won't
     // appear in it, but the authenticated per-product API may still have
     // them. Try the API before giving up. Use row.brand (the product's own
     // brand) for the originalUrl label — it's what users see in the catalog.
-    const code = row.supplier_code || row.sku;
+    const code = apiCodeFor(row);
     console.log(`[${position}/${total}] Product ${row.id}: no brand mapping, trying API for ${code}`);
     const apiBuf = await fetchImageFromBihrApi(code);
     if (apiBuf) {
@@ -702,15 +726,15 @@ async function processProduct(
   }
   // Look up the CSV's PartNumber — that's the stem used in the zip filenames,
   // not the product's internal sku or supplier_code.
-  const partEntry = partMap.get(row.sku) || partMap.get(row.supplier_code);
-  const partNumber = partEntry?.partNumber || row.supplier_code || row.sku;
+  const partEntry = (row.part_number ? partMap.get(row.part_number) : undefined) || partMap.get(row.sku) || partMap.get(row.supplier_code);
+  const partNumber = partEntry?.partNumber || row.part_number || row.supplier_code || row.sku;
   if (failedBrands.has(entry.brand)) {
     // Brand zip is known-bad (404). Try the API fallback before giving up.
     console.log(`[${position}/${total}] Product ${row.id}: brand ${entry.brand} zip 404, trying API`);
     const apiImage = await tryApiFallback(row, entry.brand, urlMap);
     if (apiImage) {
       await writeVariants(apiImage, safeSku);
-      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${apiCodeFor(row)}`)];
       await db.execute(sql`
         UPDATE products
         SET images = ${JSON.stringify(images)}::jsonb
@@ -751,7 +775,7 @@ async function processProduct(
     const apiImage = await tryApiFallback(row, entry.brand, urlMap);
     if (apiImage) {
       await writeVariants(apiImage, safeSku);
-      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${apiCodeFor(row)}`)];
       await db.execute(sql`
         UPDATE products
         SET images = ${JSON.stringify(images)}::jsonb
@@ -777,7 +801,7 @@ async function processProduct(
     const apiImage = await tryApiFallback(row, entry.brand, urlMap);
     if (apiImage) {
       await writeVariants(apiImage, safeSku);
-      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${apiCodeFor(row)}`)];
       await db.execute(sql`
         UPDATE products
         SET images = ${JSON.stringify(images)}::jsonb
@@ -799,7 +823,7 @@ async function processProduct(
     const apiImage = await tryApiFallback(row, entry.brand, urlMap);
     if (apiImage) {
       await writeVariants(apiImage, safeSku);
-      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${row.supplier_code || row.sku}`)];
+      const images = [imageRecordFor(row, safeSku, `api:${entry.brand}/${apiCodeFor(row)}`)];
       await db.execute(sql`
         UPDATE products
         SET images = ${JSON.stringify(images)}::jsonb
@@ -907,7 +931,7 @@ async function runBatch(
   totals: CumulativeTotals,
 ): Promise<CumulativeTotals> {
   const result = await db.execute(sql`
-    SELECT id, sku, supplier_code, images, name FROM products
+    SELECT id, sku, supplier_code, part_number, brand, images, name FROM products
     WHERE (images IS NULL OR images::text = '[]') AND sku IS NOT NULL AND sku <> ''
     ORDER BY id LIMIT ${effectiveBatch}
   `);
