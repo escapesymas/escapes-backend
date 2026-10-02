@@ -893,7 +893,9 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
       LEFT JOIN categories pc ON pc.id = c.parent_id
       WHERE (p.sku = ${slugStr} OR p.sku = ${skuStr} ${validId !== null ? sql`OR p.id = ${validId}` : sql``})
         AND p.status IN ('published', 'duplicate')
-      ORDER BY (p.status = 'published') DESC
+      -- La referencia manda sobre el id: '9587' es la ref. de un guante y a la vez
+      -- el id interno de un kit de cadena; ambos publicados.
+      ORDER BY (p.sku = ${slugStr}) DESC, (p.sku = ${skuStr}) DESC, (p.status = 'published') DESC
       LIMIT 1
     `);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
