@@ -24,3 +24,6 @@ escapesymas-infra-reference.md
 .audit_routes.txt
 _audit_routes.txt
 *.dump
+
+# Ficheros subidos / imágenes optimizadas (datos de ejecución)
+uploads/

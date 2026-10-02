@@ -241,6 +241,98 @@ export async function markDuplicates(): Promise<Pick<EnrichStats, 'duplicates' |
   }
 }
 
+const SIZE_TOKEN = /^(XXXS|XXS|XS|S|M|L|XL|XXL|XXXL|[2-6]XL|[A-Z]{0,2}\d{1,3}(\/[A-Z0-9]{1,4})?|Y?(XS|S|M|L|XL)|\d{1,2}\/[A-Z]{1,3})$/i;
+const isAllCaps = (s: string) => /^[A-Z0-9 ,./()&+'-]+$/.test(s);
+
+// Abreviaturas de color en los nombres del proveedor (respaldo cuando el modelo
+// no tiene ninguna hermana de ese color de la que aprenderlo).
+const COLOR_CODES: Record<string, string> = {
+  BLK: 'Negro', WHT: 'Blanco', RED: 'Rojo', BLU: 'Azul', GRY: 'Gris', GREY: 'Gris', YEL: 'Amarillo',
+  ORG: 'Naranja', ORA: 'Naranja', GRN: 'Verde', PNK: 'Rosa', SIL: 'Plata', SLV: 'Plata', BRN: 'Marrón',
+  PUR: 'Morado', GLD: 'Oro', NYE: 'Amarillo flúor', NAV: 'Azul marino', BGE: 'Beige', KHA: 'Caqui',
+  CRB: 'Carbono', TIT: 'Titanio', CLR: 'Transparente', BRZ: 'Bronce',
+};
+
+/**
+ * Completa modelos con variantes "huérfanas": referencias que el proveedor ya
+ * no lista (sin talla/color ni nombre en español) junto a hermanas que sí los
+ * tienen. Aprende, dentro de cada modelo, qué código del nombre del proveedor
+ * corresponde a cada color ("RED" → "Rojo") y deduce talla y color del nombre
+ * ("…, RED, XS"). Toma el nombre en español de una hermana del mismo color.
+ */
+/** Nombre en español para un color: el de una hermana de ese color, o el de otra cambiando el color. */
+function spanishNameFor(color: string, nameByColor: Map<string, string>): string {
+  if (nameByColor.has(color)) return nameByColor.get(color)!;
+  for (const [otherColor, name] of nameByColor) {
+    const re = new RegExp(`\\b${otherColor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    const m = name.match(re);
+    if (m) {
+      const replacement = m[0] === m[0].toLowerCase() ? color.toLowerCase() : color;
+      return name.replace(re, replacement);
+    }
+  }
+  return '';
+}
+
+export async function completeFamilies(): Promise<number> {
+  const fams = await pool.query(`
+    SELECT family_code, json_agg(json_build_object(
+      'id', id, 'name', name, 'en', supplier_name, 'vo', variant_options)) AS members
+    FROM products
+    WHERE status = 'published' AND family_code IN (
+      SELECT family_code FROM products WHERE status = 'published'
+      GROUP BY family_code
+      HAVING bool_or(variant_options IS NULL) AND bool_or(variant_options IS NOT NULL) AND count(*) <= 300)
+    GROUP BY family_code`);
+
+  const ids: number[] = [];
+  const opts: string[] = [];
+  const names: string[] = [];
+  for (const { members } of fams.rows as { members: { id: number; name: string; en: string | null; vo: Record<string, string> | null }[] }[]) {
+    const codeToColor = new Map<string, string>();
+    const sizes = new Set<string>();
+    const nameByColor = new Map<string, string>();
+    for (const m of members) {
+      if (!m.vo) continue;
+      if (m.vo.Talla) sizes.add(m.vo.Talla.toUpperCase());
+      if (m.vo.Color && m.name && !isAllCaps(m.name)) nameByColor.set(m.vo.Color, m.name);
+      const tokens = (m.en || '').split(',').map((t) => t.trim().toUpperCase()).filter(Boolean);
+      if (m.vo.Color && tokens.length >= 2) {
+        const tail = tokens.slice(1).filter((t) => !(m.vo!.Talla && t === m.vo!.Talla.toUpperCase()));
+        const code = tail[tail.length - 1];
+        if (code && !codeToColor.has(code)) codeToColor.set(code, m.vo.Color);
+      }
+    }
+    for (const m of members) {
+      if (m.vo || !m.name) continue;
+      const tokens = m.name.split(',').map((t) => t.trim().toUpperCase()).filter(Boolean);
+      if (tokens.length < 2) continue;
+      const derived: Record<string, string> = {};
+      let rest = tokens.slice(1);
+      const last = rest[rest.length - 1];
+      if (last && (sizes.has(last) || (sizes.size > 0 && SIZE_TOKEN.test(last)))) {
+        derived.Talla = last;
+        rest = rest.slice(0, -1);
+      }
+      const colorCode = rest[rest.length - 1];
+      if (colorCode && codeToColor.has(colorCode)) derived.Color = codeToColor.get(colorCode)!;
+      else if (colorCode && codeToColor.size > 0 && COLOR_CODES[colorCode]) derived.Color = COLOR_CODES[colorCode];
+      if (!Object.keys(derived).length) continue;
+      ids.push(m.id);
+      opts.push(JSON.stringify(derived));
+      names.push(isAllCaps(m.name) && derived.Color ? spanishNameFor(derived.Color, nameByColor) : '');
+    }
+  }
+  if (!ids.length) return 0;
+  const res = await pool.query(
+    `UPDATE products p SET
+       variant_options = v.vo::jsonb,
+       name = CASE WHEN v.nm <> '' THEN v.nm ELSE p.name END
+     FROM unnest($1::int[], $2::text[], $3::text[]) AS v(id, vo, nm)
+     WHERE p.id = v.id AND p.variant_options IS NULL`, [ids, opts, names]);
+  return res.rowCount || 0;
+}
+
 /** Lee el JSON de la API de Bihr y devuelve las referencias mínimas. */
 export function loadBihrApiRefs(jsonPath: string): BihrRefLite[] {
   const data = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
@@ -256,6 +348,8 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   console.log(`[ENRICH] ${refs.length} referencias de la API, ${csvIndex.size} filas de CSV`);
   const a = await applyEnrichment(refs, csvIndex);
   const b = await markDuplicates();
+  const completed = await completeFamilies();
+  console.log(`[ENRICH] ${completed} variantes completadas a partir de su modelo`);
   // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.
   await pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY catalog_words').catch((e) =>
     console.error('[ENRICH] No se pudo refrescar catalog_words:', e.message));
