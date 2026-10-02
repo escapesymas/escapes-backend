@@ -21,7 +21,7 @@ export const catalogRouter = Router();
 // Columnas necesarias para pintar una tarjeta de producto en listados. Evita
 // enviar descripción HTML, atributos y compatibilidades (cientos de KB por
 // producto en algunos casos: la sección de compatibles llegaba a 17 MB).
-const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, promo_id, stock, images, category_id, status, brand, dropshipping, ondemand, family_code, variant_options`;
+const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, promo_price, promo_id, stock, images, category_id, status, brand, dropshipping, ondemand, family_code, variant_options`;
 
 /** Agrupa filas de tarjeta por modelo: una tarjeta por familia con resumen de variantes. */
 function groupCardsByFamily(rows: any[]): any[] {
@@ -32,7 +32,7 @@ function groupCardsByFamily(rows: any[]): any[] {
   }
   const out: any[] = [];
   for (const [code, list] of groups) {
-    const eff = (r: any) => (r.sale_price && r.sale_price > 0 ? r.sale_price : r.price);
+    const eff = (r: any) => (r.promo_price > 0 ? r.promo_price : r.sale_price > 0 ? r.sale_price : r.price);
     const rep = [...list].sort((a, b) => Number(b.stock > 0) - Number(a.stock > 0) || eff(a) - eff(b))[0];
     const mapped: any = mapProductToFrontend(rep);
     if (list.length > 1) {
@@ -193,7 +193,8 @@ function bestDescription(row: any): string {
 
 export function mapProductToFrontend(row: any) {
   const priceEur = (row.price || 0) / 100;
-  const salePriceEur = row.sale_price ? row.sale_price / 100 : null;
+  // Lo que paga el cliente: precio de promoción, si no DTO1 (sale_price); price es el PVP.
+  const salePriceEur = row.promo_price > 0 ? row.promo_price / 100 : row.sale_price ? row.sale_price / 100 : null;
   let images: any[] = [];
   if (row.images) {
     if (typeof row.images === 'string') {
@@ -253,8 +254,10 @@ export function mapProductToFrontend(row: any) {
     regularPrice: priceEur,
     sale_price: salePriceEur,
     salePrice: salePriceEur,
-    // price = PVP; sale_price = DTO1 (precio habitual) o el de una promoción activa.
-    onPromotion: !!row.promo_id,
+    // price = PVP; sale_price = DTO1; promo_price = promoción activa.
+    onPromotion: row.promo_price > 0,
+    // Precio habitual (DTO1) mientras dura una promoción: la referencia de la rebaja.
+    usualPrice: row.promo_price > 0 && row.sale_price > 0 ? row.sale_price / 100 : null,
     stock: typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0),
     inStock: (typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0)) > 0,
     brand: row.brand || '',
@@ -423,7 +426,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
 
       responseData = Array.from(skusSet);
     } else if (action === 'compatible-products') {
-      const prodRedisKey = `compat:prod:v9:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+      const prodRedisKey = `compat:prod:v10:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
       const cachedProducts = await cacheGet<any[]>(prodRedisKey);
       if (cachedProducts) {
         return res.json(cachedProducts);
@@ -558,7 +561,7 @@ catalogRouter.get('/search/suggestions', async (req, res) => {
     if (q.length < 2) return res.json({ suggestions: [], products: [] });
     const limit = Math.min(Math.max(parseInt(String(req.query.limit), 10) || 6, 1), 10);
 
-    const cacheKey = `cache:suggest:v3:${normalizeText(q)}:${limit}`;
+    const cacheKey = `cache:suggest:v4:${normalizeText(q)}:${limit}`;
     const cached = await cacheGet<any>(cacheKey);
     if (cached) return res.json(cached);
 
@@ -643,7 +646,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     const sort: SortKey = (['relevance', 'price_asc', 'price_desc', 'name_asc', 'newest'] as SortKey[])
       .includes(sortParam as SortKey) ? (sortParam as SortKey) : (query.search || query.q ? 'relevance' : 'relevance');
 
-    const redisKey = cacheKeyFor('cache:products:v5', query);
+    const redisKey = cacheKeyFor('cache:products:v6', query);
     type Payload = { products: any[]; total: number; refs?: number; totalPages: number; fuzzy: boolean; corrected?: string | null };
     const cached = await cacheGet<Payload>(redisKey);
     const send = (data: Payload) => {
@@ -896,7 +899,7 @@ catalogRouter.get('/catalog/frequently-bought-together/:productId', async (req, 
         ORDER BY co_count DESC
         LIMIT 6
       )
-      SELECT p.id, p.sku, p.name, p.brand, p.price, p.sale_price, p.stock, p.images,
+      SELECT p.id, p.sku, p.name, p.brand, p.price, p.sale_price, p.promo_price, p.stock, p.images,
              r.co_count
       FROM related r
       JOIN products p ON p.id = r.related_id
@@ -920,7 +923,7 @@ catalogRouter.get('/catalog/frequently-bought-together/:productId', async (req, 
         name: row.name,
         brand: row.brand,
         price: row.price,
-        sale_price: row.sale_price,
+        sale_price: row.promo_price > 0 ? row.promo_price : row.sale_price,
         stock: row.stock,
         image: firstImage,
         co_count: row.co_count,

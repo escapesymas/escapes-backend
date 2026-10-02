@@ -6450,7 +6450,7 @@ function parseAttributes(raw: any): { name: string; value: string }[] {
 
 function mapProductToFrontend(row: any) {
   const priceEur = (row.price || 0) / 100;
-  const salePriceEur = row.sale_price ? row.sale_price / 100 : null;
+  const salePriceEur = row.promo_price > 0 ? row.promo_price / 100 : row.sale_price ? row.sale_price / 100 : null;
   let images: any[] = [];
   if (row.images) {
     if (typeof row.images === 'string') {
