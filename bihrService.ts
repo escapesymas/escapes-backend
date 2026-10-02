@@ -670,6 +670,9 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             $20, $21, $22, $23,
             $24::jsonb, $25, 'published', NOW(), NOW()
           )
+          -- Las categorías solo se fijan al crear el producto: el mapa fijo de
+          -- abajo es muy grueso (por defecto la 1) y pisaba las asignadas por
+          -- el enriquecimiento o a mano en el admin.
           ON CONFLICT (sku) DO UPDATE SET
             name = EXCLUDED.name,
             brand = EXCLUDED.brand,
@@ -680,10 +683,6 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             stock = EXCLUDED.stock,
             barcode = EXCLUDED.barcode,
             description = EXCLUDED.description,
-            category_id = EXCLUDED.category_id,
-            category2 = EXCLUDED.category2,
-            category3 = EXCLUDED.category3,
-            category2_id = EXCLUDED.category2_id,
             weight_g = EXCLUDED.weight_g,
             length_mm = EXCLUDED.length_mm,
             width_mm = EXCLUDED.width_mm,

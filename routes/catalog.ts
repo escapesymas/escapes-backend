@@ -904,6 +904,19 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
 
     const product: any = mapProductToFrontend(row);
     product.variantOptions = row.variant_options || null;
+    // Ruta completa de categorías (raíz → hoja) para el breadcrumb.
+    const leafId = row.category3_id || row.category2_id || row.category_id;
+    if (leafId) {
+      const path = await pool.query(`
+        WITH RECURSIVE up AS (
+          SELECT id, name, slug, parent_id, 0 AS depth FROM categories WHERE id = $1
+          UNION ALL SELECT c.id, c.name, c.slug, c.parent_id, up.depth + 1
+          FROM categories c JOIN up ON c.id = up.parent_id WHERE up.depth < 6
+        ) SELECT name, slug FROM up ORDER BY depth DESC`, [leafId]);
+      product.categoryPath = path.rows;
+    } else {
+      product.categoryPath = [];
+    }
     product.family = null;
     if (row.family_code) {
       const variants = await familyVariants(row.family_code);

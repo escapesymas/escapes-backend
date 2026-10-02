@@ -35,6 +35,9 @@ interface CsvInfo {
   attrs: Record<string, string>;
   /** Fotos del proveedor (Picture1…6), en orden */
   pictures: string[];
+  /** Categorías de Bihr (Category2 / Category3, en inglés) */
+  cat2: string;
+  cat3: string;
 }
 
 // Columnas V-* → nombre del eje que verá el cliente.
@@ -128,7 +131,11 @@ export function loadCsvIndex(csvDir: string): Map<string, CsvInfo> {
         const i = idx(`Picture${k}`);
         if (i >= 0 && /^https?:\/\//.test(cols[i] || '')) pictures.push(cols[i].trim());
       }
+      const i2 = idx('Category2');
+      const i3 = idx('Category3');
       index.set(pn, {
+        cat2: i2 >= 0 ? (cols[i2] || '').trim().toUpperCase() : '',
+        cat3: i3 >= 0 ? (cols[i3] || '').trim().toUpperCase() : '',
         pictures,
         nameEn: iName >= 0 ? cols[iName] : '',
         nameEs: iEs >= 0 ? (cols[iEs] || '').trim() : '',
@@ -359,6 +366,95 @@ export async function completeFamilies(): Promise<number> {
   return res.rowCount || 0;
 }
 
+/**
+ * Coloca en su categoría los productos sin subcategoría (p. ej. los que el
+ * importador dejaba en la 1 "Cascos" por defecto), usando la categoría de Bihr
+ * del CSV y la correspondencia categories.bihr_cat3 / bihr_cat2. Solo usa el
+ * árbol vigente (no los slugs old-*) y elige la categoría más profunda.
+ * Guarda raíz, segundo nivel y hoja en category_id / category2_id / category3_id.
+ */
+export async function assignCategories(csvIndex: Map<string, CsvInfo>): Promise<number> {
+  const cats = (await pool.query('SELECT id, parent_id, slug, bihr_cat2, bihr_cat3 FROM categories')).rows as
+    { id: number; parent_id: number | null; slug: string; bihr_cat2: string | null; bihr_cat3: string | null }[];
+  const byId = new Map(cats.map((c) => [c.id, c]));
+  const chainCache = new Map<number, number[]>();
+  const chainOf = (id: number): number[] => {
+    const hit = chainCache.get(id);
+    if (hit) return hit;
+    const chain: number[] = [];
+    let c = byId.get(id);
+    while (c && chain.length < 6) { chain.unshift(c.id); c = c.parent_id ? byId.get(c.parent_id) : undefined; }
+    chainCache.set(id, chain);
+    return chain;
+  };
+  const isCurrent = (id: number) => {
+    const chain = chainOf(id);
+    return chain.length > 0 && chain.every((x) => !(byId.get(x)?.slug || '').startsWith('old-'));
+  };
+  const pick = (map: Map<string, number[]>, key: string) => {
+    const ids = (map.get(key) || []).filter(isCurrent);
+    return ids.sort((a, b) => chainOf(b).length - chainOf(a).length)[0];
+  };
+  const by3 = new Map<string, number[]>();
+  const by2 = new Map<string, number[]>();
+  for (const c of cats) {
+    if (c.bihr_cat3) (by3.get(c.bihr_cat3.trim().toUpperCase()) || by3.set(c.bihr_cat3.trim().toUpperCase(), []).get(c.bihr_cat3.trim().toUpperCase())!).push(c.id);
+    if (c.bihr_cat2) (by2.get(c.bihr_cat2.trim().toUpperCase()) || by2.set(c.bihr_cat2.trim().toUpperCase(), []).get(c.bihr_cat2.trim().toUpperCase())!).push(c.id);
+  }
+
+  const bestCache = new Map<string, number | undefined>();
+  const pickCached = (map: Map<string, number[]>, key: string, tag: string) => {
+    const k = `${tag}:${key}`;
+    if (!bestCache.has(k)) bestCache.set(k, pick(map, key));
+    return bestCache.get(k);
+  };
+
+  const targets = (await pool.query(`
+    SELECT id, sku, part_number FROM products
+    WHERE status = 'published' AND category3_id IS NULL AND category2_id IS NULL`)).rows as { id: number; sku: string; part_number: string | null }[];
+
+  const ids: number[] = []; const c1: number[] = []; const c2: number[] = []; const c3: number[] = [];
+  for (const t of targets) {
+    const info = (t.part_number && csvIndex.get(t.part_number)) || csvIndex.get(t.sku);
+    if (!info) continue;
+    const leaf = pickCached(by3, info.cat3, '3') ?? pickCached(by2, info.cat2, '2');
+    if (!leaf) continue;
+    const chain = chainOf(leaf);
+    ids.push(t.id); c1.push(chain[0]); c2.push(chain[1] ?? chain[0]); c3.push(leaf);
+  }
+  let updated = 0;
+  for (let i = 0; i < ids.length; i += 2000) {
+    const r = await pool.query(
+      `UPDATE products p SET category_id = v.c1, category2_id = v.c2, category3_id = v.c3
+       FROM unnest($1::int[], $2::int[], $3::int[], $4::int[]) AS v(id, c1, c2, c3)
+       WHERE p.id = v.id AND p.category3_id IS NULL AND p.category2_id IS NULL`,
+      [ids.slice(i, i + 2000), c1.slice(i, i + 2000), c2.slice(i, i + 2000), c3.slice(i, i + 2000)]);
+    updated += r.rowCount || 0;
+  }
+
+  // Raíz y segundo nivel coherentes con la hoja (había productos con la hoja
+  // bien puesta pero la raíz en la 1 "Cascos").
+  const withLeaf = (await pool.query(`
+    SELECT id, category_id, category2_id, category3_id FROM products
+    WHERE status = 'published' AND category3_id IS NOT NULL`)).rows as { id: number; category_id: number; category2_id: number | null; category3_id: number }[];
+  const fixIds: number[] = []; const f1: number[] = []; const f2: number[] = [];
+  for (const r of withLeaf) {
+    const chain = chainOf(r.category3_id);
+    if (!chain.length) continue;
+    const want1 = chain[0];
+    const want2 = chain[1] ?? chain[0];
+    if (r.category_id !== want1 || r.category2_id !== want2) { fixIds.push(r.id); f1.push(want1); f2.push(want2); }
+  }
+  for (let i = 0; i < fixIds.length; i += 2000) {
+    const r = await pool.query(
+      `UPDATE products p SET category_id = v.c1, category2_id = v.c2
+       FROM unnest($1::int[], $2::int[], $3::int[]) AS v(id, c1, c2) WHERE p.id = v.id`,
+      [fixIds.slice(i, i + 2000), f1.slice(i, i + 2000), f2.slice(i, i + 2000)]);
+    updated += r.rowCount || 0;
+  }
+  return updated;
+}
+
 /** Lee el JSON de la API de Bihr y devuelve las referencias mínimas. */
 export function loadBihrApiRefs(jsonPath: string): BihrRefLite[] {
   const data = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
@@ -376,6 +472,8 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   const b = await markDuplicates();
   const completed = await completeFamilies();
   console.log(`[ENRICH] ${completed} variantes completadas a partir de su modelo`);
+  const categorized = await assignCategories(csvIndex);
+  console.log(`[ENRICH] ${categorized} productos colocados en su categoría`);
   // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.
   await pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY catalog_words').catch((e) =>
     console.error('[ENRICH] No se pudo refrescar catalog_words:', e.message));
