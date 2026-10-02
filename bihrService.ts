@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { pool } from './db.js';
 import { refreshCompatModels } from './lib/compat.js';
+import { enrichCatalog } from './lib/catalog-enrich.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -287,6 +288,9 @@ export async function getBihrOrderStatus(ticketId: string) {
 /**
  * Lógica para solicitar la generación asíncrona, descargar e importar el catálogo
  */
+/** Último catálogo JSON de Bihr descargado (lo usa el enriquecimiento manual). */
+export const LATEST_CATALOG_JSON = process.env.BIHR_LATEST_CATALOG_JSON || '/app/server/uploads/bihr-catalog-latest.json';
+
 export async function syncBihrCatalog(catalogType: 'HardPart' | 'RiderGear' | 'Prices' = 'HardPart'): Promise<boolean> {
   const token = await getBihrToken();
   const startTime = new Date().toISOString();
@@ -460,6 +464,14 @@ async function downloadAndProcessCatalog(downloadId: string, catalogType: string
       
       // Limpieza programada de temporales en background
       resolve(processCatalogJson(jsonFilePath, catalogType, startTime).then(() => {
+        // Copia del último catálogo para poder relanzar el enriquecimiento
+        // desde el admin (POST /api/admin/catalog/enrich).
+        try {
+          fs.mkdirSync(path.dirname(LATEST_CATALOG_JSON), { recursive: true });
+          fs.copyFileSync(jsonFilePath, LATEST_CATALOG_JSON);
+        } catch (e) {
+          console.error('[BIHR SERVICE WARNING]: No se pudo guardar la copia del catálogo:', e);
+        }
         try {
           fs.unlinkSync(zipPath);
           fs.rmSync(extractDir, { recursive: true, force: true });
@@ -543,6 +555,8 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
         const brand = ref.Brand || '';
         const supplierCode = ref.SupplierProductCode || '';
         const oldPartNumber = ref.OldPartNumber || '';
+        // Número de pieza de Bihr: agrupa variantes (lib/catalog-enrich.ts).
+        const partNumber = ref.NewPartNumber ? String(ref.NewPartNumber) : null;
 
         let cost = 0;
         let price = 0;
@@ -647,14 +661,14 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             category_id, category2, category3, category2_id,
             weight_g, length_mm, width_mm, height_mm, volume_cm3,
             dropshipping, ondemand, delivery_plant, commodity_code,
-            attributes, status, created_at, updated_at
+            attributes, part_number, status, created_at, updated_at
           ) VALUES (
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9, $10,
             $11, $12, $13, $14,
             $15, $16, $17, $18, $19,
             $20, $21, $22, $23,
-            $24::jsonb, 'published', NOW(), NOW()
+            $24::jsonb, $25, 'published', NOW(), NOW()
           )
           ON CONFLICT (sku) DO UPDATE SET
             name = EXCLUDED.name,
@@ -679,7 +693,8 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
             ondemand = EXCLUDED.ondemand,
             delivery_plant = EXCLUDED.delivery_plant,
             commodity_code = EXCLUDED.commodity_code,
-            attributes = EXCLUDED.attributes,
+            attributes = (CASE WHEN jsonb_typeof(products.attributes) = 'object' THEN products.attributes ELSE '{}'::jsonb END) || EXCLUDED.attributes,
+            part_number = COALESCE(EXCLUDED.part_number, products.part_number),
             updated_at = NOW()
           RETURNING id, (xmax = 0) AS inserted
         `, [
@@ -688,7 +703,7 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
           categoryId, ref.Category2 || '', ref.Category3 || '', category2Id,
           weightG, lengthMm, widthMm, heightMm, volumeCm3,
           dropshipping, ondemand, deliveryPlant, commodityCode,
-          attributesJson
+          attributesJson, partNumber
         ]);
 
         if (result.rows[0]?.inserted) {
@@ -709,6 +724,16 @@ async function processCatalogJson(filePath: string, catalogType: string, startTi
   }
   
   console.log(`[BIHR SERVICE]: Importación completada. Nuevos: ${totalInserted}, Actualizados: ${totalUpdated}`);
+
+  // Variantes, atributos del CSV y duplicados (idempotente).
+  try {
+    const csvDir = [process.env.CATALOG_CSV_DIR, '/app/server/uploads/catalog-csv', '/app/server/catalog-csv']
+      .find((d) => d && fs.existsSync(d)) || '';
+    const stats = await enrichCatalog(filePath, csvDir);
+    console.log('[BIHR SERVICE]: Enriquecimiento del catálogo:', stats);
+  } catch (e) {
+    console.error('[BIHR SERVICE] Error enriqueciendo el catálogo:', e);
+  }
 
   // Las compatibilidades pueden haber cambiado: recalcular la tabla de modelos.
   refreshCompatModels().catch(e => console.error('[BIHR SERVICE] Error refrescando compat_vehicle_models:', e));

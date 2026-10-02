@@ -4,6 +4,11 @@ import { sql } from 'drizzle-orm';
 import os from 'os';
 import { execSync } from 'child_process';
 import { authenticateRequest } from '../utils.js';
+import fs from 'fs';
+import { enrichCatalog, type EnrichStats } from '../lib/catalog-enrich.js';
+import { refreshCompatModels } from '../lib/compat.js';
+import { LATEST_CATALOG_JSON } from '../bihrService.js';
+import { cacheBust } from '../lib/cache.js';
 
 export const adminRouter = Router();
 
@@ -123,3 +128,31 @@ adminRouter.get('/admin/dashboard-stats', requireAdmin, async (_req: any, res: a
     res.status(500).json({ error: err.message });
   }
 });
+
+// Enriquecimiento del catálogo (variantes, atributos, duplicados) a partir del
+// último catálogo de Bihr descargado. Tarda varios minutos: se lanza en segundo
+// plano y se consulta el estado.
+let enrichState: { status: 'idle' | 'running' | 'done' | 'error'; startedAt?: string; finishedAt?: string; stats?: EnrichStats; error?: string } = { status: 'idle' };
+
+adminRouter.post('/admin/catalog/enrich', requireAdmin, async (_req: any, res: any) => {
+  if (enrichState.status === 'running') return res.status(409).json({ error: 'Ya hay un enriquecimiento en curso', state: enrichState });
+  if (!fs.existsSync(LATEST_CATALOG_JSON)) {
+    return res.status(400).json({ error: 'No hay catálogo de Bihr descargado. Lanza antes una sincronización de catálogo.' });
+  }
+  const csvDir = [process.env.CATALOG_CSV_DIR, '/app/server/uploads/catalog-csv', '/app/server/catalog-csv']
+    .find((d) => d && fs.existsSync(d)) || '';
+  enrichState = { status: 'running', startedAt: new Date().toISOString() };
+  enrichCatalog(LATEST_CATALOG_JSON, csvDir)
+    .then(async (stats) => {
+      enrichState = { ...enrichState, status: 'done', finishedAt: new Date().toISOString(), stats };
+      await refreshCompatModels().catch(() => {});
+      await cacheBust('cache:products');
+      await cacheBust('cache:filters');
+    })
+    .catch((e: any) => {
+      enrichState = { ...enrichState, status: 'error', finishedAt: new Date().toISOString(), error: e?.message || String(e) };
+    });
+  return res.status(202).json(enrichState);
+});
+
+adminRouter.get('/admin/catalog/enrich', requireAdmin, (_req: any, res: any) => res.json(enrichState));

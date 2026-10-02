@@ -44,6 +44,8 @@ RUN --mount=type=cache,target=/root/.npm (npm ci --legacy-peer-deps --omit=dev -
 # Copy compiled JavaScript dist & assets from builder stage
 COPY --chown=backend:nodejs --from=builder /app/server/dist ./dist
 COPY --chown=backend:nodejs templates/ ./templates/
+# Migraciones SQL versionadas (lib/migrate.ts las aplica al arrancar)
+COPY --chown=backend:nodejs migrations/ ./migrations/
 COPY --chown=backend:nodejs moto_catalog.jso[n] ./
 COPY --chown=backend:nodejs catalog-csv.zi[p] ./
 

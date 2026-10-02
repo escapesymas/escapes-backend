@@ -43,6 +43,8 @@ import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
+import { runMigrations } from './lib/migrate.js';
+import { backfillCatalogColumns } from './lib/catalog-backfill.js';
 
 // Initialize Sentry as early as possible so subsequent unhandled errors are
 // captured. No-op when SENTRY_DSN is unset (local dev).
@@ -306,6 +308,10 @@ const db = drizzle(pool);
     // compatibilidades en memoria, ~1 GB con el catálogo actual, solo lo usaba
     // una copia muerta de /api/vehicles y se ha eliminado.)
     initCategoryMap().catch(e => console.error('[CATEGORY MAP INITIAL LOAD ERROR]:', e));
+    // Migraciones versionadas (migrations/008+), después rellenos por lotes.
+    runMigrations()
+      .then(() => backfillCatalogColumns())
+      .catch(e => console.error('[MIGRATIONS ERROR]:', e));
     // Vista de modelos compatibles (lib/compat.ts). Solo tarda la primera vez.
     ensureCompatModels().catch(e => console.error('[COMPAT MODELS INIT ERROR]:', e));
   } catch (err) {
@@ -2310,6 +2316,28 @@ async function createInvoiceForOrder(orderId: number) {
   return invRes.rows[0];
 }
 
+// Guarda el modelo (family_code) y los ejes de variante de un producto desde
+// el admin. Solo toca lo que viene en el payload.
+async function saveProductVariant(productId: number, b: any) {
+  if (!productId) return;
+  if (b.familyCode !== undefined) {
+    const code = String(b.familyCode || '').trim().slice(0, 60);
+    await pool.query(`UPDATE products SET family_code = COALESCE(NULLIF($1, ''), sku) WHERE id = $2`, [code, productId]);
+  }
+  if (b.variantOptions !== undefined) {
+    const opts: Record<string, string> = {};
+    if (b.variantOptions && typeof b.variantOptions === 'object') {
+      for (const [k, v] of Object.entries(b.variantOptions).slice(0, 6)) {
+        const key = String(k).trim().slice(0, 40);
+        const val = String(v ?? '').trim().slice(0, 60);
+        if (key && val) opts[key] = key === 'Talla' ? val.toUpperCase() : val;
+      }
+    }
+    await pool.query(`UPDATE products SET variant_options = $1::jsonb WHERE id = $2`,
+      [Object.keys(opts).length ? JSON.stringify(opts) : null, productId]);
+  }
+}
+
 app.all('/api/admin', adminLimiter, async (req, res) => {
   const { action, userId, email } = req.query as any;
 
@@ -2541,6 +2569,18 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         if (!attribute_id || !name) return res.status(400).json({ error: 'Faltan datos' });
         const r = await pool.query('INSERT INTO product_attribute_terms (attribute_id, name) VALUES ($1, $2) RETURNING *', [attribute_id, name]);
         return res.json(r.rows[0]);
+      }
+
+      case 'product-family': {
+        // Variantes del mismo modelo (family_code) que el producto indicado.
+        const pid = parseIntSafe(req.query.product_id);
+        if (!pid) return res.status(400).json({ error: 'Falta product_id' });
+        const fam = await pool.query(
+          `SELECT v.id, v.sku, v.name, v.price, v.sale_price, v.stock, v.status, v.variant_options
+           FROM products p JOIN products v ON v.family_code = p.family_code
+           WHERE p.id = $1 AND v.status IN ('published', 'draft')
+           ORDER BY v.id LIMIT 300`, [pid]);
+        return res.json(fam.rows);
       }
 
       case 'get-product-variations': {
@@ -3032,6 +3072,8 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         // Bust product + filter cache: a new product changes both the
         // catalog listings and any aggregated brand/category filter facets.
+        await saveProductVariant(newId, b);
+
         await cacheBust('cache:products');
         await cacheBust('cache:filters');
 
@@ -4733,6 +4775,8 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         // Bust product + filter cache: any field change (price, stock, brand,
         // category, status, etc.) can shift both the listing and the filter
         // facets computed from it.
+        await saveProductVariant(productId, b);
+
         await cacheBust('cache:products');
         await cacheBust('cache:filters');
 
