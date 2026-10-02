@@ -38,7 +38,7 @@ import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { quoteOrder } from './lib/order-pricing.js';
-import { repriceProducts, pricingAuto } from './lib/pricing.js';
+import { repriceProducts, pricingAuto, refreshDto2, applyPromotions, suggestBrandRules, saveBrandRules } from './lib/pricing.js';
 import { isIP } from 'node:net';
 import { catalogRouter } from './routes/catalog.js';
 import { ordersRouter } from './routes/orders.js';
@@ -3905,6 +3905,73 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         return res.json(await repriceProducts({ dryRun: true }));
       }
 
+      // ── DTO1 por marca: descuento sugerido para un margen medio objetivo ──
+      case 'brand-rules-suggest':
+      case 'brand-rules-save': {
+        const src = req.method === 'POST' ? (req.body || {}) : (req.query || {});
+        const targetMargin = Number(src.targetMargin ?? 30);
+        const minMargin = Number(src.minMargin ?? 15);
+        const maxDiscount = Number(src.maxDiscount ?? 40);
+        if (!(targetMargin >= 0 && targetMargin <= 60) || !(minMargin >= 0 && minMargin <= targetMargin) || !(maxDiscount > 0 && maxDiscount <= 60)) {
+          return res.status(400).json({ error: 'Margen objetivo 0–60 %, mínimo ≤ objetivo y descuento máximo ≤ 60 %' });
+        }
+        const list = await suggestBrandRules({ targetMargin, minMargin, maxDiscount });
+        if (action === 'brand-rules-suggest') return res.json(list);
+        if (req.method !== 'POST') return res.status(405).end();
+        const saved = await saveBrandRules(list, minMargin);
+        await logAdminAction(req, 'brand-rules-save', { targetMargin, minMargin, maxDiscount, saved });
+        return res.json({ success: true, saved });
+      }
+
+      // ── Promociones (DTO2: precio mínimo sin pérdidas) ──────────────
+      case 'promotions-list': {
+        const r = await pool.query(`
+          SELECT pr.*, (SELECT count(*)::int FROM products p WHERE p.promo_id = pr.id) AS products
+          FROM promotions pr ORDER BY pr.active DESC, pr.starts_at DESC NULLS LAST, pr.id DESC`);
+        return res.json(r.rows);
+      }
+
+      case 'save-promotion': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const b = req.body || {};
+        const scope = String(b.scope || '');
+        const level = b.level === 'percent' ? 'percent' : 'dto2';
+        const percent = level === 'percent' ? Number(b.percent) : null;
+        const name = sanitizeString(String(b.name || '')).slice(0, 120);
+        const target = scope === 'all' ? null : String(b.target || '').trim().slice(0, 4000);
+        const startsAt = b.startsAt ? new Date(b.startsAt) : null;
+        const endsAt = b.endsAt ? new Date(b.endsAt) : null;
+        if (!name || !['all', 'category', 'brand', 'skus'].includes(scope) || (scope !== 'all' && !target)
+            || (level === 'percent' && !(percent! > 0 && percent! < 90))
+            || (startsAt && isNaN(startsAt.getTime())) || (endsAt && isNaN(endsAt.getTime()))
+            || (startsAt && endsAt && endsAt <= startsAt)) {
+          return res.status(400).json({ error: 'Promoción incompleta: nombre, ámbito, nivel y fechas válidas' });
+        }
+        const active = b.active !== false;
+        if (b.id) {
+          await pool.query(`UPDATE promotions SET name=$1, scope=$2, target=$3, level=$4, percent=$5, starts_at=$6, ends_at=$7, active=$8 WHERE id=$9`,
+            [name, scope, target, level, percent, startsAt, endsAt, active, parseInt(b.id)]);
+        } else {
+          await pool.query(`INSERT INTO promotions (name, scope, target, level, percent, starts_at, ends_at, active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [name, scope, target, level, percent, startsAt, endsAt, active]);
+        }
+        const r = await applyPromotions();
+        await cacheBust('cache:products');
+        await logAdminAction(req, 'save-promotion', { name, scope, level, ...r });
+        return res.json({ success: true, ...r });
+      }
+
+      case 'delete-promotion': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const id = parseInt(req.body?.id);
+        if (!id) return res.status(400).json({ error: 'Falta ID' });
+        await pool.query('DELETE FROM promotions WHERE id = $1', [id]);
+        const r = await applyPromotions();
+        await cacheBust('cache:products');
+        await logAdminAction(req, 'delete-promotion', { id, ...r });
+        return res.json({ success: true, ...r });
+      }
+
       case 'pricing-auto': {
         if (req.method === 'POST') {
           const on = req.body?.enabled === true;
@@ -6887,6 +6954,12 @@ app.listen(PORT, () => {
   // Placed after listen() so the boot banner is printed first even if the
   // initial run takes a few seconds.
   startBihrStockCron();
+  // Promociones con fechas (DTO2): se activan y se retiran solas.
+  const promoTick = () => applyPromotions()
+    .then((r) => { if (r.applied || r.removed) { console.log(`[PROMOS] ${r.applied} aplicadas, ${r.removed} retiradas`); return cacheBust('cache:products'); } })
+    .catch((e) => console.error('[PROMOS] Error aplicando promociones:', e.message));
+  setTimeout(promoTick, 60_000);
+  setInterval(promoTick, 5 * 60_000);
 });
 
 export default app;

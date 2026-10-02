@@ -58,11 +58,13 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
 
   const ids = input.cart.map((l) => l.id);
   const rows = ids.length
-    ? (await pool.query('SELECT id, price, sale_price, stock FROM products WHERE id = ANY($1)', [ids])).rows
+    ? (await pool.query('SELECT id, price, sale_price, stock, promo_id FROM products WHERE id = ANY($1)', [ids])).rows
     : [];
   const byId = new Map(rows.map((r: any) => [r.id, r]));
 
   let subtotalCents = 0;
+  // Líneas en promoción (precio DTO2, el mínimo sin pérdidas): no admiten más descuentos.
+  let promoCents = 0;
   const items: Quote['items'] = [];
   const stockErrors: Quote['stockErrors'] = [];
   const missing: number[] = [];
@@ -71,6 +73,7 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
     if (!row) { missing.push(line.id); continue; }
     const price = Number(row.sale_price) || Number(row.price) || 0;
     subtotalCents += price * line.quantity;
+    if (row.promo_id) promoCents += price * line.quantity;
     const stock = Number(row.stock) || 0;
     if (stock < line.quantity) stockErrors.push({ id: line.id, requested: line.quantity, available: stock });
     items.push({ productId: line.id, quantity: line.quantity, price });
@@ -107,7 +110,8 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
   }
 
   discountPercent = Math.min(100, Math.max(0, discountPercent));
-  const discountCents = Math.min(subtotalCents, Math.round((subtotalCents * discountPercent) / 100) + Math.max(0, fixedCents));
+  const discountable = subtotalCents - promoCents;
+  const discountCents = Math.min(discountable, Math.round((discountable * discountPercent) / 100) + Math.max(0, fixedCents));
 
   // Impuesto del destino: los precios llevan el IVA español y se reexpresan con
   // el tipo de la regla (0 % en Canarias, Ceuta y Melilla).
