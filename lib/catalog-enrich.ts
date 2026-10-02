@@ -46,7 +46,8 @@ const VARIANT_KEY_MAP: Record<string, string> = {
   'V-Youth Pants Size': 'Talla',
   'V-Color': 'Color',
   'V-Colores': 'Color',
-  'V-Tamaño': 'Tamaño',
+  // En el catálogo de Bihr, V-Tamaño contiene tallas de ropa (S, M, L, UK40…).
+  'V-Tamaño': 'Talla',
 };
 
 // Atributos útiles para filtrar (no son ejes de variante).
@@ -63,7 +64,9 @@ export function normalizeVariantOptions(raw: Record<string, string | undefined>)
     if (!value || !k.startsWith('V-') || k === 'V-') continue;
     const key = VARIANT_KEY_MAP[k] || k.slice(2).trim();
     if (!key || out[key]) continue;
-    out[key] = key === 'Talla' ? value.toUpperCase().replace(/\s+/g, '') : value;
+    // Códigos cortos de talla en mayúsculas (s/m → S/M); textos como
+    // "Talla única adulto" se dejan tal cual.
+    out[key] = key === 'Talla' && value.length <= 7 && !/\s/.test(value) ? value.toUpperCase() : value;
   }
   return out;
 }
@@ -253,5 +256,8 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   console.log(`[ENRICH] ${refs.length} referencias de la API, ${csvIndex.size} filas de CSV`);
   const a = await applyEnrichment(refs, csvIndex);
   const b = await markDuplicates();
+  // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.
+  await pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY catalog_words').catch((e) =>
+    console.error('[ENRICH] No se pudo refrescar catalog_words:', e.message));
   return { ...a, ...b };
 }

@@ -536,9 +536,11 @@ catalogRouter.get('/catalog/products', async (req, res) => {
       .includes(sortParam as SortKey) ? (sortParam as SortKey) : (query.search || query.q ? 'relevance' : 'relevance');
 
     const redisKey = cacheKeyFor('cache:products:v2', query);
-    const cached = await cacheGet<{ products: any[]; total: number; totalPages: number; fuzzy: boolean }>(redisKey);
-    const send = (data: { products: any[]; total: number; totalPages: number; fuzzy: boolean }) => {
-      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages, X-Search-Fuzzy');
+    type Payload = { products: any[]; total: number; totalPages: number; fuzzy: boolean; corrected?: string | null };
+    const cached = await cacheGet<Payload>(redisKey);
+    const send = (data: Payload) => {
+      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages, X-Search-Fuzzy, X-Search-Corrected');
+      if (data.corrected) res.setHeader('X-Search-Corrected', encodeURIComponent(data.corrected));
       res.setHeader('X-WP-Total', String(data.total));
       res.setHeader('X-WP-TotalPages', String(data.totalPages));
       res.setHeader('X-Search-Fuzzy', data.fuzzy ? '1' : '0');
@@ -547,7 +549,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     if (cached) return send(cached);
 
     const params = parseCatalogParams(query);
-    const { rows, total, fuzzy } = await listFamilies(params, sort, pageNum, perPage);
+    const { rows, total, fuzzy, corrected } = await listFamilies(params, sort, pageNum, perPage);
 
     const repIds = rows.map((r) => r.rep_id);
     const repRes = repIds.length
@@ -578,7 +580,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
       return mapped;
     }).filter(Boolean);
 
-    const data = { products, total, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy };
+    const data = { products, total, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy, corrected };
     await cacheSet(redisKey, data, 60);
     return send(data);
   } catch (err: any) {

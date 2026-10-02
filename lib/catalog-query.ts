@@ -128,7 +128,11 @@ function termVariants(term: string): string[] {
 }
 
 export function searchTerms(search: string): string[] {
-  const q = normalizeText(search).replace(/[^a-z0-9.\-/ ]+/g, ' ').trim();
+  const q = normalizeText(search)
+    .replace(/[^a-z0-9.\-/ ]+/g, ' ')
+    // "10w-40" / "10w.40" → "10w40" (search_text guarda ambas formas)
+    .replace(/([a-z0-9])[-./]([a-z0-9])/g, '$1$2')
+    .trim();
   if (!q) return [];
   // Frases compuestas con sinónimo propio ("kit de arrastre") como un solo término.
   const terms: string[] = [];
@@ -166,6 +170,43 @@ class Sql {
 }
 
 export type Exclude = 'brand' | 'price' | { attr: string } | null;
+
+/** Umbral de similitud para la búsqueda tolerante a erratas (pg_trgm, 0-1). */
+const FUZZY_THRESHOLD = 0.4;
+
+/** Ejecuta una consulta; en modo tolerante baja el umbral de pg_trgm solo para ella. */
+async function q(text: string, values: unknown[], fuzzy = false) {
+  if (!fuzzy) return pool.query(text, values);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL pg_trgm.word_similarity_threshold = ${FUZZY_THRESHOLD}`);
+    await client.query(`SET LOCAL pg_trgm.similarity_threshold = ${FUZZY_THRESHOLD}`);
+    const res = await client.query(text, values);
+    await client.query('COMMIT');
+    return res;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * "casco arai talla m" → busca "casco arai" filtrando Talla = M (las tallas
+ * no aparecen en el nombre del modelo).
+ */
+export function withSizeFromSearch(params: CatalogParams): CatalogParams {
+  if (!params.search) return params;
+  const m = params.search.match(/\btalla\s+([a-z0-9]{1,4}(?:\/[a-z0-9]{1,4})?)\b/i);
+  if (!m) return params;
+  const size = m[1].toUpperCase();
+  const rest = params.search.replace(m[0], ' ').replace(/\s+/g, ' ').trim();
+  const attrs = { ...(params.attrs || {}) };
+  attrs.Talla = Array.from(new Set([...(attrs.Talla || []), size]));
+  return { ...params, search: rest || undefined, attrs };
+}
 
 /**
  * Condiciones WHERE sobre products p. `fuzzy` activa la tolerancia a erratas.
@@ -273,7 +314,36 @@ export function familyTitle(nmin: string, nmax: string, fallback: string): strin
   return prefix.length >= 8 ? prefix : fallback;
 }
 
-export async function listFamilies(params: CatalogParams, sort: SortKey, page: number, perPage: number) {
+/**
+ * Corrige palabras sin resultados usando el vocabulario del catálogo
+ * (catalog_words). Devuelve la consulta corregida o null si no hay cambios.
+ */
+export async function correctSearch(search: string): Promise<string | null> {
+  const terms = searchTerms(search);
+  if (!terms.length) return null;
+  let changed = false;
+  const out: string[] = [];
+  for (const term of terms) {
+    if (term.length < 4 || /\d/.test(term) || term.includes(' ')) { out.push(term); continue; }
+    try {
+      const exists = await pool.query('SELECT 1 FROM catalog_words WHERE word = $1 OR word = $2 LIMIT 1', [term, term.replace(/e?s$/, '')]);
+      if (exists.rows.length) { out.push(term); continue; }
+      // Solo palabras de longitud parecida y bastante similares: así "motul"
+      // (marca que no está en el catálogo) no se convierte en "mot".
+      const best = await q(
+        `SELECT word FROM catalog_words
+         WHERE word % $1 AND similarity(word, $1) >= 0.5 AND abs(length(word) - length($1)) <= 2 AND length(word) >= 4
+         ORDER BY similarity(word, $1) DESC, freq DESC LIMIT 1`, [term], true);
+      if (best.rows.length) { out.push(best.rows[0].word); changed = true; } else out.push(term);
+    } catch {
+      return null; // vocabulario aún no creado
+    }
+  }
+  return changed ? out.join(' ') : null;
+}
+
+export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page: number, perPage: number) {
+  const params = withSizeFromSearch(rawParams);
   const run = async (fuzzy: boolean) => {
     const cond = await resolve(params, buildConditions(params, { fuzzy }));
     const terms = params.search ? searchTerms(params.search) : [];
@@ -290,7 +360,8 @@ export async function listFamilies(params: CatalogParams, sort: SortKey, page: n
                      WHEN ${nameNorm} LIKE ${ph(`%${e}%`)} THEN 1
                      ELSE 0.5 END`;
       });
-      return cases.length > 1 ? `GREATEST(${cases.join(', ')})` : cases[0];
+      // + parecido de la palabra con el nombre (ayuda con erratas: "pastilas").
+      return `(${cases.length > 1 ? `GREATEST(${cases.join(', ')})` : cases[0]} + word_similarity(${ph(term)}, ${nameNorm}))`;
     });
     const scoreExpr = terms.length
       ? `(${termScores.join(' + ')}) + word_similarity(${ph(normalizeText(params.search!))}, p.search_text)`
@@ -323,44 +394,58 @@ export async function listFamilies(params: CatalogParams, sort: SortKey, page: n
                 WHERE b.family_code = page.family_code
                 GROUP BY k) o) AS opts
       FROM page`;
-    return pool.query(sqlText, values);
+    return q(sqlText, values, fuzzy);
   };
 
   let res = await run(false);
   let fuzzy = false;
+  let corrected: string | null = null;
   if (res.rows.length === 0 && params.search) {
+    // 1) ¿Errata? Probar con la consulta corregida por el vocabulario del catálogo.
+    corrected = await correctSearch(params.search);
+    if (corrected) {
+      const retry = await listFamilies({ ...rawParams, search: corrected }, sort, page, perPage);
+      if (retry.total > 0) return { ...retry, corrected };
+    }
+    // 2) Búsqueda tolerante por similitud.
     res = await run(true);
     fuzzy = true;
   }
   const total = res.rows[0]?.total || 0;
-  return { rows: res.rows as (FamilyRow & { total: number })[], total, fuzzy };
+  return { rows: res.rows as (FamilyRow & { total: number })[], total, fuzzy, corrected: null as string | null };
 }
 
 /** Facetas: marcas, rango de precio y atributos, con recuento por modelo. */
-export async function facets(params: CatalogParams) {
-  const fuzzyNeeded = async () => {
-    if (!params.search) return false;
-    const c = await resolve(params, buildConditions(params));
-    const r = await pool.query(`SELECT 1 FROM products p WHERE ${c.text} LIMIT 1`, c.values);
-    return r.rows.length === 0;
+export async function facets(rawParams: CatalogParams) {
+  let params = withSizeFromSearch(rawParams);
+  const hasExact = async (p: CatalogParams) => {
+    const c = await resolve(p, buildConditions(p));
+    const r = await q(`SELECT 1 FROM products p WHERE ${c.text} LIMIT 1`, c.values);
+    return r.rows.length > 0;
   };
-  const fuzzy = await fuzzyNeeded();
+  // Mismo criterio que listFamilies: exacta → corregida → tolerante.
+  let fuzzy = false;
+  if (params.search && !(await hasExact(params))) {
+    const corrected = await correctSearch(params.search);
+    if (corrected && (await hasExact({ ...params, search: corrected }))) params = { ...params, search: corrected };
+    else fuzzy = true;
+  }
 
   const brandsQ = await resolve(params, buildConditions(params, { fuzzy, exclude: 'brand' }));
   const priceQ = await resolve(params, buildConditions(params, { fuzzy, exclude: 'price' }));
   const allQ = await resolve(params, buildConditions(params, { fuzzy }));
 
   const [brands, price, attrs] = await Promise.all([
-    pool.query(`SELECT p.brand AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
+    q(`SELECT p.brand AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
                 FROM products p WHERE ${brandsQ.text} AND p.brand IS NOT NULL AND p.brand <> ''
-                GROUP BY p.brand ORDER BY count DESC, p.brand LIMIT 200`, brandsQ.values),
-    pool.query(`SELECT min(COALESCE(NULLIF(p.sale_price, 0), p.price)) AS min,
+                GROUP BY p.brand ORDER BY count DESC, p.brand LIMIT 200`, brandsQ.values, fuzzy),
+    q(`SELECT min(COALESCE(NULLIF(p.sale_price, 0), p.price)) AS min,
                        max(COALESCE(NULLIF(p.sale_price, 0), p.price)) AS max
-                FROM products p WHERE ${priceQ.text}`, priceQ.values),
-    pool.query(`SELECT e.k AS key, e.v AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
+                FROM products p WHERE ${priceQ.text}`, priceQ.values, fuzzy),
+    q(`SELECT e.k AS key, e.v AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
                 FROM products p, jsonb_each_text(COALESCE(p.variant_options, '{}'::jsonb)) AS e(k, v)
                 WHERE ${allQ.text}
-                GROUP BY e.k, e.v`, allQ.values),
+                GROUP BY e.k, e.v`, allQ.values, fuzzy),
   ]);
 
   // Para cada eje ya filtrado, sus valores se calculan sin ese filtro (así se
@@ -368,11 +453,11 @@ export async function facets(params: CatalogParams) {
   const attrMap: Record<string, { value: string; count: number }[]> = {};
   for (const r of attrs.rows as any[]) (attrMap[r.key] ||= []).push({ value: r.value, count: r.count });
   for (const key of Object.keys(params.attrs || {})) {
-    const q = await resolve(params, buildConditions(params, { fuzzy, exclude: { attr: key } }));
-    const r = await pool.query(
-      `SELECT p.variant_options ->> $${q.values.length + 1} AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
-       FROM products p WHERE ${q.text} AND p.variant_options ? $${q.values.length + 1}
-       GROUP BY 1`, [...q.values, key]);
+    const qq = await resolve(params, buildConditions(params, { fuzzy, exclude: { attr: key } }));
+    const r = await q(
+      `SELECT p.variant_options ->> $${qq.values.length + 1} AS value, count(DISTINCT COALESCE(p.family_code, p.sku))::int AS count
+       FROM products p WHERE ${qq.text} AND p.variant_options ? $${qq.values.length + 1}
+       GROUP BY 1`, [...qq.values, key], fuzzy);
     attrMap[key] = r.rows.map((x: any) => ({ value: x.value, count: x.count }));
   }
   for (const list of Object.values(attrMap)) list.sort(compareOptionValues);
@@ -386,16 +471,28 @@ export async function facets(params: CatalogParams) {
   };
 }
 
-const SIZE_ORDER = ['XXXS', '3XS', 'XXS', '2XS', 'XS', 'XS/S', 'S', 'S/M', 'M', 'M/L', 'L', 'L/XL', 'XL', 'XL/2XL', 'XXL', '2XL', 'XXXL', '3XL', '4XL', '5XL', '6XL'];
-/** Orden natural de tallas (XS < S < M…) y números; el resto alfabético. */
+const SIZE_ORDER = ['XXXS', '3XS', 'XXS', '2XS', 'XS', 'XS/S', 'S', 'S/M', 'M', 'M/L', 'L', 'L/XL', 'XL', 'XL/2XL', 'XL/XXL', 'XXL', '2XL', 'XXXL', '3XL', '4XL', '5XL', '6XL'];
+
+/** Clave de orden: tallas de letra, luego numéricas (38, 10/L…), luego infantiles (Y…), luego el resto. */
+function optionSortKey(value: string): [number, number, string] {
+  const v = value.toUpperCase().trim();
+  const letter = SIZE_ORDER.indexOf(v);
+  if (letter >= 0) return [0, letter, v];
+  const num = v.match(/^(\d+(?:[.,]\d+)?)/);
+  if (num) return [1, parseFloat(num[1].replace(',', '.')), v];
+  const youth = v.match(/^Y(.+)$/);
+  if (youth) {
+    const i = SIZE_ORDER.indexOf(youth[1]);
+    return [2, i >= 0 ? i : 99, v];
+  }
+  return [3, 0, v];
+}
+
+/** Orden natural de tallas (XS < S < M…), números y el resto alfabético. */
 export function compareOptionValues(a: { value: string }, b: { value: string }): number {
-  const ia = SIZE_ORDER.indexOf(a.value.toUpperCase());
-  const ib = SIZE_ORDER.indexOf(b.value.toUpperCase());
-  if (ia >= 0 && ib >= 0) return ia - ib;
-  const na = parseFloat(a.value);
-  const nb = parseFloat(b.value);
-  if (!isNaN(na) && !isNaN(nb)) return na - nb;
-  return a.value.localeCompare(b.value, 'es');
+  const ka = optionSortKey(a.value);
+  const kb = optionSortKey(b.value);
+  return ka[0] - kb[0] || ka[1] - kb[1] || ka[2].localeCompare(kb[2], 'es');
 }
 
 /** Variantes de un modelo (para la ficha de producto). */
