@@ -10,6 +10,7 @@ import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
 import { getLiveStockValue } from '../bihrService.js';
 import { findCompatibleSkus } from '../lib/compat.js';
+import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,22 +20,43 @@ export const catalogRouter = Router();
 // Columnas necesarias para pintar una tarjeta de producto en listados. Evita
 // enviar descripción HTML, atributos y compatibilidades (cientos de KB por
 // producto en algunos casos: la sección de compatibles llegaba a 17 MB).
-const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, stock, images, category_id, status, brand, dropshipping, ondemand`;
+const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, stock, images, category_id, status, brand, dropshipping, ondemand, family_code, variant_options`;
+
+/** Agrupa filas de tarjeta por modelo: una tarjeta por familia con resumen de variantes. */
+function groupCardsByFamily(rows: any[]): any[] {
+  const groups = new Map<string, any[]>();
+  for (const r of rows) {
+    const key = r.family_code || r.sku;
+    (groups.get(key) || groups.set(key, []).get(key)!).push(r);
+  }
+  const out: any[] = [];
+  for (const [code, list] of groups) {
+    const eff = (r: any) => (r.sale_price && r.sale_price > 0 ? r.sale_price : r.price);
+    const rep = [...list].sort((a, b) => Number(b.stock > 0) - Number(a.stock > 0) || eff(a) - eff(b))[0];
+    const mapped: any = mapProductToFrontend(rep);
+    if (list.length > 1) {
+      const options: Record<string, string[]> = {};
+      for (const r of list) {
+        for (const [k, v] of Object.entries((r.variant_options || {}) as Record<string, string>)) {
+          (options[k] ||= []).includes(v) || options[k].push(v);
+        }
+      }
+      for (const k of Object.keys(options)) options[k] = options[k].map((value) => ({ value })).sort(compareOptionValues).map((x) => x.value);
+      const names = list.map((r) => r.name).sort();
+      mapped.name = mapped.title = familyTitle(names[0], names[names.length - 1], rep.name);
+      mapped.family = {
+        code, variantCount: list.length,
+        priceMin: Math.min(...list.map(eff)) / 100, priceMax: Math.max(...list.map(eff)) / 100,
+        inStock: list.some((r) => r.stock > 0), options,
+      };
+    }
+    mapped.variantOptions = rep.variant_options || null;
+    out.push(mapped);
+  }
+  return out;
+}
 
 const OPTIMIZED_DIR = path.join(process.cwd(), 'uploads', 'optimized');
-
-const FILTER_ATTR_KEYS = new Set([
-  'Marca del vehículo',
-  'Modelo del vehículo',
-  'Cilindrada',
-  'Año',
-  'Homologación',
-  'Material',
-  'Posición',
-  'Color',
-  'Tipo de escape',
-  'Acabado'
-]);
 
 const ALLOWED_IMAGE_WIDTHS = new Set([200, 400, 800]);
 
@@ -305,7 +327,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
 
       responseData = Array.from(skusSet);
     } else if (action === 'compatible-products') {
-      const prodRedisKey = `compat:prod:v6:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
+      const prodRedisKey = `compat:prod:v7:${(brand||'').toLowerCase()}:${(model||'').toLowerCase()}:${year||''}`;
       const cachedProducts = await cacheGet<any[]>(prodRedisKey);
       if (cachedProducts) {
         return res.json(cachedProducts);
@@ -390,7 +412,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
         `SELECT ${PRODUCT_CARD_COLUMNS} FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
         [skusList]
       );
-      const products = productsRes.rows.map(mapProductToFrontend);
+      const products = groupCardsByFamily(productsRes.rows);
       await cacheSet(prodRedisKey, products, 600);
       return res.json(products);
     } else {
@@ -424,202 +446,178 @@ catalogRouter.get('/catalog/sitemap-skus', async (req, res) => {
 // GET /api/search/suggestions
 catalogRouter.get('/search/suggestions', async (req, res) => {
   try {
-    const q = sanitizeString(String(req.query.q || ''));
-    if (!q || q.length < 2) return res.json({ suggestions: [], products: [] });
+    const q = String(req.query.q || '').slice(0, 120).trim();
+    if (q.length < 2) return res.json({ suggestions: [], products: [] });
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit), 10) || 6, 1), 10);
 
-    const searchPattern = `%${sanitizeLike(q)}%`;
-    const productsRes = await db.execute(sql`
-      SELECT id, sku, name, brand, price, sale_price, stock, images
-      FROM products
-      WHERE status = 'published' AND (LOWER(name) LIKE LOWER(${searchPattern}) ESCAPE '\\' OR LOWER(sku) LIKE LOWER(${searchPattern}) ESCAPE '\\')
-      ORDER BY stock DESC, id ASC
-      LIMIT 8
-    `);
+    const cacheKey = `cache:suggest:v2:${normalizeText(q)}:${limit}`;
+    const cached = await cacheGet<any>(cacheKey);
+    if (cached) return res.json(cached);
 
-    const products = productsRes.rows.map(mapProductToFrontend);
-    res.json({ suggestions: [], products });
+    // Mismo motor que el catálogo: sinónimos, plurales, erratas y un resultado por modelo.
+    const { rows } = await listFamilies({ search: q }, 'relevance', 1, limit);
+    const reps = rows.length
+      ? (await pool.query(`SELECT ${PRODUCT_CARD_COLUMNS} FROM products WHERE id = ANY($1)`, [rows.map((r) => r.rep_id)])).rows
+      : [];
+    const byId = new Map(reps.map((r: any) => [r.id, r]));
+    const products = rows.map((f) => {
+      const row: any = byId.get(f.rep_id);
+      if (!row) return null;
+      const m: any = mapProductToFrontend(row);
+      if (f.n > 1) m.name = m.title = familyTitle(f.nmin, f.nmax, row.name);
+      return m;
+    }).filter(Boolean);
+
+    // Marcas que coinciden con lo escrito, como sugerencia rápida.
+    const brands = await pool.query(
+      `SELECT DISTINCT brand FROM products WHERE status = 'published' AND brand ILIKE $1 ORDER BY brand LIMIT 3`,
+      [`${q.replace(/[\\%_]/g, '')}%`]
+    );
+    const result = { suggestions: brands.rows.map((r: any) => r.brand), products };
+    await cacheSet(cacheKey, result, 300);
+    res.json(result);
   } catch (err: any) {
     console.error('[SEARCH SUGGESTIONS ERROR]:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Error en las sugerencias' });
   }
 });
 
+// Parámetros comunes de listado y facetas.
+function parseCatalogParams(query: any): CatalogParams {
+  const int = (v: any) => {
+    const n = parseInt(String(v ?? ''), 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  let attrs: Record<string, string[]> = {};
+  const rawAttrs = typeof query.attrs === 'string' ? query.attrs : '';
+  if (rawAttrs && rawAttrs.length <= 1000) {
+    try {
+      const parsed = JSON.parse(rawAttrs);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed).slice(0, 8)) {
+          const list = (Array.isArray(v) ? v : [v]).map((x) => String(x)).filter(Boolean).slice(0, 20);
+          if (list.length) attrs[String(k).slice(0, 60)] = list;
+        }
+      }
+    } catch { attrs = {}; }
+  }
+  const brands = String(query.brand || query.brands || '').split(',').map((b) => b.trim()).filter(Boolean).slice(0, 30);
+  const minEur = int(query.min_price);
+  const maxEur = int(query.max_price);
+  return {
+    search: query.search ? String(query.search).slice(0, 120) : (query.q ? String(query.q).slice(0, 120) : undefined),
+    categoryId: int(query.category_id),
+    categorySlug: !query.category_id && query.category_slug ? String(query.category_slug).slice(0, 120) : undefined,
+    brands,
+    minPriceCents: minEur != null ? minEur * 100 : null,
+    maxPriceCents: maxEur != null ? maxEur * 100 : null,
+    inStock: query.in_stock === 'true' || query.in_stock === '1',
+    attrs,
+    // 'universal=true' lo envía el frontend desde siempre pero nunca se aplicó:
+    // /universales muestra todo el catálogo. Solo se filtra con universal=only.
+    universal: query.universal === 'only',
+  };
+}
+
+function cacheKeyFor(prefix: string, query: any): string {
+  const s = JSON.stringify(Object.keys(query).sort().map((k) => [k, query[k]]));
+  return `${prefix}:${crypto.createHash('sha256').update(s).digest('hex')}`;
+}
+
 // GET /api/catalog/products
+// Lista MODELOS (una tarjeta por modelo con sus variantes) salvo group=0.
 catalogRouter.get('/catalog/products', async (req, res) => {
   try {
-    const { search, category_id, category_slug, page = '1', per_page = '20', universal, brand, min_price, max_price, in_stock, attrs } = req.query as any;
-    const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const perPage = Math.min(Math.max(1, parseInt(per_page, 10) || 20), 50);
-    const offset = (pageNum - 1) * perPage;
+    const query = req.query as any;
+    const pageNum = Math.max(1, parseInt(query.page, 10) || 1);
+    const perPage = Math.min(Math.max(1, parseInt(query.per_page, 10) || 20), 48);
+    const sortParam = String(query.sort || '');
+    const sort: SortKey = (['relevance', 'price_asc', 'price_desc', 'name_asc', 'newest'] as SortKey[])
+      .includes(sortParam as SortKey) ? (sortParam as SortKey) : (query.search || query.q ? 'relevance' : 'relevance');
 
-    const queryStr = JSON.stringify(req.query);
-    const redisKey = queryStr.length > 200
-      ? `cache:products:${crypto.createHash('sha256').update(queryStr).digest('hex')}`
-      : `cache:products:${queryStr}`;
+    const redisKey = cacheKeyFor('cache:products:v2', query);
+    const cached = await cacheGet<{ products: any[]; total: number; totalPages: number; fuzzy: boolean }>(redisKey);
+    const send = (data: { products: any[]; total: number; totalPages: number; fuzzy: boolean }) => {
+      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages, X-Search-Fuzzy');
+      res.setHeader('X-WP-Total', String(data.total));
+      res.setHeader('X-WP-TotalPages', String(data.totalPages));
+      res.setHeader('X-Search-Fuzzy', data.fuzzy ? '1' : '0');
+      return res.json(data.products);
+    };
+    if (cached) return send(cached);
 
-    const cached = await cacheGet<{ products: any[]; total: number; totalPages: number }>(redisKey);
-    if (cached) {
-      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages');
-      res.setHeader('X-WP-Total', cached.total.toString());
-      res.setHeader('X-WP-TotalPages', cached.totalPages.toString());
-      return res.json(cached.products);
-    }
+    const params = parseCatalogParams(query);
+    const { rows, total, fuzzy } = await listFamilies(params, sort, pageNum, perPage);
 
-    const conditions = sql`WHERE status IN ('published', 'active') AND name NOT LIKE 'Aplicaciones:%' AND name NOT LIKE 'Applications:%' AND sku NOT LIKE 'Aplicaciones:%' AND sku NOT LIKE 'Applications:%'`;
+    const repIds = rows.map((r) => r.rep_id);
+    const repRes = repIds.length
+      ? await pool.query(`SELECT ${PRODUCT_CARD_COLUMNS} FROM products WHERE id = ANY($1)`, [repIds])
+      : { rows: [] as any[] };
+    const byId = new Map(repRes.rows.map((r: any) => [r.id, r]));
 
-    if (search) {
-      const searchPattern = `%${sanitizeLike(search)}%`;
-      conditions.append(sql`
-        AND (
-          LOWER(name) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-          OR LOWER(sku) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-          OR LOWER(supplier_code) LIKE LOWER(${searchPattern}) ESCAPE '\\'
-        )`);
-    }
-
-    if (brand) {
-      const brandList = String(brand).split(',').map((b) => b.trim()).filter(Boolean);
-      if (brandList.length === 1) {
-        conditions.append(sql` AND LOWER(brand) = LOWER(${brandList[0]})`);
-      } else if (brandList.length > 1) {
-        const orChain = brandList
-          .map((b) => sql`LOWER(brand) = LOWER(${b})`)
-          .reduce((acc, frag, i) => (i === 0 ? frag : sql`${acc} OR ${frag}`));
-        conditions.append(sql` AND (${orChain})`);
+    const products = rows.map((f) => {
+      const row: any = byId.get(f.rep_id);
+      if (!row) return null;
+      const mapped: any = mapProductToFrontend(row);
+      const options: Record<string, string[]> = {};
+      for (const [k, vals] of Object.entries(f.opts || {})) {
+        options[k] = [...(vals as string[])].map((value) => ({ value })).sort(compareOptionValues).map((x) => x.value);
       }
-    }
+      const title = f.n > 1 ? familyTitle(f.nmin, f.nmax, row.name) : row.name;
+      mapped.title = title;
+      mapped.name = title;
+      mapped.variantOptions = row.variant_options || null;
+      mapped.family = {
+        code: f.family_code,
+        variantCount: f.n,
+        priceMin: Number(f.pmin) / 100,
+        priceMax: Number(f.pmax) / 100,
+        inStock: f.any_stock,
+        options,
+      };
+      return mapped;
+    }).filter(Boolean);
 
-    if (min_price) {
-      const mp = parseInt(min_price, 10);
-      if (!isNaN(mp)) conditions.append(sql` AND price >= ${mp * 100}`);
-    }
-    if (max_price) {
-      const mp = parseInt(max_price, 10);
-      if (!isNaN(mp)) conditions.append(sql` AND price <= ${mp * 100}`);
-    }
-    if (in_stock === 'true' || in_stock === '1') {
-      conditions.append(sql` AND stock > 0`);
-    }
-
-    if (category_id) {
-      const catId = parseInt(category_id, 10);
-      if (!isNaN(catId)) {
-        const parentId = Math.floor(catId / 100);
-        conditions.append(sql`
-          AND (
-            category_id = ${catId}
-            OR category_id IN (
-              SELECT id FROM categories
-              WHERE parent_id = ${catId}
-                 OR parent_id IN (SELECT id FROM categories WHERE parent_id = ${catId})
-            )
-            OR category_id = ${parentId}
-          )`);
-      }
-    } else if (category_slug) {
-      const slugLower = String(category_slug).toLowerCase();
-      conditions.append(sql`
-        AND category_id IN (
-          SELECT id FROM categories
-          WHERE LOWER(slug) LIKE ${'%' + slugLower + '%'}
-             OR LOWER(name) LIKE ${'%' + slugLower + '%'}
-             OR parent_id IN (
-               SELECT id FROM categories
-               WHERE LOWER(slug) LIKE ${'%' + slugLower + '%'}
-                  OR LOWER(name) LIKE ${'%' + slugLower + '%'}
-             )
-        )`);
-    }
-
-    const countRes = await db.execute(sql`SELECT count(*) as total FROM products ${conditions}`);
-    const total = Number(countRes.rows[0]?.total || 0);
-    const totalPages = Math.max(1, Math.ceil(total / perPage));
-
-    const productsRes = await db.execute(sql`
-      SELECT p.*
-      FROM products p
-      ${conditions}
-      ORDER BY p.stock DESC, p.id DESC
-      LIMIT ${perPage} OFFSET ${offset}
-    `);
-
-    const products = productsRes.rows.map(mapProductToFrontend);
-    const resultData = { products, total, totalPages };
-
-    await cacheSet(redisKey, resultData, 60);
-
-    res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages');
-    res.setHeader('X-WP-Total', total.toString());
-    res.setHeader('X-WP-TotalPages', totalPages.toString());
-    return res.json(products);
+    const data = { products, total, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy };
+    await cacheSet(redisKey, data, 60);
+    return send(data);
   } catch (err: any) {
     console.error('[CATALOG PRODUCTS ROUTE ERROR]:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Error al cargar el catálogo' });
   }
 });
 
 // GET /api/catalog/filters
+// Mismos parámetros que /catalog/products; recuentos por modelo.
 catalogRouter.get('/catalog/filters', async (req, res) => {
   try {
-    const { universal, search, category_id } = req.query as any;
-    const cacheKey = `filters:${universal}:${search}:${category_id}`;
-    const redisKey = `cache:filters:${cacheKey}`;
+    const query = req.query as any;
+    const redisKey = cacheKeyFor('cache:filters:v2', query);
     const cached = await cacheGet<any>(redisKey);
     if (cached) return res.json(cached);
 
-    const conditions = sql`WHERE status = 'published'`;
-
-    if (search) {
-      const searchPattern = `%${sanitizeLike(search)}%`;
-      conditions.append(sql` AND (LOWER(name) LIKE LOWER(${searchPattern}) ESCAPE '\\' OR LOWER(sku) LIKE LOWER(${searchPattern}) ESCAPE '\\')`);
-    }
-
-    if (category_id) {
-      const catId = parseInt(category_id, 10);
-      if (!isNaN(catId)) {
-        conditions.append(sql` AND category_id IN (
-          SELECT id FROM categories
-          WHERE id = ${catId}
-             OR parent_id = ${catId}
-             OR parent_id IN (SELECT id FROM categories WHERE parent_id = ${catId})
-        )`);
-      }
-    }
-
-    const attrKeysArr = Array.from(FILTER_ATTR_KEYS);
-
-    const [brandsRes, priceRes, attrsRes] = await Promise.all([
-      db.execute(sql`SELECT DISTINCT brand FROM products ${conditions} AND brand IS NOT NULL AND brand != '' ORDER BY brand`),
-      db.execute(sql`SELECT MIN(price) as min_p, MAX(price) as max_p FROM products ${conditions}`),
-      db.execute(sql`
-        SELECT att.key, JSON_AGG(DISTINCT att.value) AS values
-        FROM products p, jsonb_each_text(p.attributes) AS att(key, value)
-        ${conditions}
-          AND att.value IS NOT NULL AND att.value != ''
-          AND att.key IN (${buildInClause(attrKeysArr)})
-        GROUP BY att.key
-        ORDER BY att.key
-      `)
-    ]);
-
-    const brands = brandsRes.rows.map((r: any) => r.brand).filter(Boolean);
-    const priceMinRow: any = priceRes.rows[0] || {};
-    const priceMin = priceMinRow.min_p ? Math.round(Number(priceMinRow.min_p) / 100) : 0;
-    const priceMax = priceMinRow.max_p ? Math.round(Number(priceMinRow.max_p) / 100) : 1000;
-
+    const f = await facets(parseCatalogParams(query));
     const attributes: Record<string, string[]> = {};
-    for (const row of attrsRes.rows) {
-      const r: any = row;
-      attributes[r.key] = r.values;
+    const attributeCounts: Record<string, { value: string; count: number }[]> = {};
+    for (const [k, list] of Object.entries(f.attributes)) {
+      if (list.length < 2 && !(parseCatalogParams(query).attrs || {})[k]) continue; // un solo valor no filtra nada
+      attributes[k] = list.map((x) => x.value);
+      attributeCounts[k] = list;
     }
-
-    const result = { brands, price_min: priceMin, price_max: priceMax, attributes };
-    await cacheSet(redisKey, result, 600);
+    const result = {
+      brands: f.brands.map((b) => b.value),
+      brand_counts: f.brands,
+      price_min: Math.floor(f.priceMinCents / 100),
+      price_max: Math.ceil(f.priceMaxCents / 100) || 1000,
+      attributes,
+      attribute_counts: attributeCounts,
+      fuzzy: f.fuzzy,
+    };
+    await cacheSet(redisKey, result, 300);
     res.json(result);
-
   } catch (err: any) {
     console.error('[FILTERS ERROR]:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Error al cargar los filtros' });
   }
 });
 
@@ -816,11 +814,55 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
              COALESCE(rs.review_count, 0) AS review_count
       FROM products p
       LEFT JOIN product_rating_stats rs ON rs.product_id = p.id
-      WHERE (p.sku = ${slugStr} OR p.sku = ${skuStr} ${validId !== null ? sql`OR p.id = ${validId}` : sql``}) AND p.status = 'published'
+      WHERE (p.sku = ${slugStr} OR p.sku = ${skuStr} ${validId !== null ? sql`OR p.id = ${validId}` : sql``})
+        AND p.status IN ('published', 'duplicate')
+      ORDER BY (p.status = 'published') DESC
       LIMIT 1
     `);
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
-    res.json(mapProductToFrontend(result.rows[0]));
+    const row: any = result.rows[0];
+
+    // Ficha duplicada (importación antigua): indicar la canónica para redirigir (301).
+    if (row.status === 'duplicate' && row.duplicate_of) {
+      const canon = await pool.query(`SELECT sku FROM products WHERE id = $1 AND status = 'published'`, [row.duplicate_of]);
+      if (canon.rows.length) return res.json({ redirectTo: canon.rows[0].sku });
+      return res.status(404).json({ error: 'No encontrado' });
+    }
+
+    const product: any = mapProductToFrontend(row);
+    product.variantOptions = row.variant_options || null;
+    product.family = null;
+    if (row.family_code) {
+      const variants = await familyVariants(row.family_code);
+      if (variants.length > 1) {
+        const mappedVariants = variants.map((v: any) => {
+          const m: any = mapProductToFrontend(v);
+          return {
+            id: m.id, sku: m.sku, slug: m.slug, name: m.name,
+            price: m.price, salePrice: m.salePrice, stock: m.stock, inStock: m.inStock,
+            image: m.image, options: v.variant_options || {},
+          };
+        });
+        const axes: Record<string, string[]> = {};
+        for (const v of mappedVariants) {
+          for (const [k, val] of Object.entries(v.options as Record<string, string>)) {
+            (axes[k] ||= []).includes(val) || axes[k].push(val);
+          }
+        }
+        for (const k of Object.keys(axes)) {
+          axes[k] = axes[k].map((value) => ({ value })).sort(compareOptionValues).map((x) => x.value);
+          if (axes[k].length < 2) delete axes[k];
+        }
+        const names = variants.map((v: any) => v.name).sort();
+        product.family = {
+          code: row.family_code,
+          title: familyTitle(names[0], names[names.length - 1], row.name),
+          axes,
+          variants: mappedVariants,
+        };
+      }
+    }
+    res.json(product);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
