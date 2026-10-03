@@ -361,7 +361,12 @@ export async function correctSearch(search: string): Promise<string | null> {
   return changed ? out.join(' ') : null;
 }
 
-export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page: number, perPage: number) {
+/**
+ * @param opts.exact sin corrección de erratas ni búsqueda aproximada cuando no hay
+ *   resultados (el asistente prueba sus propias variantes y eso tardaba segundos).
+ */
+export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page: number, perPage: number,
+                                   opts: { exact?: boolean } = {}) {
   const params = withSizeFromSearch(rawParams);
   const run = async (fuzzy: boolean) => {
     const cond = await resolve(params, buildConditions(params, { fuzzy }));
@@ -420,7 +425,7 @@ export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page
   let res = await run(false);
   let fuzzy = false;
   let corrected: string | null = null;
-  if (res.rows.length === 0 && params.search) {
+  if (res.rows.length === 0 && params.search && !opts.exact) {
     // 1) ¿Errata? Probar con la consulta corregida por el vocabulario del catálogo.
     corrected = await correctSearch(params.search);
     if (corrected) {

@@ -13,7 +13,8 @@ export const minimaxClient = new OpenAI({
 export const CHAT_MODEL = 'MiniMax-M2.7-highspeed';
 
 export const CHAT_LIMITS = {
-  maxTokens: 400,
+  // Incluye el razonamiento del modelo: con 400 algunas respuestas salían cortadas.
+  maxTokens: 900,
   temperature: 0.4,
   topP: 0.9,
   historyMaxMessages: 20,

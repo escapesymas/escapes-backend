@@ -1,22 +1,21 @@
 import https from 'https';
 
 /**
- * Palabras clave que activan la búsqueda técnica en internet.
+ * Preguntas de ficha técnica de la moto (desarrollo de serie, qué aceite o
+ * batería lleva, presiones…), con límites de palabra: antes «par» coincidía con
+ * «para» y cada mensaje lanzaba una búsqueda en internet de hasta 3,5 s.
  */
-const TECH_SPEC_WORDS = [
-  'dientes', 'piñon', 'piñón', 'corona', 'desarrollo', 'cadena',
-  'aceite', 'capacidad', 'bateria', 'batería', 'bujia', 'bujía',
-  'presion', 'presión', 'neumatico', 'neumático', 'par', 'apriete',
-  'medida', 'medidas', 'paso', 'serie', 'original', 'ficha', 'tecnica', 'técnica',
-  'especificaciones', 'litros', 'ah', 'cca', 'filtro', 'juego', 'soporte',
-];
+const TECH_SPEC_RE = new RegExp(
+  [
+    '\\b(dientes|desarrollo|de serie|ficha t[eé]cnica|especificaciones|capacidad|litros|par de apriete|presi[oó]n(es)?)\\b',
+    '\\b(qu[eé]|cu[aá]l|cu[aá]nto)s? .{0,25}\\b(lleva|usa|monta|necesita|admite|cabe|tiene) de (serie|f[aá]brica)\\b',
+    '\\b(qu[eé]|cu[aá]l)(es)? (aceite|bater[ií]a|buj[ií]as?|neum[aá]ticos?|medida|paso de cadena|cadena|pi[nñ][oó]n|corona) (lleva|usa|monta|necesita)\\b',
+  ].join('|'),
+  'i'
+);
 
-/**
- * Comprueba si la consulta del usuario requiere buscar datos técnicos de la moto en internet.
- */
 export function isTechSpecQuery(query: string): boolean {
-  const lower = query.toLowerCase();
-  return TECH_SPEC_WORDS.some((w) => lower.includes(w));
+  return TECH_SPEC_RE.test(query);
 }
 
 /**

@@ -13,31 +13,36 @@ const INJECTION_PATTERNS: RegExp[] = [
   /\bdeveloper\s+mode\b/i,
 ];
 
-const OUT_OF_SCOPE_KEYWORDS = [
-  'receta', 'recipe', 'cocina', 'cook',
-  'clima', 'weather', 'tiempo',
-  'política', 'politics', 'elecciones',
-  'religión', 'religion', 'dios',
-  'matemáticas', 'math', 'ecuación',
-  'historia', 'history',
-  'cine', 'película', 'movie', 'film',
-  'música', 'song', 'canción',
-  'juego', 'game', 'videojuego',
-  'deporte', 'football', 'fútbol', 'baloncesto',
-  'chiste', 'joke',
-  'poema', 'poem',
-  'traducir', 'translate', 'translation',
-  'código', 'programming', 'python', 'javascript',
-  'bitcoin', 'crypto', 'stock market',
-];
+// Temas claramente ajenos a la tienda. Solo palabras sin doble sentido y con
+// límites de palabra: «tiempo» (de envío), «juego» (de pastillas), «código»
+// (de descuento) o «historia» (historial de pedidos) bloqueaban preguntas reales.
+// Lo dudoso lo resuelve el asistente con sus instrucciones.
+const OUT_OF_SCOPE_RE = new RegExp(
+  '\\b(' + [
+    'recetas?', 'recipes?', 'cocinar',
+    'pol[ií]tica partidista', 'elecciones', 'partido pol[ií]tico',
+    'religi[oó]n', 'dios',
+    'ecuaci[oó]n(es)?', 'integrales? definidas?',
+    'pel[ií]culas?', 'movies?', 'series? de tv',
+    'canci[oó]n(es)?', 'songs?', 'letra de',
+    'videojuegos?',
+    'f[uú]tbol', 'baloncesto', 'football',
+    'chistes?', 'jokes?',
+    'poemas?', 'poems?',
+    'traduce', 'traducir', 'translate',
+    'programar', 'programming', 'python', 'javascript',
+    'bitcoin', 'criptomonedas?', 'crypto', 'bolsa de valores',
+    'hor[oó]scopo',
+  ].join('|') + ')\\b',
+  'i'
+);
 
 export function containsPromptInjection(text: string): boolean {
   return INJECTION_PATTERNS.some((rx) => rx.test(text));
 }
 
 export function isOutOfScope(text: string): boolean {
-  const lower = text.toLowerCase();
-  return OUT_OF_SCOPE_KEYWORDS.some((kw) => lower.includes(kw));
+  return OUT_OF_SCOPE_RE.test(text);
 }
 
 export function sanitizeUserInput(text: string): string {
