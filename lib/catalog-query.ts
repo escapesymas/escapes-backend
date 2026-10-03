@@ -305,10 +305,23 @@ export interface FamilyRow {
   opts: Record<string, string[]> | null;
 }
 
+/**
+ * Quita la talla del final de un nombre de variante para usarlo como título del
+ * modelo: «Guantes URBAN 3 Blanco, talla 7/M» → «Guantes URBAN 3 Blanco»,
+ * «Casco BELL MOTO-9S Verde, 58-59 / Talla L» → «Casco BELL MOTO-9S Verde».
+ */
+export function stripSizeSuffix(name: string): string {
+  return name
+    .replace(/[\s,\-–/(]*\b(?:talla|size)\b.*$/i, '')
+    .replace(/,\s*\d{2}\s*-\s*\d{2}\s*$/, '')
+    .replace(/[\s,\-–/(]+$/, '')
+    .trim() || name;
+}
+
 /** Nombre común de un modelo: prefijo compartido por todas sus variantes. */
 export function familyTitle(nmin: string, nmax: string, fallback: string, mostCommon?: string): string {
   if (!nmin || !nmax || nmin === nmax) return fallback;
-  const reference = (mostCommon || fallback || '').replace(/\s+/g, ' ').trim();
+  const reference = stripSizeSuffix((mostCommon || fallback || '').replace(/\s+/g, ' ').trim());
   let i = 0;
   while (i < nmin.length && i < nmax.length && nmin[i] === nmax[i]) i++;
   let prefix = nmin.slice(0, i);

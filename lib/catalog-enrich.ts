@@ -543,6 +543,48 @@ export async function archiveInInactiveCategories(): Promise<number> {
   return r.rowCount || 0;
 }
 
+/**
+ * Productos distintos que se llaman igual (832 discos «Disco de freno NG BRAKES
+ * redondo fijo»): a los que no tienen variantes se les añade la referencia del
+ * fabricante («… · Ref. 1979»). El importador repone el nombre de Bihr en cada
+ * sincronización y este paso lo vuelve a aplicar. Por lotes de id.
+ */
+export async function disambiguateNames(): Promise<number> {
+  const { rows: [range] } = await pool.query(`SELECT min(id) AS lo, max(id) AS hi FROM products WHERE status = 'published'`);
+  let total = 0;
+  for (let from = Number(range?.lo) || 0; from <= (Number(range?.hi) || 0); from += 5000) {
+    const r = await pool.query(`
+      WITH dup AS (
+        SELECT name FROM products WHERE status = 'published' GROUP BY name HAVING count(DISTINCT family_code) > 1
+      ), single AS (
+        SELECT family_code FROM products WHERE status = 'published' GROUP BY family_code HAVING count(*) = 1
+      )
+      UPDATE products p
+         SET name = p.name || ' · Ref. ' || COALESCE(NULLIF(trim(p.supplier_code), ''), p.sku)
+        FROM dup d, single s
+       WHERE p.id >= $1 AND p.id < $2 AND p.status = 'published'
+         AND d.name = p.name AND s.family_code = p.family_code
+         AND p.name NOT LIKE '% · Ref. %'`, [from, from + 5000]);
+    total += r.rowCount || 0;
+  }
+  return total;
+}
+
+/**
+ * Nombres en inglés traducidos (tabla name_translations, rellenada una vez con
+ * lib/name-translation.ts). Como el importador repone el nombre de Bihr, la
+ * traducción se aplica de nuevo en cada sincronización.
+ */
+export async function applyNameTranslations(): Promise<number> {
+  const exists = await pool.query(`SELECT to_regclass('public.name_translations') AS t`);
+  if (!exists.rows[0]?.t) return 0;
+  const r = await pool.query(`
+    UPDATE products p SET name = t.name_es
+      FROM name_translations t
+     WHERE p.name = t.source_name AND t.name_es <> '' AND p.name <> t.name_es`);
+  return r.rowCount || 0;
+}
+
 export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<EnrichStats> {
   const refs = loadBihrApiRefs(jsonPath);
   const csvIndex = loadCsvIndex(csvDir);
@@ -559,6 +601,10 @@ export async function enrichCatalog(jsonPath: string, csvDir: string): Promise<E
   if (hidden) console.log(`[ENRICH] ${hidden} productos archivados por estar en categorías desactivadas (p. ej. Ciclismo)`);
   const ty = await applyTyreAttributes(csvIndex);
   console.log(`[ENRICH] Neumáticos y cámaras: ${ty.sized}/${ty.tyres + ty.tubes} con medida, ${ty.updated} actualizados`);
+  const translated = await applyNameTranslations();
+  if (translated) console.log(`[ENRICH] ${translated} nombres traducidos al español`);
+  const refs2 = await disambiguateNames();
+  if (refs2) console.log(`[ENRICH] ${refs2} nombres repetidos con la referencia del fabricante`);
   // Vocabulario del buscador (corrección de erratas) con los nombres nuevos.
   await pool.query('REFRESH MATERIALIZED VIEW CONCURRENTLY catalog_words').catch((e) =>
     console.error('[ENRICH] No se pudo refrescar catalog_words:', e.message));
