@@ -10,13 +10,16 @@ import { pool } from '../db.js';
 
 const BATCH = 2000;
 /** Subir este número cuando cambie products_search_text() en una migración. */
-const SEARCH_TEXT_VERSION = '2';
+const SEARCH_TEXT_VERSION = '3';
 
 const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// search_extra (categoría y modelos compatibles) se calcula en la misma sentencia.
+const EXTRA = `products_search_extra(p.category_id, p.compatibility)`;
 const RECOMPUTE = `
+  search_extra = ${EXTRA},
   search_text = products_search_text(p.name, p.supplier_name, p.brand, p.sku,
-                                     p.part_number, p.barcode, p.supplier_code, p.old_part_number),
+                                     p.part_number, p.barcode, p.supplier_code, p.old_part_number, ${EXTRA}),
   family_code = COALESCE(p.family_code, CASE
     WHEN p.part_number ~ '^[0-9]{10}$' THEN left(p.part_number, 7)
     WHEN p.sku ~ '^[0-9]{10}$' THEN left(p.sku, 7)
@@ -48,7 +51,7 @@ export async function backfillCatalogColumns(): Promise<void> {
          WHERE p.id >= $1 AND p.id < $2
            -- solo las filas cuyo texto cambia (no reescribir lo ya actualizado)
            AND p.search_text IS DISTINCT FROM products_search_text(p.name, p.supplier_name, p.brand, p.sku,
-                 p.part_number, p.barcode, p.supplier_code, p.old_part_number)`,
+                 p.part_number, p.barcode, p.supplier_code, p.old_part_number, ${EXTRA})`,
         [from, from + BATCH]);
       total += res.rowCount || 0;
       await pause(100);
