@@ -179,7 +179,8 @@ function mapHit(row: any): CatalogHit {
     stock: row.stock,
     stock_status: row.stock_status,
     image: pickFirstImage(row.images),
-    slug: row.slug || row.sku?.toLowerCase().replace(/[^a-z0-9]/g, '-') || `product-${row.id}`,
+    // La ficha se abre por la referencia tal cual (/producto/07YA23SA; en minúsculas da 404).
+    slug: row.slug || row.sku || String(row.id),
     compatibility: row.compatibility,
     category2: row.category2,
     category3: row.category3,
