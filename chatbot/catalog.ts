@@ -192,7 +192,7 @@ function formatHitText(p: CatalogHit, targetMoto?: GarageMotorcycle | null): str
     : `${(p.price / 100).toFixed(2)}€`;
   const stockStr = (p.stock || 0) > 0 ? `stock: ${p.stock}` : 'sin stock';
   const compatTag = targetMoto && (targetMoto.brand || targetMoto.model)
-    ? `[COMPATIBLE VERIFICADO CON ${targetMoto.brand} ${targetMoto.model}${targetMoto.year ? ` (${targetMoto.year})` : ''}] `
+    ? `[COMPATIBLE VERIFICADO CON ${`${targetMoto.brand} ${targetMoto.model}`.replace(/[¿?¡!,;]/g, '').trim()}${targetMoto.year ? ` (${targetMoto.year})` : ''}] `
     : '';
   return `- ${compatTag}${p.sku} | ${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}`;
 }
@@ -649,7 +649,10 @@ export async function getCatalogContext(
     const note = missing.length > 0
       ? `NO HAY NADA QUE CUMPLA «${missing.join(' ')}» EN ESTA BÚSQUEDA. Díselo al cliente y ofrécele estas alternativas:\n`
       : '';
-    return { hits, text: note + hits.map((h) => formatHitText(h, null)).join('\n') };
+    // La búsqueda exige el modelo de la moto (nombre o compatibilidad): se marcan
+    // como compatibles para que el asistente no dude de ellos.
+    const moto = queryMoto && (queryMoto.brand || queryMoto.model) ? queryMoto : garageMoto;
+    return { hits, text: note + hits.map((h) => formatHitText(h, moto)).join('\n') };
   }
   if ((queryMoto && (queryMoto.brand || queryMoto.model)) || garageMoto) {
     // Sin resultados para la moto nombrada: mejor decirlo que ofrecer piezas de otra.
