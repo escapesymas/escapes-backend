@@ -35,6 +35,8 @@ import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats 
 import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-webhook-service.js';
 import { processEmailRetryQueue, recordOpen, emailStats, sendEmail, sendTemplatedEmail } from './lib/email.js';
 import { orderEmailItems } from './lib/order-emails.js';
+import { formatOrderNumber } from './lib/email-templates.js';
+import { REFUND_REASONS, REFUNDABLE_STATUSES, REFUND_REASON_MIN, REFUND_REASON_MAX, refundEstimate, refundRequestsByOrder, refundRequestView, type RefundLine } from './lib/refunds.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { quoteOrder } from './lib/order-pricing.js';
@@ -124,6 +126,61 @@ function payToken(orderId: number): string {
 /** Enlace permanente de pago de un pedido: crea la sesión de Stripe al abrirlo. */
 function paymentUrlFor(orderId: number): string {
   return `${PUBLIC_SITE_URL}/api/pay/${orderId}?t=${payToken(orderId)}`;
+}
+
+/** Email y nombre del cliente de un pedido (guardados en shipping_data). */
+function orderContact(order: any): { email: string; firstName: string } {
+  try {
+    const sd = typeof order.shipping_data === 'string' ? JSON.parse(order.shipping_data || '{}') : (order.shipping_data || {});
+    return { email: String(sd.email || ''), firstName: String(sd.firstName || sd.name || '') };
+  } catch { return { email: '', firstName: '' }; }
+}
+
+class RefundError extends Error {}
+
+/**
+ * Reembolsa por Stripe parte o todo un pedido y actualiza refunded_amount y el
+ * estado. Se reembolsa por PaymentIntent (tarjeta, Bizum y Klarna) y, si no lo
+ * hay, por el cargo (ch_ o py_). Importes en céntimos.
+ */
+async function refundOrderPayment(orderId: number, amountCents: number, reason = 'requested_by_customer') {
+  const r = await pool.query('SELECT id, stripe_charge_id, payment_id, total, refunded_amount, shipping_data, created_at FROM orders WHERE id = $1', [orderId]);
+  const order = r.rows[0];
+  if (!order) throw new RefundError('Pedido no encontrado');
+  if (!(amountCents > 0)) throw new RefundError('Indica un importe a reembolsar mayor que 0.');
+
+  const pi = [order.payment_id, order.stripe_charge_id].find((x: any) => typeof x === 'string' && x.startsWith('pi_'));
+  const charge = [order.stripe_charge_id, order.payment_id].find((x: any) => typeof x === 'string' && /^(ch|py)_/.test(x));
+  if (!pi && !charge) throw new RefundError('El pedido no tiene un pago de Stripe asociado que se pueda reembolsar.');
+
+  const totalCents = Math.round(Number(order.total) || 0);
+  const alreadyCents = Math.round(Number(order.refunded_amount) || 0);
+  const remainingCents = totalCents - alreadyCents;
+  if (amountCents > remainingCents) {
+    throw new RefundError(`Solo quedan ${(remainingCents / 100).toFixed(2)} € por reembolsar en este pedido.`);
+  }
+
+  const refund = await stripeLive.refunds.create({
+    ...(pi ? { payment_intent: pi } : { charge }),
+    amount: amountCents,
+    reason: (['duplicate', 'fraudulent', 'requested_by_customer'].includes(reason) ? reason : 'requested_by_customer') as any,
+    metadata: { orderId: String(orderId) },
+  });
+
+  const full = alreadyCents + amountCents >= totalCents;
+  await pool.query(
+    `UPDATE orders SET refunded_amount = COALESCE(refunded_amount, 0) + $1, status = $2 WHERE id = $3`,
+    [amountCents, full ? 'refunded' : 'partially_refunded', orderId]);
+  return { refund, full, order };
+}
+
+/** Aviso al cliente de un reembolso hecho (no bloquea si falla). */
+function notifyRefund(order: any, amountCents: number, full: boolean, note?: string | null) {
+  const c = orderContact(order);
+  if (!c.email) return;
+  sendTemplatedEmail('refund-processed', c.email, {
+    orderId: order.id, orderDate: order.created_at, customerName: c.firstName, amount: amountCents, full, note: note || null,
+  }).catch((e) => console.error('[REFUND EMAIL]', e.message));
 }
 
 async function sendMail(to: string, subject: string, text: string, html?: string) {
@@ -3137,6 +3194,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           SELECT * FROM orders${statusFilter} ORDER BY created_at DESC LIMIT ${lim} OFFSET ${offset}
         `);
         const result = [];
+        const refundReqs = await refundRequestsByOrder(ordersRes.rows.map((o: any) => o.id));
         for (const rawOrder of ordersRes.rows) {
           const order = rawOrder as any;
           const itemsRes = await db.execute(sql`
@@ -3167,6 +3225,9 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             costTotal: order.cost_total || 0,
             notes: notesRes.rows,
             invoiceNumber: invCheck.rows.length > 0 ? (invCheck.rows[0] as any).invoice_number : null,
+            refunded_amount: Number(order.refunded_amount) || 0,
+            stripe_charge_id: order.stripe_charge_id,
+            refundRequests: (refundReqs.get(order.id) || []).map(refundRequestView),
           });
         }
         return res.json({
@@ -3182,13 +3243,25 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
       case 'update-order-status': {
         if (req.method !== 'POST') return res.status(405).end();
-        const { orderId, status } = req.body;
+        const { orderId, status, reason } = req.body;
         if (!orderId || !status) return res.status(400).json({ error: 'Faltan datos' });
+        const prev = (await pool.query('SELECT id, status, shipping_data, created_at FROM orders WHERE id = $1', [parseInt(orderId)])).rows[0];
         await db.execute(sql`
           UPDATE orders
           SET status = ${status}
           WHERE id = ${parseInt(orderId)}
         `);
+
+        // Aviso al cliente al cancelar (solo la primera vez).
+        if (status === 'cancelled' && prev && prev.status !== 'cancelled') {
+          const c = orderContact(prev);
+          if (c.email) {
+            sendTemplatedEmail('order-cancelled', c.email, {
+              orderId: prev.id, orderDate: prev.created_at, customerName: c.firstName,
+              reason: reason ? String(reason).slice(0, 500) : undefined,
+            }).catch((e) => console.error('[CANCEL EMAIL]', e.message));
+          }
+        }
 
         // Auto-generate invoice if manually moved to paid status
         if (status === 'processing' || status === 'completed') {
@@ -3341,53 +3414,59 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         return res.json(noteRes.rows[0]);
       }
 
+      case 'resolve-refund-request': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { requestId, decision, amount, note } = req.body || {};
+        const rr = (await pool.query('SELECT * FROM refund_requests WHERE id = $1', [parseInt(requestId)])).rows[0];
+        if (!rr) return res.status(404).json({ error: 'Solicitud no encontrada' });
+        if (rr.status !== 'pending') return res.status(409).json({ error: 'Esta solicitud ya está resuelta' });
+        const cleanNote = String(note || '').trim().slice(0, 2000);
+
+        if (decision === 'reject') {
+          if (cleanNote.length < 5) return res.status(400).json({ error: 'Explica al cliente por qué se rechaza.' });
+          await pool.query(`UPDATE refund_requests SET status = 'rejected', admin_note = $1, resolved_at = NOW() WHERE id = $2`, [cleanNote, rr.id]);
+          const order = (await pool.query('SELECT id, shipping_data, created_at FROM orders WHERE id = $1', [rr.order_id])).rows[0];
+          const c = orderContact(order);
+          if (c.email) {
+            sendTemplatedEmail('refund-rejected', c.email, {
+              orderId: order.id, orderDate: order.created_at, customerName: c.firstName, note: cleanNote,
+            }).catch((e) => console.error('[REFUND EMAIL]', e.message));
+          }
+          return res.json({ success: true, status: 'rejected' });
+        }
+
+        if (decision !== 'approve') return res.status(400).json({ error: 'Decisión no válida' });
+        // El importe lo decide el equipo (por defecto, el estimado de la solicitud).
+        const amountCents = amount != null && amount !== '' ? Math.round((parseFloat(amount) || 0) * 100) : rr.amount_cents;
+        try {
+          const { full, order } = await refundOrderPayment(rr.order_id, amountCents, 'requested_by_customer');
+          await pool.query(
+            `UPDATE refund_requests SET status = 'refunded', refunded_cents = $1, admin_note = NULLIF($2, ''), resolved_at = NOW() WHERE id = $3`,
+            [amountCents, cleanNote, rr.id]);
+          notifyRefund(order, amountCents, full, cleanNote);
+          return res.json({ success: true, status: 'refunded', full });
+        } catch (error: any) {
+          if (!(error instanceof RefundError)) console.error('[STRIPE REFUND ERROR]', error.message);
+          return res.status(400).json({ error: error.message });
+        }
+      }
+
+      case 'refund-requests-pending': {
+        const r = await pool.query(`SELECT order_id FROM refund_requests WHERE status = 'pending' ORDER BY created_at`);
+        return res.json({ count: r.rows.length, orderIds: r.rows.map((x: any) => x.order_id) });
+      }
+
       case 'refund-order': {
         if (req.method !== 'POST') return res.status(405).end();
-        const { orderId, amount, reason } = req.body;
-        const amountEur = Math.round((parseFloat(amount) || 0) * 100) / 100;
-        if (!orderId || !(amountEur > 0)) return res.status(400).json({ error: 'Indica un importe a reembolsar mayor que 0.' });
-
-        const orderRes = await db.execute(sql`SELECT stripe_charge_id, payment_id, total, refunded_amount FROM orders WHERE id = ${parseInt(orderId)}`);
-        const order = orderRes.rows[0] as any;
-        if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
-
-        // Se reembolsa por PaymentIntent (vale para tarjeta, Bizum y Klarna). Si
-        // no lo hay, por el cargo: ch_ (tarjeta) o py_ (Bizum, Klarna y otros).
-        const pi = [order.payment_id, order.stripe_charge_id].find((x: any) => typeof x === 'string' && x.startsWith('pi_'));
-        const charge = [order.stripe_charge_id, order.payment_id].find((x: any) => typeof x === 'string' && /^(ch|py)_/.test(x));
-        if (!pi && !charge) {
-          return res.status(400).json({ error: 'El pedido no tiene un pago de Stripe asociado que se pueda reembolsar.' });
-        }
-
-        // Importes en céntimos, como total.
-        const amountCents = Math.round(amountEur * 100);
-        const totalCents = Math.round(Number(order.total) || 0);
-        const alreadyCents = Math.round(Number(order.refunded_amount) || 0);
-        const remainingCents = totalCents - alreadyCents;
-        if (amountCents > remainingCents) {
-          return res.status(400).json({ error: `Solo quedan ${(remainingCents / 100).toFixed(2)} € por reembolsar en este pedido.` });
-        }
-
+        const { orderId, amount, reason, note } = req.body;
+        const amountCents = Math.round((parseFloat(amount) || 0) * 100);
+        if (!orderId) return res.status(400).json({ error: 'Faltan datos' });
         try {
-          const client = getStripeClient(req);
-          const refund = await client.refunds.create({
-            ...(pi ? { payment_intent: pi } : { charge }),
-            amount: amountCents,
-            reason: ['duplicate', 'fraudulent', 'requested_by_customer'].includes(reason) ? reason : 'requested_by_customer',
-            metadata: { orderId: String(orderId) },
-          });
-
-          const full = alreadyCents + amountCents >= totalCents;
-          await db.execute(sql`
-            UPDATE orders
-            SET refunded_amount = COALESCE(refunded_amount, 0) + ${amountCents},
-                status = ${full ? 'refunded' : 'partially_refunded'}
-            WHERE id = ${parseInt(orderId)}
-          `);
-
+          const { refund, full, order } = await refundOrderPayment(parseInt(orderId), amountCents, reason);
+          notifyRefund(order, amountCents, full, note);
           return res.json({ success: true, refund: { id: refund.id, amount: refund.amount, status: refund.status }, full });
         } catch (error: any) {
-          console.error('[STRIPE REFUND ERROR]', error.message);
+          if (!(error instanceof RefundError)) console.error('[STRIPE REFUND ERROR]', error.message);
           return res.status(400).json({ error: error.message });
         }
       }
@@ -5584,6 +5663,7 @@ app.get('/api/orders/my-orders', requireAuth, async (req: any, res: any) => {
     const ordersRes = await db.execute(sql`
       SELECT * FROM orders WHERE user_id = ${userId} ORDER BY created_at DESC
     `);
+    const refundReqs = await refundRequestsByOrder(ordersRes.rows.map((o: any) => o.id));
 
     const result = [];
     for (const rawOrder of ordersRes.rows) {
@@ -5593,11 +5673,15 @@ app.get('/api/orders/my-orders', requireAuth, async (req: any, res: any) => {
         FROM order_items oi
         LEFT JOIN products p ON oi.product_id = p.id
         WHERE oi.order_id = ${order.id}
+        ORDER BY oi.id
       `);
-      
+
       let parsedShipping = {};
       try { parsedShipping = order.shipping_data ? JSON.parse(order.shipping_data as string) : {}; } catch { }
 
+      const requests = (refundReqs.get(order.id) || []).map(refundRequestView);
+      const refundedCents = Number(order.refunded_amount) || 0;
+      const hasPending = requests.some((r) => r.status === 'pending');
       result.push({
         id: order.id,
         total: (order.total as number) / 100, // en euros
@@ -5605,15 +5689,19 @@ app.get('/api/orders/my-orders', requireAuth, async (req: any, res: any) => {
         paymentId: order.payment_id,
         shippingData: parsedShipping,
         createdAt: order.created_at,
+        refunded: refundedCents / 100,
+        refundRequests: requests,
+        canRequestRefund: REFUNDABLE_STATUSES.includes(order.status) && !hasPending && refundedCents < Number(order.total),
         items: itemsRes.rows.map(rawItem => {
           const item = rawItem as any;
-          let imgs = [];
-          try { imgs = item.product_images ? JSON.parse(item.product_images as string) : []; } catch { }
+          // images es jsonb: llega ya como array (o como texto en filas antiguas).
+          let imgs: any[] = [];
+          try { imgs = Array.isArray(item.product_images) ? item.product_images : (item.product_images ? JSON.parse(item.product_images as string) : []); } catch { }
           return {
             id: item.id,
             productId: item.product_id,
             productName: item.product_name || 'Producto eliminado',
-            image: imgs[0]?.src || imgs[0] || '',
+            image: imgs[0]?.src || (typeof imgs[0] === 'string' ? imgs[0] : '') || '',
             quantity: item.quantity,
             price: (item.price as number) / 100 // en euros
           };
@@ -5625,6 +5713,93 @@ app.get('/api/orders/my-orders', requireAuth, async (req: any, res: any) => {
   } catch (err: any) {
     console.error('[MY ORDERS ERROR]:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Solicitud de reembolso del cliente: pedido completo o algunas líneas, con motivo.
+app.post('/api/orders/:id/refund-request', requireAuth, formsLimiter, async (req: any, res: any) => {
+  try {
+    const orderId = parseInt(String(req.params.id), 10);
+    const { scope, items, reasonCode, reason } = req.body || {};
+    if (!Number.isFinite(orderId)) return res.status(400).json({ error: 'Pedido no válido' });
+    if (scope !== 'full' && scope !== 'partial') return res.status(400).json({ error: 'Indica si es el pedido completo o algunos productos.' });
+    if (!REFUND_REASONS[String(reasonCode)]) return res.status(400).json({ error: 'Elige un motivo.' });
+    const text = String(reason || '').trim();
+    if (text.length < REFUND_REASON_MIN) return res.status(400).json({ error: `Explica el motivo del reembolso (mínimo ${REFUND_REASON_MIN} caracteres).` });
+    if (text.length > REFUND_REASON_MAX) return res.status(400).json({ error: 'El motivo es demasiado largo.' });
+
+    const order = (await pool.query('SELECT * FROM orders WHERE id = $1 AND user_id = $2', [orderId, req.user.user_id])).rows[0];
+    if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
+    if (!REFUNDABLE_STATUSES.includes(order.status)) return res.status(409).json({ error: 'Este pedido no admite solicitudes de reembolso.' });
+    if (Number(order.refunded_amount) >= Number(order.total)) return res.status(409).json({ error: 'Este pedido ya está reembolsado.' });
+    const open = await pool.query(`SELECT 1 FROM refund_requests WHERE order_id = $1 AND status = 'pending' LIMIT 1`, [orderId]);
+    if (open.rows.length) return res.status(409).json({ error: 'Ya tienes una solicitud de reembolso pendiente para este pedido.' });
+
+    const lines = (await pool.query(
+      `SELECT oi.id, oi.product_id, oi.quantity, oi.price, COALESCE(p.name, 'Producto') AS name
+         FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = $1 ORDER BY oi.id`, [orderId])).rows;
+
+    let selected: RefundLine[];
+    if (scope === 'full') {
+      selected = lines.map((l: any) => ({ itemId: l.id, productId: l.product_id, name: l.name, quantity: Number(l.quantity), priceCents: Number(l.price) }));
+    } else {
+      const wanted = Array.isArray(items) ? items : [];
+      selected = [];
+      for (const w of wanted) {
+        const line = lines.find((l: any) => l.id === parseInt(w?.itemId));
+        const qty = parseInt(w?.quantity);
+        if (!line || !Number.isInteger(qty) || qty < 1) continue;
+        if (qty > Number(line.quantity)) return res.status(400).json({ error: `No puedes pedir más unidades de las compradas (${line.name}).` });
+        selected.push({ itemId: line.id, productId: line.product_id, name: line.name, quantity: qty, priceCents: Number(line.price) });
+      }
+      if (!selected.length) return res.status(400).json({ error: 'Selecciona al menos un producto.' });
+    }
+
+    const amountCents = refundEstimate(order, lines, selected, scope);
+    if (amountCents <= 0) return res.status(409).json({ error: 'No queda importe por reembolsar en este pedido.' });
+
+    const ins = await pool.query(
+      `INSERT INTO refund_requests (order_id, user_id, scope, items, amount_cents, reason_code, reason)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [orderId, req.user.user_id, scope, JSON.stringify(selected), amountCents, reasonCode, text]);
+
+    const c = orderContact(order);
+    const reasonLabel = REFUND_REASONS[String(reasonCode)];
+    const num = formatOrderNumber(order.id, order.created_at);
+    if (c.email) {
+      sendTemplatedEmail('refund-request-received', c.email, {
+        orderId: order.id, orderDate: order.created_at, customerName: c.firstName,
+        scope, items: selected.map((x) => ({ name: x.name, quantity: x.quantity })), amount: amountCents, reasonLabel, reason: text,
+      }, { replyTo: 'garantiasydevoluciones@escapesymas.com' }).catch((e) => console.error('[REFUND REQUEST EMAIL]', e.message));
+    }
+    sendTemplatedEmail('internal', 'garantiasydevoluciones@escapesymas.com', {
+      subject: `[REEMBOLSO] Pedido #${num} · ${(amountCents / 100).toFixed(2)} €`,
+      title: 'Nueva solicitud de reembolso',
+      facts: [
+        ['Pedido', `#${num} (id ${order.id})`],
+        ['Cliente', `${c.firstName} <${c.email}>`],
+        ['Alcance', scope === 'full' ? 'Pedido completo' : 'Algunos productos'],
+        ['Importe estimado', `${(amountCents / 100).toFixed(2)} €`],
+        ['Motivo', reasonLabel],
+      ],
+      table: { head: ['Producto', 'Unidades'], rows: selected.map((x) => [x.name, String(x.quantity)] as [string, string]) },
+      message: text,
+    }, { replyTo: c.email || undefined, fromName: 'Reembolsos web' }).catch((e) => console.error('[REFUND REQUEST EMAIL]', e.message));
+
+    try {
+      const { sendNotificationToAll } = await import('./pushService.js');
+      await sendNotificationToAll({
+        title: `↩️ Solicitud de reembolso · Pedido #${order.id}`,
+        body: `${(amountCents / 100).toFixed(2)} € · ${reasonLabel}`,
+        url: '/orders', category: 'new_order', data: { orderId: order.id },
+      });
+    } catch { /* aviso opcional */ }
+
+    return res.json({ success: true, request: refundRequestView(ins.rows[0]) });
+  } catch (err: any) {
+    console.error('[REFUND REQUEST ERROR]', err.message);
+    return res.status(500).json({ error: 'No hemos podido registrar tu solicitud. Inténtalo de nuevo.' });
   }
 });
 

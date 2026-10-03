@@ -22,6 +22,7 @@
  *   - contact-reply         respuesta a una consulta
  *   - generic               texto libre con botón opcional
  *   - internal              avisos internos (contacto, garantías)
+ *   - refund-request-received / refund-processed / refund-rejected  reembolsos
  * El carrito abandonado está en templates/abandoned-cart.ts y usa estas piezas.
  */
 
@@ -515,6 +516,108 @@ ${d.originalMessage ? `\n--\nTu mensaje original:\n${d.originalMessage}\n--\n` :
   return { subject, text, html };
 }
 
+export interface RefundLineData {
+  name: string;
+  quantity: number;
+}
+
+export interface RefundRequestReceivedData {
+  orderId: number | string;
+  orderDate?: Date | string | null;
+  customerName?: string;
+  scope: 'full' | 'partial';
+  items: RefundLineData[];
+  /** Importe estimado en céntimos. */
+  amount: number;
+  reasonLabel: string;
+  reason: string;
+}
+
+export function refundRequestReceived(d: RefundRequestReceivedData): RenderedEmail {
+  const num = formatOrderNumber(d.orderId, d.orderDate);
+  const what = d.scope === 'full' ? 'del pedido completo' : 'de algunos productos';
+  const subject = `Hemos recibido tu solicitud de reembolso · Pedido #${num}`;
+  const text = `Hola${d.customerName ? ` ${d.customerName}` : ''},
+
+Hemos recibido tu solicitud de reembolso ${what} del pedido #${num}.
+
+${d.items.map((i) => `- ${i.quantity} × ${i.name}`).join('\n')}
+Importe estimado: ${eur(d.amount)}
+Motivo: ${d.reasonLabel}
+${d.reason}
+
+La revisaremos y te responderemos en un plazo máximo de 3 días laborables. Si hay que devolver el producto, te indicaremos cómo hacerlo.${signature}`;
+  const html = shell(`
+    ${heading('Solicitud de reembolso recibida')}
+    ${greeting(d.customerName)}
+    ${p(`Hemos recibido tu solicitud de reembolso ${what} del pedido <strong style="color:${C.text}">#${escapeHtml(num)}</strong>.`)}
+    ${factsTable([
+      ...d.items.map((i) => [i.name, `${i.quantity} ud.`] as [string, string]),
+      ['Importe estimado', eur(d.amount)],
+      ['Motivo', d.reasonLabel],
+    ])}
+    ${panel(escapeHtml(d.reason).replace(/\n/g, '<br>'), true)}
+    ${p('La revisaremos y te responderemos en un plazo máximo de 3 días laborables. Si hay que devolver el producto, te indicaremos cómo hacerlo.')}
+  `, `Solicitud de reembolso del pedido #${num} recibida.`);
+  return { subject, text, html };
+}
+
+export interface RefundProcessedData {
+  orderId: number | string;
+  orderDate?: Date | string | null;
+  customerName?: string;
+  /** Importe reembolsado en céntimos. */
+  amount: number;
+  full: boolean;
+  note?: string | null;
+}
+
+export function refundProcessed(d: RefundProcessedData): RenderedEmail {
+  const num = formatOrderNumber(d.orderId, d.orderDate);
+  const subject = `Reembolso de ${eur(d.amount)} realizado · Pedido #${num}`;
+  const text = `Hola${d.customerName ? ` ${d.customerName}` : ''},
+
+Hemos realizado un reembolso de ${eur(d.amount)} ${d.full ? 'por el total de tu pedido' : 'de parte de tu pedido'} #${num}.${d.note ? `\n\n${d.note}` : ''}
+
+El dinero vuelve al mismo medio de pago que usaste. Según tu banco puede tardar entre 5 y 10 días hábiles en aparecer.${signature}`;
+  const html = shell(`
+    ${heading('Reembolso realizado')}
+    ${greeting(d.customerName)}
+    ${p(`Hemos realizado un reembolso ${d.full ? 'por el total de tu pedido' : 'de parte de tu pedido'} <strong style="color:${C.text}">#${escapeHtml(num)}</strong>.`)}
+    ${highlight('Importe reembolsado', eur(d.amount))}
+    ${d.note ? panel(escapeHtml(d.note).replace(/\n/g, '<br>'), true) : ''}
+    ${p('El dinero vuelve al mismo medio de pago que usaste. Según tu banco puede tardar entre 5 y 10 días hábiles en aparecer.')}
+  `, `Te hemos devuelto ${eur(d.amount)}.`);
+  return { subject, text, html };
+}
+
+export interface RefundRejectedData {
+  orderId: number | string;
+  orderDate?: Date | string | null;
+  customerName?: string;
+  note: string;
+}
+
+export function refundRejected(d: RefundRejectedData): RenderedEmail {
+  const num = formatOrderNumber(d.orderId, d.orderDate);
+  const subject = `Sobre tu solicitud de reembolso · Pedido #${num}`;
+  const text = `Hola${d.customerName ? ` ${d.customerName}` : ''},
+
+Hemos revisado tu solicitud de reembolso del pedido #${num} y no podemos aceptarla:
+
+${d.note}
+
+Si no estás de acuerdo o quieres darnos más información, responde a este correo.${signature}`;
+  const html = shell(`
+    ${heading('Solicitud de reembolso revisada')}
+    ${greeting(d.customerName)}
+    ${p(`Hemos revisado tu solicitud de reembolso del pedido <strong style="color:${C.text}">#${escapeHtml(num)}</strong> y no podemos aceptarla:`)}
+    ${panel(escapeHtml(d.note).replace(/\n/g, '<br>'), true)}
+    ${p('Si no estás de acuerdo o quieres darnos más información, responde a este correo.')}
+  `);
+  return { subject, text, html };
+}
+
 export interface GenericData {
   subject: string;
   body: string;
@@ -566,6 +669,9 @@ type TemplateMap = {
   'contact-reply': ContactReplyData;
   'generic': GenericData;
   'internal': InternalData;
+  'refund-request-received': RefundRequestReceivedData;
+  'refund-processed': RefundProcessedData;
+  'refund-rejected': RefundRejectedData;
 };
 
 export type TemplateName = keyof TemplateMap;
@@ -586,6 +692,9 @@ export function renderEmail<K extends keyof TemplateMap>(template: K, data: Temp
     case 'contact-reply':       return contactReply(data as any);
     case 'generic':             return generic(data as any);
     case 'internal':            return internal(data as any);
+    case 'refund-request-received': return refundRequestReceived(data as any);
+    case 'refund-processed':    return refundProcessed(data as any);
+    case 'refund-rejected':     return refundRejected(data as any);
     default: {
       const unknown = (template as string) || 'unknown';
       throw new Error(`Unknown email template: ${unknown}`);
