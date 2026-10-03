@@ -19,6 +19,7 @@ import { pool, db } from '../db.js';
 import { sql } from 'drizzle-orm';
 import { processStripeEvent } from './stripe-webhook.js';
 import { sendTemplatedEmail, sendEmail } from './email.js';
+import { orderEmailItems } from './order-emails.js';
 import { cacheBust } from './cache.js';
 import fs from 'fs';
 
@@ -190,7 +191,7 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
   }
 
   // 1. Order-level idempotency check: check current status
-  const existingOrderRes = await db.execute(sql`SELECT id, status, shipping_data, total FROM orders WHERE id = ${orderId}`);
+  const existingOrderRes = await db.execute(sql`SELECT id, status, shipping_data, total, subtotal, discount_amount, shipping_cost, created_at FROM orders WHERE id = ${orderId}`);
   const existingOrder = existingOrderRes.rows[0] as any;
 
   if (!existingOrder) {
@@ -202,7 +203,8 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
   // Stripe charged does not match the order total. Protects against tampered
   // PaymentIntents and partial captures. See audit 2026-08-15, finding #2.
   const expectedCents = Number(existingOrder.total) || 0;
-  const chargedCents = Number(obj.amount_received ?? obj.amount) || 0;
+  // PaymentIntent: amount_received/amount; Checkout Session: amount_total.
+  const chargedCents = Number(obj.amount_received ?? obj.amount ?? obj.amount_total) || 0;
   if (expectedCents > 0 && chargedCents !== expectedCents) {
     console.warn(
       `[STRIPE WEBHOOK SECURITY] Pedido #${orderId} importe ${chargedCents} != esperado ${expectedCents}. ` +
@@ -312,9 +314,14 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
         customerEmail,
         {
           orderId,
+          orderDate: existingOrder.created_at,
           customerName,
           total: existingOrder.total || 0,
+          subtotal: existingOrder.subtotal,
+          discount: existingOrder.discount_amount,
+          shipping: existingOrder.shipping_cost,
           invoiceNumber: invoiceRecord?.invoice_number,
+          items: await orderEmailItems(orderId).catch(() => []),
         },
         { attachments, eventId: evt.id }
       );
