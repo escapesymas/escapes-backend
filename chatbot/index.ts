@@ -74,6 +74,7 @@ PRODUCTOS DEL CATÁLOGO PARA ESTA CONSULTA:
 ${catalogContext}
 
 CÓMO RESPONDER:
+- Escribe siempre en español, sin palabras en otros idiomas ni caracteres chinos.
 - Breve: 2-4 frases, o una lista corta si comparas productos. Texto plano: sin títulos (#) ni tablas; como mucho **negritas** y guiones para listas.
 - No muestres referencias (SKU) ni enlaces: debajo de tu respuesta el cliente ve tarjetas con esos productos, su precio y el botón de añadir al carrito.
 - Productos, precios y stock: solo los de la lista de arriba, con el precio que figura. Si un producto pone «sin stock», di que ahora mismo está agotado; nunca lo describas como disponible.
@@ -117,6 +118,8 @@ function stripThinking(text: string): string {
   const re = new RegExp(`${THINK_OPEN}[\\s\\S]*?${THINK_CLOSE}`, 'g');
   return encoded.replace(re, '').replace(/\s{2,}/g, ' ').trim();
 }
+
+const CJK_RE = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]+/g;
 
 const recentByUser = new Map<number, number[]>();
 const PER_USER_LIMIT_MS = 10 * 60 * 1000;
@@ -257,7 +260,8 @@ export async function chatHandler(req: Request, res: Response) {
     for await (const chunk of stream as any) {
       const choice = chunk.choices?.[0];
       if (choice?.finish_reason) finishReason = choice.finish_reason;
-      const piece = choice?.delta?.content;
+      // MiniMax a veces cuela palabras en chino («materiales复合材料»): se quitan.
+      const piece = choice?.delta?.content?.replace(CJK_RE, '');
       if (!piece) continue;
       pending += piece;
       if (!started) {
