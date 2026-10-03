@@ -30,7 +30,7 @@ export interface Quote {
   taxNote: string | null;
   taxCents: number;
   totalCents: number;
-  promo: { code: string; valid: boolean; type?: string } | null;
+  promo: { code: string; valid: boolean; type?: string; minAmount?: number; error?: string } | null;
   nextTier: { min: number; discountPercent: number; freeShipping: boolean; missingCents: number } | null;
 }
 
@@ -96,17 +96,23 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
   if (code) {
     const sqlCheck = `FROM coupons WHERE UPPER(code) = $1 AND active = 1
         AND (max_uses IS NULL OR times_used < max_uses) AND (expires_at IS NULL OR expires_at > NOW())`;
-    const c: any = opts.redeemCoupon
-      ? (await pool.query(`UPDATE coupons SET times_used = times_used + 1
-          WHERE id = (SELECT id ${sqlCheck} LIMIT 1) RETURNING type, value`, [code])).rows[0]
-      : (await pool.query(`SELECT type, value ${sqlCheck} LIMIT 1`, [code])).rows[0];
-    // Códigos fijos heredados (solo si no existen en la tabla coupons).
-    const legacy: Record<string, { type: string; value: number }> = {
-      WELCOME10: { type: 'percent', value: 10 }, RIDER20: { type: 'percent', value: 20 }, ENVIOFREE: { type: 'free_shipping', value: 0 },
-    };
-    const known = c || (await pool.query('SELECT 1 FROM coupons WHERE UPPER(code) = $1 LIMIT 1', [code])).rows.length > 0;
-    const applied: any = c || (!known ? legacy[code] : null);
-    promo = { code, valid: !!applied, type: applied?.type };
+    const found: any = (await pool.query(`SELECT type, value, COALESCE(min_amount, 0) AS min_amount ${sqlCheck} LIMIT 1`, [code])).rows[0];
+    const minCents = Number(found?.min_amount) || 0;
+    let applied: any = null;
+    let error: string | undefined;
+    if (!found) {
+      error = 'Cupón no válido o caducado';
+    } else if (subtotalCents < minCents) {
+      error = `Este cupón requiere una compra mínima de ${(minCents / 100).toFixed(2).replace('.', ',')} €`;
+    } else if (opts.redeemCoupon) {
+      // Canje atómico: límite de usos y caducidad comprobados en la misma sentencia.
+      applied = (await pool.query(`UPDATE coupons SET times_used = times_used + 1
+          WHERE id = (SELECT id ${sqlCheck} LIMIT 1) RETURNING type, value`, [code])).rows[0] || null;
+      if (!applied) error = 'Cupón no válido o caducado';
+    } else {
+      applied = found;
+    }
+    promo = { code, valid: !!applied, type: applied?.type, minAmount: minCents / 100, error };
     if (applied?.type === 'percent') discountPercent += Number(applied.value) || 0;
     else if (applied?.type === 'fixed') fixedCents = Number(applied.value) || 0;
     else if (applied?.type === 'free_shipping') shippingCents = 0;

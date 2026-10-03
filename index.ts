@@ -4838,18 +4838,34 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
       case 'create-coupon': {
         if (req.method !== 'POST') return res.status(405).end();
-        const { code, type, value, active, expiresAt, maxUses } = req.body;
+        const { code, type, value, active, expiresAt, maxUses, minAmount } = req.body;
         if (!code || !type || value === undefined) {
           return res.status(400).json({ error: 'Faltan datos obligatorios' });
         }
         const codeUpper = code.trim().toUpperCase();
         const expiresVal = expiresAt ? new Date(expiresAt) : null;
-        
+        const minCents = Math.max(0, Math.round((parseFloat(minAmount) || 0) * 100));
+
         await db.execute(sql`
-          INSERT INTO coupons (code, type, value, active, expires_at, max_uses, times_used)
-          VALUES (${codeUpper}, ${type}, ${parseInt(value)}, ${active !== undefined ? parseInt(active) : 1}, ${expiresVal}, ${maxUses !== undefined ? parseInt(maxUses) : 999999}, 0)
+          INSERT INTO coupons (code, type, value, active, expires_at, max_uses, times_used, min_amount)
+          VALUES (${codeUpper}, ${type}, ${parseInt(value)}, ${active !== undefined ? parseInt(active) : 1}, ${expiresVal}, ${maxUses !== undefined ? parseInt(maxUses) : 999999}, 0, ${minCents})
         `);
         return res.json({ success: true });
+      }
+
+      // Cambios en un cupón existente sin perder su historial de usos.
+      case 'update-coupon': {
+        if (req.method !== 'POST') return res.status(405).end();
+        const { id, minAmount, active } = req.body || {};
+        if (!id) return res.status(400).json({ error: 'Falta el cupón' });
+        const sets: string[] = []; const vals: any[] = [];
+        if (minAmount !== undefined) { vals.push(Math.max(0, Math.round((parseFloat(minAmount) || 0) * 100))); sets.push(`min_amount = $${vals.length}`); }
+        if (active !== undefined) { vals.push(active ? 1 : 0); sets.push(`active = $${vals.length}`); }
+        if (!sets.length) return res.status(400).json({ error: 'Nada que cambiar' });
+        vals.push(parseInt(id));
+        const r = await pool.query(`UPDATE coupons SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`, vals);
+        if (!r.rows.length) return res.status(404).json({ error: 'Cupón no encontrado' });
+        return res.json({ success: true, coupon: r.rows[0] });
       }
 
       // --- TAXONOMÍAS: CATEGORÍAS ---
@@ -5352,44 +5368,35 @@ app.all('/api/garage', requireAuth, async (req: any, res) => {
 // PUBLIC VALIDATIONS & dynamic mappings
 // ================================================================
 app.post('/api/coupons/validate', async (req: any, res: any) => {
-  const { code } = req.body;
+  const { code, subtotal } = req.body || {};
   if (!code) return res.status(400).json({ valid: false, error: 'Falta el código de cupón' });
 
   try {
-    const codeUpper = code.trim().toUpperCase();
-    const coupRes = await db.execute(sql`
-      SELECT * FROM coupons WHERE UPPER(code) = ${codeUpper} AND active = 1
-    `);
+    const codeUpper = String(code).trim().toUpperCase();
+    const c = (await pool.query(
+      `SELECT code, type, value, COALESCE(min_amount, 0) AS min_amount, expires_at, max_uses, times_used
+         FROM coupons WHERE UPPER(code) = $1 AND active = 1`, [codeUpper])).rows[0];
+    if (!c) return res.json({ valid: false, error: 'Cupón no válido' });
 
-    if (coupRes.rows.length > 0) {
-      const c = coupRes.rows[0] as any;
-      const now = new Date();
-      const expiry = c.expires_at ? new Date(c.expires_at) : null;
-      const underLimit = c.max_uses === null || c.times_used < c.max_uses;
+    const expired = c.expires_at && new Date(c.expires_at) <= new Date();
+    const used = c.max_uses !== null && c.times_used >= c.max_uses;
+    if (expired || used) return res.json({ valid: false, error: 'El cupón ha caducado o ya se ha usado' });
 
-      if ((!expiry || expiry > now) && underLimit) {
-        return res.json({
-          valid: true,
-          code: c.code,
-          type: c.type,
-          value: c.value // en céntimos (si es fixed) o porcentaje (si es percent)
-        });
-      } else {
-        return res.json({ valid: false, error: 'El cupón ha expirado o alcanzado su límite de uso' });
-      }
-    } else {
-      // Legacy hardcoded fallbacks
-      if (codeUpper === 'WELCOME10') {
-        return res.json({ valid: true, code: 'WELCOME10', type: 'percent', value: 10 });
-      } else if (codeUpper === 'RIDER20') {
-        return res.json({ valid: true, code: 'RIDER20', type: 'percent', value: 20 });
-      } else if (codeUpper === 'ENVIOFREE') {
-        return res.json({ valid: true, code: 'ENVIOFREE', type: 'free_shipping', value: 0 });
-      }
-      return res.json({ valid: false, error: 'Cupón no válido' });
+    // Importe mínimo: subtotal en euros (productos con IVA, antes de descuentos).
+    const minEur = (Number(c.min_amount) || 0) / 100;
+    if (minEur > 0 && subtotal !== undefined && Number(subtotal) < minEur) {
+      return res.json({ valid: false, minAmount: minEur, error: `Este cupón requiere una compra mínima de ${minEur.toFixed(2).replace('.', ',')} €` });
     }
+    return res.json({
+      valid: true,
+      code: c.code,
+      type: c.type,
+      value: c.value, // céntimos si es fixed, porcentaje si es percent
+      minAmount: minEur,
+    });
   } catch (err: any) {
-    return res.status(500).json({ valid: false, error: err.message });
+    console.error('[COUPON VALIDATE ERROR]:', err.message);
+    return res.status(500).json({ valid: false, error: 'No se pudo validar el cupón' });
   }
 });
 
