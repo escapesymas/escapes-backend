@@ -148,6 +148,11 @@ export async function sendEmail(payload: EmailPayload): Promise<SendResult> {
   }
 
   console.error(`[EMAIL] Giving up on ${payload.to} after ${MAX_ATTEMPTS} attempts: ${lastErr?.message}`);
+  import('../pushService.js').then(({ notifySystem }) => notifySystem(
+    '📭 Correo no enviado',
+    `«${payload.subject}» a ${payload.to}: ${String(lastErr?.message || lastErr).slice(0, 120)}`,
+    {}, 'notifications',
+  )).catch(() => {});
   return { status: 'permanent_failure', attempts: MAX_ATTEMPTS, lastError: String(lastErr?.message || lastErr) };
 }
 
