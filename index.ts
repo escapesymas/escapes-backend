@@ -3344,35 +3344,50 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
       case 'refund-order': {
         if (req.method !== 'POST') return res.status(405).end();
         const { orderId, amount, reason } = req.body;
-        if (!orderId || !amount) return res.status(400).json({ error: 'Faltan datos' });
-        
-        const orderRes = await db.execute(sql`SELECT stripe_charge_id, payment_id FROM orders WHERE id = ${parseInt(orderId)}`);
+        const amountEur = Math.round((parseFloat(amount) || 0) * 100) / 100;
+        if (!orderId || !(amountEur > 0)) return res.status(400).json({ error: 'Indica un importe a reembolsar mayor que 0.' });
+
+        const orderRes = await db.execute(sql`SELECT stripe_charge_id, payment_id, total, refunded_amount FROM orders WHERE id = ${parseInt(orderId)}`);
         const order = orderRes.rows[0] as any;
-        if (!order || (!order.stripe_charge_id && !order.payment_id)) {
-          return res.status(400).json({ error: 'El pedido no tiene un ID de pago válido de Stripe.' });
+        if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
+
+        // Se reembolsa por PaymentIntent (vale para tarjeta, Bizum y Klarna). Si
+        // no lo hay, por el cargo: ch_ (tarjeta) o py_ (Bizum, Klarna y otros).
+        const pi = [order.payment_id, order.stripe_charge_id].find((x: any) => typeof x === 'string' && x.startsWith('pi_'));
+        const charge = [order.stripe_charge_id, order.payment_id].find((x: any) => typeof x === 'string' && /^(ch|py)_/.test(x));
+        if (!pi && !charge) {
+          return res.status(400).json({ error: 'El pedido no tiene un pago de Stripe asociado que se pueda reembolsar.' });
         }
 
-        const chargeId = order.stripe_charge_id || order.payment_id;
+        // Importes en céntimos, como total.
+        const amountCents = Math.round(amountEur * 100);
+        const totalCents = Math.round(Number(order.total) || 0);
+        const alreadyCents = Math.round(Number(order.refunded_amount) || 0);
+        const remainingCents = totalCents - alreadyCents;
+        if (amountCents > remainingCents) {
+          return res.status(400).json({ error: `Solo quedan ${(remainingCents / 100).toFixed(2)} € por reembolsar en este pedido.` });
+        }
 
         try {
           const client = getStripeClient(req);
           const refund = await client.refunds.create({
-            payment_intent: chargeId.startsWith('pi_') ? chargeId : undefined,
-            charge: chargeId.startsWith('ch_') ? chargeId : undefined,
-            amount: Math.round(parseFloat(amount) * 100), // convert to cents
-            reason: reason || 'requested_by_customer'
+            ...(pi ? { payment_intent: pi } : { charge }),
+            amount: amountCents,
+            reason: ['duplicate', 'fraudulent', 'requested_by_customer'].includes(reason) ? reason : 'requested_by_customer',
+            metadata: { orderId: String(orderId) },
           });
 
+          const full = alreadyCents + amountCents >= totalCents;
           await db.execute(sql`
-            UPDATE orders 
-            SET refunded_amount = COALESCE(refunded_amount, 0) + ${amount},
-                status = 'refunded'
+            UPDATE orders
+            SET refunded_amount = COALESCE(refunded_amount, 0) + ${amountCents},
+                status = ${full ? 'refunded' : 'partially_refunded'}
             WHERE id = ${parseInt(orderId)}
           `);
 
-          return res.json({ success: true, refund });
+          return res.json({ success: true, refund: { id: refund.id, amount: refund.amount, status: refund.status }, full });
         } catch (error: any) {
-          console.error('[STRIPE REFUND ERROR]', error);
+          console.error('[STRIPE REFUND ERROR]', error.message);
           return res.status(400).json({ error: error.message });
         }
       }
