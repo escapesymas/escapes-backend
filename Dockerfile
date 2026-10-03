@@ -49,9 +49,8 @@ COPY --chown=backend:nodejs migrations/ ./migrations/
 COPY --chown=backend:nodejs moto_catalog.jso[n] ./
 COPY --chown=backend:nodejs catalog-csv.zi[p] ./
 
-# Infra post-deploy hook
-COPY --chown=root:root infra/escapes-post-deploy.sh /usr/local/bin/escapes-post-deploy.sh
-RUN chmod +x /usr/local/bin/escapes-post-deploy.sh
+# El hook post-deploy vive en el servidor (/usr/local/bin/escapes-post-deploy.sh,
+# lo lanza cada minuto /usr/local/bin/escapes-traefik-sync.sh): no va en la imagen.
 
 USER backend
 EXPOSE 3001
