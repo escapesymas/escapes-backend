@@ -206,7 +206,12 @@ export async function chatHandler(req: Request, res: Response) {
     // Lo que se busca tiene en cuenta la conversación («¿y para la trasera?»).
     const searchQuery = buildSearchQuery(messages.filter((m) => m.role === 'user').map((m) => m.content));
     const moto = extractMotorcycleFromQuery(searchQuery);
-    const garageEntriesP = getGarageEntries(user.user_id);
+    // La moto elegida ahora en la web va primero; después, las del garaje.
+    const selectedBike = typeof (req.body as any)?.selectedBike === 'string'
+      ? sanitizeUserInput((req.body as any).selectedBike).slice(0, 80)
+      : '';
+    const garageEntriesP = getGarageEntries(user.user_id)
+      .then((g) => (selectedBike ? [selectedBike, ...g.filter((x) => x.toLowerCase() !== selectedBike.toLowerCase())] : g));
 
     const [userContext, ordersContext, policies, webSearchText, catalog] = await Promise.all([
       getGarageContext(user.user_id),
@@ -218,7 +223,8 @@ export async function chatHandler(req: Request, res: Response) {
       garageEntriesP.then((g) => getCatalogContext(searchQuery, g)),
     ]);
 
-    const systemPrompt = buildSystemPrompt(userContext, catalog.text, ordersContext, policies, webSearchText);
+    const bikeContext = selectedBike ? `${userContext}\nMoto seleccionada ahora en la web: ${selectedBike}.` : userContext;
+    const systemPrompt = buildSystemPrompt(bikeContext, catalog.text, ordersContext, policies, webSearchText);
     const finalMessages: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...truncateHistory(messages)];
 
     startStream();

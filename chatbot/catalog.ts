@@ -487,7 +487,10 @@ export async function getCatalogContext(
   const notes: string[] = [];
   if (missing) notes.push(`NO HAY NADA QUE CUMPLA «${missing}» EN ESTA BÚSQUEDA. Díselo al cliente y ofrécele estas alternativas.`);
   if (moto && moto === garageMoto) {
-    notes.push(`Resultados para la moto de su garaje: ${moto.brand} ${moto.model}${moto.year ? ` (${moto.year})` : ''}.`);
+    notes.push(`Resultados para su moto ${moto.brand} ${moto.model}${moto.year ? ` (${moto.year})` : ''} (la elegida en la web o la primera de su garaje).`);
+    if (garageEntries.length > 1) {
+      notes.push(`Tiene más motos guardadas (${garageEntries.slice(1, 4).join(', ')}): menciona para cuál son y ofrece buscar para otra.`);
+    }
   }
   if (moto && !moto.year) {
     notes.push('NO SABEMOS EL AÑO DE LA MOTO: indica los años compatibles de cada producto y pregúntale el año para confirmar.');
