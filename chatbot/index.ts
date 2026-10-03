@@ -177,7 +177,9 @@ export async function chatHandler(req: Request, res: Response) {
 
   const startStream = () => {
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    // no-transform: el proxy de Next.js (/api) comprime con gzip y retenía toda la
+    // respuesta hasta el final; así la deja pasar según se escribe.
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
