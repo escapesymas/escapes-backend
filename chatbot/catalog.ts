@@ -79,16 +79,69 @@ function mapHit(row: any): CatalogHit {
   };
 }
 
-function formatHitText(p: CatalogHit, targetMoto?: GarageMotorcycle | null): string {
+function formatHitText(p: CatalogHit, tag = ''): string {
   const priceStr = p.sale_price
     ? `${(p.sale_price / 100).toFixed(2)}€ (antes ${(p.price / 100).toFixed(2)}€)`
     : `${(p.price / 100).toFixed(2)}€`;
   const stockStr = (p.stock || 0) > 0 ? `stock: ${p.stock}` : 'sin stock';
-  const compatTag = targetMoto && (targetMoto.brand || targetMoto.model)
-    ? `[COMPATIBLE VERIFICADO CON ${`${targetMoto.brand} ${targetMoto.model}`.replace(/[¿?¡!,;]/g, '').trim()}${targetMoto.year ? ` (${targetMoto.year})` : ''}] `
-    : '';
-  return `- ${compatTag}${p.sku} | ${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}`;
+  return `- ${tag ? `${tag} ` : ''}${p.sku} | ${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}`;
 }
+
+/** «MT-07» → /(^|[^A-Z0-9])MT[\s-]?07(?![A-Z0-9])/: no confunde la Z900 con la Z900RS. */
+function modelPattern(model: string): RegExp | null {
+  const chunks = model.toUpperCase().match(/[A-Z]+|\d+/g);
+  if (!chunks) return null;
+  return new RegExp(`(^|[^A-Z0-9])${chunks.join('[\\s./-]?')}(?![A-Z0-9])`);
+}
+
+/** Años de la moto (marca y modelo) con los que el producto es compatible. */
+function compatibleYears(hit: CatalogHit, moto: GarageMotorcycle): number[] | null {
+  const list = Array.isArray(hit.compatibility) ? hit.compatibility : [];
+  if (list.length === 0) return null; // sin datos de compatibilidad
+  const re = modelPattern(moto.model);
+  const years = new Set<number>();
+  for (const e of list) {
+    if (moto.brand && String(e?.brand || '').toUpperCase() !== moto.brand) continue;
+    if (re && !re.test(String(e?.model || '').toUpperCase())) continue;
+    const y = parseInt(e?.year, 10);
+    if (Number.isFinite(y)) years.add(y);
+  }
+  return [...years].sort((x, y) => x - y);
+}
+
+function yearRanges(years: number[]): string {
+  const out: string[] = [];
+  for (let i = 0; i < years.length; i++) {
+    let j = i;
+    while (j + 1 < years.length && years[j + 1] === years[j] + 1) j++;
+    out.push(i === j ? `${years[i]}` : `${years[i]}-${years[j]}`);
+    i = j;
+  }
+  return out.join(', ');
+}
+
+/**
+ * Filtra por la moto (y el año, si se sabe) con la compatibilidad de cada
+ * producto: del mismo modelo cambian las piezas según el año (MT-07 2014-2016,
+ * 2017-2020 y 2021+). Devuelve los productos con la etiqueta para el asistente.
+ */
+function filterByMoto(hits: CatalogHit[], moto: GarageMotorcycle): { hit: CatalogHit; tag: string }[] {
+  const name = `${moto.brand} ${moto.model}`.replace(/[¿?¡!,;]/g, '').trim();
+  const verified: { hit: CatalogHit; tag: string }[] = [];
+  const unknown: { hit: CatalogHit; tag: string }[] = [];
+  for (const hit of hits) {
+    const years = compatibleYears(hit, moto);
+    if (years === null) { unknown.push({ hit, tag: '' }); continue; } // sin datos: se ofrece sin garantizar
+    if (years.length === 0) continue; // tiene compatibilidades, pero no con esta moto
+    if (moto.year) {
+      if (years.includes(moto.year)) verified.push({ hit, tag: `[COMPATIBLE VERIFICADO CON ${name} (${moto.year})]` });
+    } else {
+      verified.push({ hit, tag: `[COMPATIBLE CON ${name} DE ${yearRanges(years)}]` });
+    }
+  }
+  return [...verified, ...unknown];
+}
+
 
 // Palabras de conversación que no describen el producto («¿tenéis…?», «me
 // recomiendas…»): el buscador de la web exige que aparezcan todas.
@@ -133,11 +186,11 @@ function productSearchText(text: string): string {
  * representativo: con stock y el más barato). Sin resultados aproximados, para
  * no ofrecer piezas de otra moto.
  */
-async function searchLikeWeb(search: string): Promise<CatalogHit[]> {
+async function searchLikeWeb(search: string, perPage = 12): Promise<CatalogHit[]> {
   if (!search) return [];
   try {
     // Una sola consulta exacta; los modelos con stock van primero.
-    const res = await listFamilies({ search }, 'relevance', 1, 12, { exact: true });
+    const res = await listFamilies({ search }, 'relevance', 1, perPage, { exact: true });
     if (res.total === 0) return [];
     const ids = res.rows.map((r) => r.rep_id);
     const { rows } = await pool.query(
@@ -248,7 +301,7 @@ export function extractMotorcycleFromQuery(query: string): GarageMotorcycle | nu
 
     // El modelo acaba en la primera puntuación o conjunción y tiene como mucho 3
     // palabras («mt-07 y alguna más barata?» → «MT-07»).
-    afterBrand = afterBrand.split(/[¿?¡!,.;:()]|\s(?:y|e|o|u|pero|alguna?|algun|mas|más|que|qué)\s/)[0];
+    afterBrand = afterBrand.split(/[¿?¡!,.;:()]|\s(?:y|e|o|u|de|del|año|es|era|son|tiene|tengo|modelo|pero|alguna?|algun|mas|más|que|qué)(?:\s|$)/)[0];
     const parts = afterBrand.split(stopWords);
     const firstSegment = (parts[0] || '').trim().split(/\s+/).slice(0, 3).join(' ');
     if (firstSegment && firstSegment.length >= 1) {
@@ -275,19 +328,6 @@ export function extractMotorcycleFromQuery(query: string): GarageMotorcycle | nu
     model: modelStr || '',
     year: detectedYear,
   };
-}
-
-function diversifyByBrand(hits: CatalogHit[], maxPerBrand: number): CatalogHit[] {
-  const result: CatalogHit[] = [];
-  const brandCount = new Map<string, number>();
-  for (const h of hits) {
-    const key = h.brand.toUpperCase().trim();
-    const count = brandCount.get(key) || 0;
-    if (count >= maxPerBrand) continue;
-    brandCount.set(key, count + 1);
-    result.push(h);
-  }
-  return result;
 }
 
 // Resumen real del catálogo para preguntas generales (antes decía «Akrapovic,
@@ -320,6 +360,24 @@ async function catalogSummary(): Promise<string> {
   }
 }
 
+/**
+ * La palabra menos frecuente en los nombres del catálogo, si aparece en menos de
+ * 100 productos (frases y números no cuentan): la candidata a quitar cuando una
+ * búsqueda no da nada.
+ */
+async function rarestTerm(terms: string[]): Promise<string | null> {
+  const words = terms.filter((t) => !t.includes(' ') && t.length >= 3 && !/^\d+$/.test(t));
+  if (words.length === 0) return null;
+  try {
+    const { rows } = await pool.query(`SELECT word, freq FROM catalog_words WHERE word = ANY($1::text[])`, [words]);
+    const freq = new Map(rows.map((r: any) => [r.word, Number(r.freq)]));
+    const ranked = words.map((w) => ({ w, f: freq.get(w) ?? 0 })).sort((a, b) => a.f - b.f);
+    return ranked[0].f < 100 ? ranked[0].w : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Términos de producto de un mensaje (sin relleno ni palabras de pedidos). */
 function productTerms(text: string): string[] {
   return searchTerms(productSearchText(text)).filter((w) => !NON_PRODUCT.has(w));
@@ -344,7 +402,7 @@ export function buildSearchQuery(userMessages: string[]): string {
   if (!extractMotorcycleFromQuery(query)?.brand) {
     for (const m of previous) {
       const moto = extractMotorcycleFromQuery(m);
-      if (moto?.brand) { query = `${query} ${moto.brand} ${moto.model}`.trim(); break; }
+      if (moto?.brand) { query = `${query} ${moto.brand} ${moto.model}${moto.year ? ` ${moto.year}` : ''}`.trim(); break; }
     }
   }
   return query;
@@ -355,7 +413,7 @@ export async function getCatalogContext(
   query: string,
   garageEntries: string[] = []
 ): Promise<CatalogContextResult> {
-  const base = productSearchText(query);
+  let base = productSearchText(query);
   if (productTerms(query).length === 0) {
     return { hits: [], text: await catalogSummary() };
   }
@@ -363,6 +421,9 @@ export async function getCatalogContext(
   // Moto nombrada en la consulta (solo si se reconoce la marca: «talla 58» no es una moto).
   const parsed = extractMotorcycleFromQuery(query);
   const queryMoto = parsed?.brand ? parsed : null;
+  // El año de la moto no está en el texto de búsqueda (se filtra después con la
+  // compatibilidad): «pastillas mt-07 2019» buscaría «2019» y no daría nada.
+  if (queryMoto?.year) base = base.replace(new RegExp(`\\b${queryMoto.year}\\b`, 'g'), ' ').replace(/\s+/g, ' ').trim();
   const garageMoto = !queryMoto
     ? garageEntries.map(parseGarageMotorcycle).find((m): m is GarageMotorcycle => !!m && !!m.brand) || null
     : null;
@@ -375,43 +436,67 @@ export async function getCatalogContext(
   }
   attempts.push({ search: base, moto: queryMoto });
 
-  let hits: CatalogHit[] = [];
+  // Con moto se piden más modelos: después se quitan los que no le valen por año.
+  const run = async (search: string, m: GarageMotorcycle | null) => {
+    const found = await searchLikeWeb(search, m ? 36 : 12);
+    return m ? filterByMoto(found, m) : found.map((hit) => ({ hit, tag: '' }));
+  };
+
+  let found: { hit: CatalogHit; tag: string }[] = [];
   let moto: GarageMotorcycle | null = null;
   for (const a of attempts) {
-    hits = await searchLikeWeb(a.search);
-    if (hits.length > 0) { moto = a.moto; break; }
+    found = await run(a.search, a.moto);
+    if (found.length > 0) { moto = a.moto; break; }
   }
 
-  // ¿Pide algo que no tenemos («escape Akrapovic para Z900»)? Se quita una
-  // palabra que no sea la moto y se ofrece lo que haya («escape Z900»).
+  // ¿Pide algo que no tenemos («escape Akrapovic para Z900», «guantes de
+  // verano»)? Se quita la palabra más rara del catálogo (una marca que no hay, un
+  // adjetivo) y se ofrece lo que haya; nunca el tipo de pieza («kit de arrastre»).
   let missing = '';
-  if (hits.length === 0) {
+  if (found.length === 0) {
     const motoTerms = new Set(queryMoto ? searchTerms(`${queryMoto.brand} ${queryMoto.model}`) : []);
     const terms = searchTerms(base);
-    for (const t of terms.filter((w) => !motoTerms.has(w)).slice(0, 4)) {
-      if (terms.length < 2) break;
-      hits = await searchLikeWeb(terms.filter((w) => w !== t).join(' '));
-      if (hits.length > 0) { missing = t; moto = queryMoto; break; }
+    const rare = await rarestTerm(terms.filter((w) => !motoTerms.has(w)));
+    if (rare && terms.length >= 2) {
+      found = await run(terms.filter((w) => w !== rare).join(' '), queryMoto);
+      if (found.length > 0) { missing = rare; moto = queryMoto; }
     }
   }
 
-  if (hits.length === 0) {
-    const what = queryMoto ? `${base} (moto ${queryMoto.brand} ${queryMoto.model})` : base;
+  if (found.length === 0) {
+    const what = queryMoto
+      ? `${base} (moto ${queryMoto.brand} ${queryMoto.model}${queryMoto.year ? ` de ${queryMoto.year}` : ''})`
+      : base;
     return {
       hits: [],
       text: `NO SE ENCONTRARON PRODUCTOS PARA «${what}». Dile al cliente que ahora mismo no lo tenemos en el catálogo, ` +
-        `no ofrezcas piezas de otra moto y pídele más detalles o que escriba a info@escapesymas.com.`,
+        `no ofrezcas piezas de otra moto ni de otro año y pídele más detalles o que escriba a info@escapesymas.com.`,
     };
   }
 
-  const shown = diversifyByBrand(hits, 2).slice(0, 6);
+  // Dos por marca para variar, respetando el orden (compatibles verificados primero).
+  const perBrand = new Map<string, number>();
+  const shown = found.filter(({ hit }) => {
+    const k = (hit.brand || '').toUpperCase().trim();
+    const n = perBrand.get(k) || 0;
+    if (n >= 2) return false;
+    perBrand.set(k, n + 1);
+    return true;
+  }).slice(0, 6);
+
   const notes: string[] = [];
   if (missing) notes.push(`NO HAY NADA QUE CUMPLA «${missing}» EN ESTA BÚSQUEDA. Díselo al cliente y ofrécele estas alternativas.`);
-  if (moto && moto === garageMoto) notes.push(`Resultados para la moto de su garaje: ${moto.brand} ${moto.model}.`);
-  // La búsqueda exige el modelo (nombre o compatibilidad): se marcan como
-  // compatibles para que el asistente no dude de ellos.
-  const text = [...notes, ...shown.map((h) => formatHitText(h, moto))].join('\n');
-  return { hits: shown, text };
+  if (moto && moto === garageMoto) {
+    notes.push(`Resultados para la moto de su garaje: ${moto.brand} ${moto.model}${moto.year ? ` (${moto.year})` : ''}.`);
+  }
+  if (moto && !moto.year) {
+    notes.push('NO SABEMOS EL AÑO DE LA MOTO: indica los años compatibles de cada producto y pregúntale el año para confirmar.');
+  }
+  if (shown.some((x) => !x.tag) && moto) {
+    notes.push('Los productos sin etiqueta de compatibilidad no tienen datos de compatibilidad: dilo y recomienda comprobar la medida o la referencia original.');
+  }
+  const text = [...notes, ...shown.map(({ hit, tag }) => formatHitText(hit, tag))].join('\n');
+  return { hits: shown.map((x) => x.hit), text };
 }
 
 export interface GarageEntry {
