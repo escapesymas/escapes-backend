@@ -10,9 +10,9 @@ import { resolveTax, toDestinationCents, taxInTotal } from './tax.js';
 export const ORDER_TIERS = [
   { min: 500, discountPercent: 15, freeShipping: true },
   { min: 300, discountPercent: 10, freeShipping: true },
-  { min: 150, discountPercent: 5, freeShipping: true },
+  { min: 150, discountPercent: 5, freeShipping: false }, // el envío gratis empieza en 200 € (shipping_methods)
 ];
-const DEFAULT_SHIPPING_CENTS = 1500;
+const DEFAULT_SHIPPING_CENTS = 1999;
 
 export interface CartLine { id: number; quantity: number }
 export interface QuoteInput { cart: CartLine[]; country?: string; postcode?: string; promoCode?: string | null }
@@ -34,7 +34,8 @@ export interface Quote {
   nextTier: { min: number; discountPercent: number; freeShipping: boolean; missingCents: number } | null;
 }
 
-async function shippingFor(country: string, postcode: string, subtotalEur: number): Promise<number> {
+/** Envío del destino según shipping_methods (cost y free_shipping_threshold de la zona). */
+export async function shippingFor(country: string, postcode: string, subtotalEur: number): Promise<number> {
   const prefix2 = postcode.substring(0, 2);
   const [zones, methods] = await Promise.all([
     pool.query('SELECT id, regions FROM shipping_zones'),

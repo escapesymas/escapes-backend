@@ -39,7 +39,7 @@ import { formatOrderNumber } from './lib/email-templates.js';
 import { REFUND_REASONS, REFUNDABLE_STATUSES, REFUND_REASON_MIN, REFUND_REASON_MAX, refundEstimate, refundRequestsByOrder, refundRequestView, type RefundLine } from './lib/refunds.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
-import { quoteOrder } from './lib/order-pricing.js';
+import { quoteOrder, shippingFor } from './lib/order-pricing.js';
 import { repriceProducts, pricingAuto, refreshDto2, applyPromotions, suggestBrandRules, saveBrandRules } from './lib/pricing.js';
 import { isIP } from 'node:net';
 import { catalogRouter } from './routes/catalog.js';
@@ -5447,52 +5447,13 @@ app.get('/api/seo/autolinks', async (req, res) => {
 // ================================================================
 app.post('/api/shipping-estimate', async (req: any, res: any) => {
   try {
-    const { country, zipCode, subtotalEur } = req.body;
-    let shippingCents = 1500; // Fallback
-
-    const reqCountry = country || 'ES';
-    const reqZip = zipCode || '';
-    const prefix2 = reqZip.substring(0, 2);
-
-    const zonesRes = await db.execute(sql`SELECT * FROM shipping_zones`);
-    const methodsRes = await db.execute(sql`SELECT * FROM shipping_methods WHERE active = 1`);
-
-    let matchedZoneId = null;
-    let exactMatch = false;
-
-    for (const z of zonesRes.rows) {
-      const regions = z.regions as string[];
-      if (regions && regions.includes(`${reqCountry}-${prefix2}`)) {
-        matchedZoneId = z.id;
-        exactMatch = true;
-        break;
-      }
-    }
-
-    if (!exactMatch) {
-      for (const z of zonesRes.rows) {
-        const regions = z.regions as string[];
-        if (regions && regions.includes(reqCountry)) {
-          matchedZoneId = z.id;
-          break;
-        }
-      }
-    }
-
-    if (matchedZoneId) {
-      const zoneMethods = methodsRes.rows.filter((m: any) => m.zone_id === matchedZoneId);
-      if (zoneMethods.length > 0) {
-        const method = zoneMethods[0] as any;
-        shippingCents = method.cost;
-        if (method.free_shipping_threshold && subtotalEur >= method.free_shipping_threshold) {
-          shippingCents = 0;
-        }
-      }
-    }
-
+    const { country, zipCode, subtotalEur } = req.body || {};
+    // Mismo cálculo que el presupuesto y el pedido (lib/order-pricing.ts).
+    const shippingCents = await shippingFor(String(country || 'ES').toUpperCase(), String(zipCode || ''), Number(subtotalEur) || 0);
     return res.json({ shippingCents, shippingCost: shippingCents / 100 });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    console.error('[SHIPPING ESTIMATE ERROR]:', err.message);
+    return res.status(500).json({ error: 'No se pudo calcular el envío' });
   }
 });
 

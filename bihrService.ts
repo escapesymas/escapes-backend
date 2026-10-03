@@ -356,7 +356,8 @@ export async function syncBihrCatalog(catalogType: 'HardPart' | 'RiderGear' | 'P
         });
 
         let attempts = 0;
-        const maxAttempts = 20;
+        // Los catálogos completos de Bihr (sobre todo Prices) pueden tardar más de 10 min.
+        const maxAttempts = 80;
 
         while (attempts < maxAttempts) {
           await new Promise(r => setTimeout(r, 30000));
