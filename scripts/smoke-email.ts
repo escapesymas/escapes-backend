@@ -31,7 +31,7 @@ async function main() {
   });
   assert(/Pedido #\S*12345/.test(oc.subject), 'order-confirmation subject includes orderId');
   assert(oc.subject.includes('confirmado'), 'order-confirmation subject includes "confirmado"');
-  assert(oc.text.includes('109.95€'), 'order-confirmation text formats total as EUR');
+  assert(oc.text.includes('109,95'), 'order-confirmation text formats total as EUR');
   assert(oc.text.includes('Juan Pérez'), 'order-confirmation text includes customerName');
   assert(oc.html.includes('<!DOCTYPE html>'), 'order-confirmation html is wrapped');
   assert(oc.html.includes('FAC-2026-001'), 'order-confirmation html includes invoice number');

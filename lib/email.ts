@@ -32,9 +32,14 @@ export interface EmailPayload {
   attachments?: Array<{
     filename: string;
     path?: string;
-    content?: Buffer;
+    content?: Buffer | string;
+    encoding?: string;
     contentType?: string;
   }>;
+  /** Dirección a la que se responde (p. ej. el cliente en avisos internos). */
+  replyTo?: string;
+  /** Nombre visible del remitente; la dirección siempre es la del dominio. */
+  fromName?: string;
   /** If set, rows are inserted into email_send_queue to persist across
    *  restarts and retry on failure. */
   eventId?: string;
@@ -116,8 +121,11 @@ export async function sendEmail(payload: EmailPayload): Promise<SendResult> {
 
   const transporter = getTransporter();
   const mailOptions = {
-    from: process.env.SMTP_FROM || '"Escapes y Más" <web@escapesymas.com>',
+    from: payload.fromName
+      ? `"${payload.fromName.replace(/"/g, '')}" <${process.env.SMTP_USER || 'web@escapesymas.com'}>`
+      : (process.env.SMTP_FROM || '"Escapes y Más" <web@escapesymas.com>'),
     to: payload.to,
+    replyTo: payload.replyTo,
     subject: payload.subject,
     text: payload.text,
     html: payload.html,
@@ -151,7 +159,7 @@ export async function sendTemplatedEmail(
   template: TemplateName,
   to: string,
   data: any,
-  options: { attachments?: EmailPayload['attachments']; eventId?: string } = {},
+  options: { attachments?: EmailPayload['attachments']; eventId?: string; replyTo?: string; fromName?: string } = {},
 ): Promise<SendResult> {
   const rendered = renderEmail(template, data);
   const payload: EmailPayload = {
@@ -160,6 +168,8 @@ export async function sendTemplatedEmail(
     text: rendered.text,
     html: rendered.html,
     attachments: options.attachments,
+    replyTo: options.replyTo,
+    fromName: options.fromName,
     template,
     eventId: options.eventId,
   };

@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import { taxInTotal } from './lib/tax.js';
 import express from 'express';
-import nodemailer from 'nodemailer';
 import fs from 'fs';
 import os from 'os';
 import { execSync, exec, spawn } from 'child_process';
@@ -34,7 +33,8 @@ import { syncBihrStock, startBihrStockCron, lastBihrStockSync } from './lib/bihr
 import { meiliSearchProducts, reindexMeilisearch, lastReindexSummary, isMeilisearchEnabled, meilisearchBanner } from './lib/search.js';
 import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats } from './lib/stripe-webhook.js';
 import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-webhook-service.js';
-import { processEmailRetryQueue, recordOpen, emailStats } from './lib/email.js';
+import { processEmailRetryQueue, recordOpen, emailStats, sendEmail, sendTemplatedEmail } from './lib/email.js';
+import { orderEmailItems } from './lib/order-emails.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { quoteOrder } from './lib/order-pricing.js';
@@ -114,34 +114,24 @@ function getStripeClient(req: any): any {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-async function sendMail(to: string, subject: string, text: string, html?: string) {
-  try {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || "smtp.buzondecorreo.com",
-      port: parseInt(process.env.SMTP_PORT || "465"),
-      secure: true,
-      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
-      auth: {
-        user: process.env.SMTP_USER || "web@escapesymas.com",
-        pass: process.env.SMTP_PASSWORD
-      },
-      tls: {
-        rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true'
-      }
-    });
-    
-    await transporter.sendMail({
-      from: '"Escapes y Más" <web@escapesymas.com>',
-      to,
-      subject,
-      text,
-      html
-    });
-    console.log(`[EMAIL] Sent to ${to}: ${subject}`);
-  } catch (err) {
-    console.error(`[EMAIL ERROR] Failed to send email to ${to}`, err);
-  }
+const PUBLIC_SITE_URL = (process.env.SITE_URL || process.env.PUBLIC_BASE_URL || 'https://escapesymas.com').replace(/\/$/, '');
+
+/** Firma del enlace de pago de un pedido manual (evita recorrer ids ajenos). */
+function payToken(orderId: number): string {
+  return crypto.createHmac('sha256', process.env.JWT_SECRET || 'escapes').update(`pay:${orderId}`).digest('hex').slice(0, 32);
 }
+
+/** Enlace permanente de pago de un pedido: crea la sesión de Stripe al abrirlo. */
+function paymentUrlFor(orderId: number): string {
+  return `${PUBLIC_SITE_URL}/api/pay/${orderId}?t=${payToken(orderId)}`;
+}
+
+async function sendMail(to: string, subject: string, text: string, html?: string) {
+  // Usa el transporte compartido de lib/email.ts (pool de conexiones y reintentos).
+  const r = await sendEmail({ to, subject, text, html });
+  if (r.status !== 'sent') console.error(`[EMAIL ERROR] Failed to send email to ${to}: ${r.lastError || r.status}`);
+}
+
 
 // ================================================================
 // CONFIGURACIÓN
@@ -3327,7 +3317,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         
         if (isCustomerNote) {
           try {
-            const orderRes = await pool.query('SELECT user_id, shipping_data FROM orders WHERE id = $1', [orderId]);
+            const orderRes = await pool.query('SELECT user_id, shipping_data, created_at FROM orders WHERE id = $1', [orderId]);
             let toEmail = '';
             if (orderRes.rows.length > 0) {
               const order = orderRes.rows[0];
@@ -3337,27 +3327,12 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
               }
             }
             if (toEmail) {
-              const htmlContent = `
-                <div style="font-family: 'Inter', system-ui, -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background-color: #f8fafc; border-radius: 6px; color: #0f172a; border: 1px solid #e2e8f0;">
-                  <div style="text-align: center; margin-bottom: 30px;">
-                    <img src="https://www.escapesymas.com/logo-cabecera-negro.svg" alt="Escapes y Más" style="max-width: 250px;">
-                  </div>
-                  <h2 style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: #0f172a; text-align: center; font-size: 24px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;">¡HOLA!</h2>
-                  <div style="background-color: #ffffff; padding: 25px; border-radius: 6px; border-left: 4px solid #eab308; margin: 20px 0; border-top: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0;">
-                    <p style="color: #475569; font-size: 16px; line-height: 1.6; margin-top: 0;">
-                      Hemos añadido una actualización a tu pedido <strong>#${orderId}</strong>:
-                    </p>
-                    <div style="background-color: #f1f5f9; padding: 15px; border-radius: 4px; margin-top: 15px; font-style: italic; color: #334155;">
-                      "${note}"
-                    </div>
-                  </div>
-                  <p style="color: #64748b; font-size: 14px; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 20px; margin-bottom: 0;">
-                    ¿Tienes dudas? Responde a este correo o escríbenos a <a href="mailto:info@escapesymas.com" style="color: #0f172a; font-weight: 600;">info@escapesymas.com</a>.<br><br>
-                    <strong>Escapes y Más</strong>
-                  </p>
-                </div>
-              `;
-              await sendMail(toEmail, `Actualización de tu pedido #${orderId}`, `Hola,\n\nHemos añadido una actualización a tu pedido #${orderId}:\n\n"${note}"\n\nSaludos,\nEl equipo de Escapes y Más.`, htmlContent);
+              const order = orderRes.rows[0];
+              let customerName = '';
+              try { customerName = JSON.parse(order.shipping_data || '{}').firstName || ''; } catch {}
+              await sendTemplatedEmail('order-note', toEmail, {
+                orderId, orderDate: order.created_at, customerName, note: String(note),
+              });
             }
           } catch(e) {
             console.error('Error sending note email:', e);
@@ -3441,86 +3416,23 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
              `);
           }
 
-          let paymentLinkUrl = null;
+          // El cobro se crea al abrir el enlace (/api/pay), con los importes
+          // guardados en el pedido: los precios del admin ya vienen en céntimos.
+          let paymentLinkUrl: string | null = null;
           if (generatePaymentLink) {
-             const client = getStripeClient(req);
-             
-             const lineItems = items.map((it: any) => ({
-               price_data: {
-                 currency: 'eur',
-                 product_data: { name: it.name },
-                 unit_amount: Math.round((parseFloat(it.price) || 0) * 100)
-               },
-               quantity: it.quantity
-             }));
-
-             if (parseFloat(shippingCost) > 0) {
-               lineItems.push({
-                 price_data: {
-                   currency: 'eur',
-                   product_data: { name: 'Gastos de envío' },
-                   unit_amount: Math.round(parseFloat(shippingCost) * 100)
-                 },
-                 quantity: 1
-               });
-             }
-
-             const storeUrl = process.env.STORE_URL || 'https://escapesymas.com'; // Default to production domain
-             const returnUrl = `${storeUrl}/checkout/success?session_id={CHECKOUT_SESSION_ID}`;
-             const paymentLinkUrl = `${storeUrl}/pagar/${orderId}`;
-
-             const sessionParams = {
-               payment_method_types: ['card', 'klarna', 'bizum'],
-               line_items: lineItems,
-               mode: 'payment',
-               ui_mode: 'embedded_page',
-               return_url: returnUrl,
-               client_reference_id: `manual_${orderId}`,
-               metadata: { orderId: orderId.toString() }
-             } as any;
-             if (customerData.email) sessionParams.customer_email = customerData.email;
-             
-             const stripeSession = await client.checkout.sessions.create(sessionParams);
-             
-             await db.execute(sql`UPDATE orders SET payment_id = ${stripeSession.id} WHERE id = ${orderId}`);
-
-             if (customerData.email) {
-                 const nameText = customerData.name ? ` ${customerData.name}` : '';
-                 const emailHtml = `
-                    <div style="font-family: 'Inter', system-ui, -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background-color: #f8fafc; border-radius: 6px; color: #0f172a; border: 1px solid #e2e8f0;">
-                      <div style="text-align: center; margin-bottom: 30px;">
-                        <img src="https://www.escapesymas.com/logo-cabecera-negro.svg" alt="Escapes y Más" style="max-width: 250px;">
-                      </div>
-                      <h2 style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: #0f172a; text-align: center; font-size: 24px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;">¡Hola${nameText}!</h2>
-                      <div style="background-color: #ffffff; padding: 25px; border-radius: 6px; border-left: 4px solid #eab308; margin: 20px 0; border-top: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0;">
-                        <p style="color: #475569; font-size: 16px; line-height: 1.6; margin-top: 0;">
-                          Hemos preparado tu pedido <strong>#${orderId}</strong>.
-                        </p>
-                        <p style="color: #475569; font-size: 16px; line-height: 1.6; margin-bottom: 0;">
-                          Para finalizar la compra y que podamos procesar tu envío de inmediato, por favor accede a nuestra plataforma segura para completar el pago.
-                        </p>
-                      </div>
-                      <div style="text-align: center; margin: 40px 0;">
-                        <a href="${paymentLinkUrl}" style="background-color: #eab308; color: #000000; padding: 16px 32px; text-decoration: none; font-size: 16px; border-radius: 6px; font-weight: 700; display: inline-block; text-transform: uppercase; letter-spacing: 0.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">Finalizar Pago Ahora</a>
-                      </div>
-                      <p style="color: #64748b; font-size: 14px; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 20px; margin-bottom: 0;">
-                        ¿Tienes dudas? Responde a este correo o escríbenos a <a href="mailto:info@escapesymas.com" style="color: #0f172a; font-weight: 600;">info@escapesymas.com</a>.<br><br>
-                        <strong>Escapes y Más</strong>
-                      </p>
-                    </div>
-                 `;
-                 
-                 // Run asynchronously so frontend doesn't hang if SMTP is slow
-                 sendMail(
-                   customerData.email, 
-                   `Finaliza tu pedido #${orderId} en Escapes y Más`, 
-                   `Hola ${customerData.name || ''},\nHemos preparado tu pedido manualmente. Por favor, págala en este enlace: ${paymentLinkUrl}`,
-                   emailHtml
-                 ).catch(e => console.error('[EMAIL BACKGROUND ERROR]', e));
-             }
+            paymentLinkUrl = paymentUrlFor(Number(orderId));
+            if (customerData.email) {
+              const created = await pool.query('SELECT created_at FROM orders WHERE id = $1', [orderId]);
+              const emailItems = await orderEmailItems(Number(orderId));
+              sendTemplatedEmail('payment-link', customerData.email, {
+                orderId, orderDate: created.rows[0]?.created_at,
+                customerName: customerData.firstName || customerData.name || '',
+                url: paymentLinkUrl, total, items: emailItems,
+              }).catch((e) => console.error('[EMAIL BACKGROUND ERROR]', e));
+            }
           }
 
-          return res.json({ success: true, orderId });
+          return res.json({ success: true, orderId, paymentLinkUrl });
 
         } catch(e: any) {
           console.error('[MANUAL ORDER ERROR]', e);
@@ -4296,83 +4208,25 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           `);
           const sessionToken = cartDb.rows[0] ? (cartDb.rows[0] as any).session_token : '';
 
-          const transporter = nodemailer.createTransport({
-            host: "smtp.buzondecorreo.com",
-            port: 465,
-            secure: true,
-            name: process.env.SMTP_HELO_NAME || "escapesymas.com",
-            auth: {
-              user: process.env.SMTP_USER || "web@escapesymas.com",
-              pass: process.env.SMTP_PASSWORD
-            },
-            tls: {
-              rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true'
-            }
-          });
-
-          await transporter.verify();
-
-          const clientName = firstName || 'Motero';
           const itemsList = Array.isArray(items) ? items : [];
-
-          const nameText = clientName ? ` ${clientName}` : '';
-          let itemsHtml = '';
+          // Los precios del carrito de sesión vienen en euros.
           let total = 0;
-          for (const item of itemsList) {
-            const price = parseFloat(item.price || 0);
-            const qty = parseInt(item.quantity || 1);
-            const subtotal = price * qty;
-            total += subtotal;
-            itemsHtml += `
-              <tr>
-                <td style="padding: 12px 10px; border-bottom: 1px solid #f1f5f9;">
-                  <a href="https://escapesymas.com/producto/${item.id}" style="color: #0f172a; text-decoration: none; font-weight: 700; font-size: 14px; border-bottom: 1.5px solid #eab308;" target="_blank">${item.title || item.name || 'Producto'}</a><br/>
-                  <span style="color: #64748b; font-size: 12px;">Cantidad: ${qty} x ${price.toFixed(2)}€</span>
-                </td>
-                <td style="padding: 12px 10px; border-bottom: 1px solid #f1f5f9; text-align: right; font-weight: 700; color: #eab308; font-size: 14px;">
-                  ${subtotal.toFixed(2)}€
-                </td>
-              </tr>
-            `;
-          }
-
-          const mailOptions = {
-            from: '"Escapes y Más" <web@escapesymas.com>',
-            to: email,
-            subject: `🏍️ ¡Te guardamos tu carrito en Escapes y Más!`,
-            html: `
-              <div style="font-family: 'Inter', system-ui, -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background-color: #f8fafc; border-radius: 6px; color: #0f172a; border: 1px solid #e2e8f0;">
-                <div style="text-align: center; margin-bottom: 30px;">
-                  <img src="https://www.escapesymas.com/logo-cabecera-negro.svg" alt="Escapes y Más" style="max-width: 250px;">
-                </div>
-                <h2 style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: #0f172a; text-align: center; font-size: 24px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;">¡HOLA${nameText}!</h2>
-                <div style="background-color: #ffffff; padding: 25px; border-radius: 6px; border-left: 4px solid #eab308; margin: 20px 0; border-top: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0;">
-                  <p style="color: #475569; font-size: 16px; line-height: 1.6; margin-top: 0;">
-                    Vemos que has dejado algunos artículos espectaculares en tu carrito de compra. ¡No te preocupes! Los hemos guardado de forma segura para ti para que no pierdas tus selecciones.
-                  </p>
-                  
-                  <h3 style="margin-top: 25px; border-bottom: 2px solid #f1f5f9; padding-bottom: 8px; text-transform: uppercase; font-size: 14px; letter-spacing: 0.5px; color: #0f172a; font-weight: 700;">Tu Carrito Seleccionado</h3>
-                  <table style="width: 100%; border-collapse: collapse; font-size: 14px; color: #475569;">
-                    ${itemsHtml}
-                    <tr>
-                      <td style="padding: 15px 10px; font-weight: bold; font-size: 14px; color: #0f172a; border-top: 2px solid #f1f5f9;">TOTAL ESTIMADO</td>
-                      <td style="padding: 15px 10px; text-align: right; font-weight: 700; font-size: 16px; color: #eab308; border-top: 2px solid #f1f5f9;">${total.toFixed(2)}€</td>
-                    </tr>
-                  </table>
-                </div>
-                <div style="text-align: center; margin: 40px 0;">
-                  <a href="https://escapesymas.com/?tab=cart${sessionToken ? `&sessionToken=${sessionToken}` : ''}" style="background-color: #eab308; color: #000000; padding: 16px 32px; text-decoration: none; font-size: 16px; border-radius: 6px; font-weight: 700; display: inline-block; text-transform: uppercase; letter-spacing: 0.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">Completar mi Compra Ahora</a>
-                </div>
-                
-                <p style="color: #64748b; font-size: 14px; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 20px; margin-bottom: 0;">
-                  ¿Tienes dudas? Responde a este correo o escríbenos a <a href="mailto:info@escapesymas.com" style="color: #0f172a; font-weight: 600;">info@escapesymas.com</a>.<br><br>
-                  <strong>Escapes y Más</strong>
-                </p>
-              </div>
-            `
-          };
-
-          await transporter.sendMail(mailOptions);
+          for (const item of itemsList) total += (parseFloat(item.price || 0) || 0) * (parseInt(item.quantity || 1) || 1);
+          const totalCents = Math.round(total * 100);
+          const { subject, html, text } = renderAbandonedCartEmail(
+            {
+              id: parseInt(cartId), user_email: email,
+              cart_snapshot: itemsList.map((it: any) => ({ ...it, slug: it.sku || it.slug || it.id })),
+              cart_total_cents: totalCents, discount_cents: 0, emails_sent: 0,
+              last_activity_at: new Date(), recovery_token: '',
+            },
+            {
+              siteUrl: PUBLIC_SITE_URL, stage: 1, customerName: firstName || '',
+              recoveryUrl: `${PUBLIC_SITE_URL}/?tab=cart${sessionToken ? `&sessionToken=${encodeURIComponent(sessionToken)}` : ''}`,
+            },
+          );
+          const sent = await sendEmail({ to: email, subject, text, html });
+          if (sent.status !== 'sent') throw new Error(sent.lastError || 'No se pudo enviar el correo');
 
           // Disparar Notificación Push para el Admin sobre carrito abandonado
           try {
@@ -5850,7 +5704,7 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
 // ================================================================
 // ABANDONED CART EMAIL CRON
 // ================================================================
-import { renderAbandonedCartEmail } from './templates/abandoned-cart.js';
+import { renderAbandonedCartEmail, ABANDONED_COUPON_HOURS } from './templates/abandoned-cart.js';
 
 async function processAbandonedCartEmails() {
   try {
@@ -5883,6 +5737,18 @@ async function processAbandonedCartEmails() {
         const cartTotalCents = Math.round(parseFloat(row.cart_total_cents)) || 0;
         const discountCents = Math.floor(cartTotalCents * discountPct);
         try {
+          // Recordatorios 2 y 3: cupón real de un solo uso (antes el correo
+          // anunciaba un descuento que el checkout no aplicaba).
+          let couponCode: string | null = null;
+          if (w.stage > 1 && discountPct > 0) {
+            const pct = Math.round(discountPct * 100);
+            const hours = ABANDONED_COUPON_HOURS[w.stage as 2 | 3];
+            couponCode = `VUELVE${pct}-${crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6)}`;
+            await pool.query(
+              `INSERT INTO coupons (code, type, value, active, expires_at, max_uses, times_used)
+               VALUES ($1, 'percent', $2, 1, NOW() + ($3 || ' hours')::interval, 1, 0)`,
+              [couponCode, pct, String(hours)]);
+          }
           const { subject, html, text } = renderAbandonedCartEmail(
             {
               id: row.id,
@@ -5895,8 +5761,10 @@ async function processAbandonedCartEmails() {
               recovery_token: row.recovery_token,
             },
             {
-              siteUrl: process.env.SITE_URL || 'https://escapesymas.com',
+              siteUrl: PUBLIC_SITE_URL,
               stage: w.stage,
+              couponCode,
+              discountPct: Math.round(discountPct * 100),
             }
           );
           await sendMail(row.user_email, subject, text, html);
@@ -5904,7 +5772,8 @@ async function processAbandonedCartEmails() {
             UPDATE cart_abandoned_emails
             SET emails_sent = ${w.stage},
                 last_emailed_at = NOW(),
-                discount_cents = ${discountCents}
+                discount_cents = ${discountCents},
+                coupon_code = COALESCE(${couponCode}, coupon_code)
             WHERE id = ${row.id}
           `);
           console.log(`[ABANDONED CART] Stage ${w.stage} email sent to ${row.user_email} (cart id ${row.id})`);
@@ -6062,7 +5931,7 @@ app.get('/api/cart/recover/:token', async (req: any, res: any) => {
     }
 
     const result = await db.execute(sql`
-      SELECT id, user_email, cart_snapshot, cart_total_cents, discount_cents, recovered_at
+      SELECT id, user_email, cart_snapshot, cart_total_cents, discount_cents, recovered_at, coupon_code
       FROM cart_abandoned_emails
       WHERE recovery_token = ${token}::uuid
     `);
@@ -6090,6 +5959,7 @@ app.get('/api/cart/recover/:token', async (req: any, res: any) => {
       cart: row.cart_snapshot,
       total_cents: row.cart_total_cents,
       discount_cents: row.discount_cents,
+      coupon_code: row.coupon_code || null,
       already_recovered: wasAlreadyRecovered,
       recovery_token: token,
     });
@@ -6246,6 +6116,78 @@ app.post('/api/create-payment-intent', async (req: any, res: any) => {
   }
 });
 
+/** Página mínima para los avisos del enlace de pago (sin JS, tema claro). */
+function payNoticePage(title: string, message: string): string {
+  const esc = (x: string) => x.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string));
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${esc(title)} · Escapes y Más</title></head>
+<body style="margin:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0f172a">
+<div style="max-width:480px;margin:64px auto;padding:32px;background:#fff;border:1px solid #e2e8f0;border-radius:12px;text-align:center">
+<img src="${PUBLIC_SITE_URL}/email/logo.png" alt="Escapes y Más" width="200" style="max-width:100%">
+<h1 style="font-family:'Courier New',monospace;text-transform:uppercase;font-size:20px;margin:28px 0 12px">${esc(title)}</h1>
+<p style="color:#475569;line-height:1.6">${esc(message)}</p>
+<a href="${PUBLIC_SITE_URL}" style="display:inline-block;margin-top:16px;background:#eab308;color:#0f172a;border:solid #eab308;border-width:12px 24px;border-radius:8px;font-family:'Courier New',monospace;font-weight:700;text-transform:uppercase;text-decoration:none">Ir a la tienda</a>
+</div></body></html>`;
+}
+
+// Enlace de pago de los pedidos creados desde el admin. Crea en cada visita una
+// sesión de Stripe con los importes guardados en el pedido, así el enlace no
+// caduca y nadie puede cambiar el precio.
+app.get('/api/pay/:orderId', async (req: any, res: any) => {
+  const orderId = parseInt(String(req.params.orderId), 10);
+  const t = String(req.query.t || '');
+  const expected = Number.isFinite(orderId) && orderId > 0 ? payToken(orderId) : '';
+  if (!expected || t.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(t), Buffer.from(expected))) {
+    return res.status(404).type('html').send(payNoticePage('Enlace no válido', 'Este enlace de pago no es válido. Revisa que lo has copiado completo o escríbenos a info@escapesymas.com.'));
+  }
+  try {
+    const o = await pool.query('SELECT id, total, shipping_cost, status, shipping_data FROM orders WHERE id = $1', [orderId]);
+    const order = o.rows[0];
+    if (!order) return res.status(404).type('html').send(payNoticePage('Pedido no encontrado', 'No encontramos este pedido. Escríbenos a info@escapesymas.com y lo revisamos.'));
+    if (['paid', 'processing', 'shipped', 'delivered', 'completed'].includes(order.status)) {
+      return res.type('html').send(payNoticePage('Pedido ya pagado', 'Este pedido ya está pagado. Te avisaremos por correo cuando salga del almacén.'));
+    }
+    if (!['pending_payment', 'payment_failed', 'pending'].includes(order.status)) {
+      return res.status(409).type('html').send(payNoticePage('Pago no disponible', 'Este pedido ya no admite pagos. Escríbenos a info@escapesymas.com si necesitas ayuda.'));
+    }
+
+    const lines = (await pool.query(
+      `SELECT oi.quantity, oi.price, COALESCE(p.name, 'Producto') AS name
+         FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = $1 ORDER BY oi.id`, [orderId])).rows;
+    const lineItems: any[] = lines.map((l: any) => ({
+      price_data: { currency: 'eur', product_data: { name: String(l.name).slice(0, 250) }, unit_amount: Math.round(Number(l.price) || 0) },
+      quantity: Number(l.quantity) || 1,
+    }));
+    const shipping = Math.round(Number(order.shipping_cost) || 0);
+    if (shipping > 0) lineItems.push({ price_data: { currency: 'eur', product_data: { name: 'Gastos de envío' }, unit_amount: shipping }, quantity: 1 });
+    const sum = lineItems.reduce((acc, li) => acc + li.price_data.unit_amount * li.quantity, 0);
+    if (!lineItems.length || sum <= 0 || sum !== Math.round(Number(order.total) || 0)) {
+      console.error(`[PAY LINK] Pedido #${orderId}: líneas ${sum} != total ${order.total}`);
+      return res.status(409).type('html').send(payNoticePage('No podemos cobrar este pedido', 'Hay una diferencia en el importe del pedido. Escríbenos a info@escapesymas.com y te enviamos un enlace nuevo.'));
+    }
+
+    let email: string | undefined;
+    try { email = JSON.parse(order.shipping_data || '{}').email || undefined; } catch {}
+    const session = await stripeLive.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card', 'klarna', 'bizum'],
+      line_items: lineItems,
+      success_url: `${PUBLIC_SITE_URL}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${PUBLIC_SITE_URL}/`,
+      client_reference_id: String(orderId),
+      metadata: { orderId: String(orderId) },
+      payment_intent_data: { metadata: { orderId: String(orderId) } },
+      customer_email: email,
+      locale: 'es',
+    } as any);
+    await pool.query('UPDATE orders SET payment_id = $1 WHERE id = $2', [session.id, orderId]);
+    return res.redirect(303, session.url);
+  } catch (e: any) {
+    console.error('[PAY LINK ERROR]', e.message);
+    return res.status(502).type('html').send(payNoticePage('Pasarela no disponible', 'No hemos podido abrir la pasarela de pago. Inténtalo de nuevo en unos minutos.'));
+  }
+});
+
 app.post('/api/contact', formsLimiter, async (req: any, res: any) => {
   const { name, email, subject, message } = req.body;
 
@@ -6256,49 +6198,24 @@ app.post('/api/contact', formsLimiter, async (req: any, res: any) => {
     return res.status(400).json({ error: "Faltan campos requeridos" });
   }
 
+  const cleanEmail = String(email).trim();
+  if (!/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(cleanEmail)) {
+    return res.status(400).json({ error: "Email no válido" });
+  }
+
   try {
-    console.log("[CONTACT] Creating transporter...");
-    const transporter = nodemailer.createTransport({
-      host: "smtp.buzondecorreo.com",
-      port: 465,
-      secure: true,
-      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
-      auth: {
-        user: process.env.SMTP_USER || "web@escapesymas.com",
-        pass: process.env.SMTP_PASSWORD
-      },
-      tls: {
-        rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true'
-      }
-    });
-
-    console.log("[CONTACT] Verifying transporter connection...");
-    await transporter.verify();
-    console.log("[CONTACT] Transporter verified successfully");
-
-    const mailOptions = {
-      from: '"Escapes y Más Web" <web@escapesymas.com>',
-      to: "info@escapesymas.com",
-      replyTo: email,
-      subject: `Consulta de ${subject || 'General'}`,
-      html: `
-        <h3>Nueva Consulta desde la Web</h3>
-        <p><strong>De:</strong> ${name} (${email})</p>
-        <p><strong>Asunto:</strong> ${subject || 'General'}</p>
-        <div style="background-color: #f5f5f5; padding: 15px; border-left: 5px solid #ff4500;">
-          <p>${message.replace(/\n/g, '<br>').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>
-        </div>
-      `
-    };
-
-    console.log("[CONTACT] Sending email...");
-    const info = await transporter.sendMail(mailOptions);
-    console.log("[CONTACT] ✅ Email sent successfully:", info.messageId);
-    return res.status(200).json({ success: true, messageId: info.messageId });
-
+    const sent = await sendTemplatedEmail('internal', 'info@escapesymas.com', {
+      subject: `Consulta de ${String(subject || 'General').slice(0, 120)}`,
+      title: 'Nueva consulta desde la web',
+      facts: [['Nombre', String(name)], ['Email', cleanEmail], ['Asunto', String(subject || 'General')]],
+      message: String(message),
+    }, { replyTo: cleanEmail, fromName: 'Escapes y Más Web' });
+    if (sent.status !== 'sent') throw new Error(sent.lastError || 'No se pudo enviar');
+    console.log("[CONTACT] ✅ Email sent successfully:", sent.messageId);
+    return res.status(200).json({ success: true, messageId: sent.messageId });
   } catch (error: any) {
     console.error("[CONTACT] ❌ Email error:", error.message);
-    return res.status(500).json({ error: "Error al enviar el correo: " + error.message });
+    return res.status(500).json({ error: "No hemos podido enviar tu mensaje. Inténtalo de nuevo o escríbenos a info@escapesymas.com." });
   }
 });
 
@@ -6312,112 +6229,49 @@ app.post('/api/warranty', formsLimiter, async (req: any, res: any) => {
     return res.status(400).json({ message: 'Faltan datos obligatorios' });
   }
 
+  const cleanEmail = String(email).trim();
+  if (!/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(cleanEmail)) {
+    return res.status(400).json({ message: 'Email no válido' });
+  }
+
   try {
-    console.log("[WARRANTY] Creating transporter...");
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.buzondecorreo.com',
-      port: 465,
-      secure: true,
-      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
-      auth: {
-        user: process.env.SMTP_USER || 'web@escapesymas.com',
-        pass: process.env.SMTP_PASSWORD
-      },
-      tls: {
-        rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true'
-      }
+    const productList = (Array.isArray(products) ? products : []).map((x: any) => ({
+      name: String(x?.name || 'Producto'), issue: String(x?.issue || ''),
+    }));
+    // Fotos en base64 (data URL) que adjunta el formulario.
+    const attachments = (Array.isArray(images) ? images : []).slice(0, 10).map((img: string, index: number) => {
+      const [head, content = ''] = String(img).split(',');
+      const type = (head.match(/:(.*?);/) || [])[1] || 'image/jpeg';
+      const ext = (type.split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '');
+      return { filename: `evidencia_${index + 1}.${ext}`, content: Buffer.from(content, 'base64'), contentType: type };
     });
 
-    const productRows = (products || []).map((p: any) => `
-      <tr>
-        <td style="padding: 8px; border: 1px solid #ddd;">${p.name}</td>
-        <td style="padding: 8px; border: 1px solid #ddd;">${p.issue}</td>
-      </tr>
-    `).join('');
+    const team = await sendTemplatedEmail('internal', 'garantiasydevoluciones@escapesymas.com', {
+      subject: `[GARANTÍA] ${String(invoiceNumber).slice(0, 60)} - ${String(buyerName).slice(0, 80)}`,
+      title: 'Nueva solicitud de garantía',
+      facts: [
+        ['Factura', String(invoiceNumber)],
+        ['Fecha de compra', String(purchaseDate || 'No indicada')],
+        ['Fecha de instalación', String(installationDate || 'No indicada')],
+        ['Titular', String(buyerName)],
+        ['Email', cleanEmail],
+        ['Teléfono', String(phone || 'No indicado')],
+        ['Fotos adjuntas', String(attachments.length)],
+      ],
+      table: productList.length ? { head: ['Producto', 'Incidencia'], rows: productList.map((x) => [x.name, x.issue] as [string, string]) } : undefined,
+    }, { attachments, replyTo: cleanEmail, fromName: 'Portal Garantías' });
+    if (team.status !== 'sent') throw new Error(team.lastError || 'No se pudo enviar');
 
-    const htmlContent = `
-      <h2>Nueva Solicitud de Garantía</h2>
-      <p><strong>Factura:</strong> ${invoiceNumber}</p>
-      <p><strong>Fecha Compra:</strong> ${purchaseDate}</p>
-      <p><strong>Fecha Instalación:</strong> ${installationDate || 'No indicada'}</p>
-      <p><strong>Titular:</strong> ${buyerName}</p>
-      <p><strong>Email:</strong> ${email}</p>
-      <p><strong>Teléfono:</strong> ${phone}</p>
-      
-      <h3>Productos e Incidencias</h3>
-      <table style="width: 100%; border-collapse: collapse;">
-        <thead>
-          <tr style="background: #f0f0f0;">
-            <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Producto</th>
-            <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Incidencia</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${productRows}
-        </tbody>
-      </table>
-    `;
+    // El acuse al cliente no debe tumbar la solicitud si falla.
+    sendTemplatedEmail('warranty-received', cleanEmail, {
+      customerName: String(buyerName), invoiceNumber: String(invoiceNumber), products: productList,
+    }, { replyTo: 'garantiasydevoluciones@escapesymas.com' })
+      .catch((e) => console.error('[WARRANTY] Acuse no enviado:', e.message));
 
-    const attachments = (images || []).map((img: string, index: number) => {
-      const split = img.split(',');
-      const typeMatch = split[0].match(/:(.*?);/);
-      const type = typeMatch ? typeMatch[1] : 'image/jpeg';
-      const itemContent = split[1];
-      const ext = type.split('/')[1] || 'jpg';
-
-      return {
-        filename: `evidencia_${index + 1}.${ext}`,
-        content: itemContent,
-        encoding: 'base64'
-      };
-    });
-
-    try {
-      await transporter.sendMail({
-        from: '"Portal Garantías" <web@escapesymas.com>',
-        to: 'garantiasydevoluciones@escapesymas.com',
-        replyTo: email,
-        subject: `[GARANTÍA] ${invoiceNumber} - ${buyerName}`,
-        html: htmlContent,
-        attachments: attachments
-      });
-
-      await transporter.sendMail({
-        from: '"Escapes y Más" <web@escapesymas.com>',
-        to: email,
-        replyTo: 'garantiasydevoluciones@escapesymas.com',
-        subject: 'Hemos recibido tu solicitud de garantía',
-        html: `
-          <div style="font-family: 'Inter', system-ui, -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background-color: #f8fafc; border-radius: 6px; color: #0f172a; border: 1px solid #e2e8f0;">
-            <div style="text-align: center; margin-bottom: 30px;">
-              <img src="https://www.escapesymas.com/logo-cabecera-negro.svg" alt="Escapes y Más" style="max-width: 250px;">
-            </div>
-            <h2 style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: #0f172a; text-align: center; font-size: 24px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;">¡HOLA ${buyerName}!</h2>
-            <div style="background-color: #ffffff; padding: 25px; border-radius: 6px; border-left: 4px solid #eab308; margin: 20px 0; border-top: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0;">
-              <p style="color: #475569; font-size: 16px; line-height: 1.6; margin-top: 0;">
-                Hemos recibido tu solicitud de garantía asociada a la factura <strong>${invoiceNumber}</strong>.
-              </p>
-              <p style="color: #475569; font-size: 16px; line-height: 1.6; margin-bottom: 0;">
-                Nuestro equipo revisará la información y te contactará en breve. Gracias por confiar en Escapes y Más.
-              </p>
-            </div>
-            <p style="color: #64748b; font-size: 14px; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 20px; margin-bottom: 0;">
-              ¿Tienes dudas? Responde a este correo o escríbenos a <a href="mailto:info@escapesymas.com" style="color: #0f172a; font-weight: 600;">info@escapesymas.com</a>.<br><br>
-              <strong>Escapes y Más</strong>
-            </p>
-          </div>
-        `
-      });
-
-      return res.status(200).json({ success: true, message: 'Correo enviado correctamente' });
-
-    } catch (error: any) {
-      console.error('Error enviando correo:', error);
-      return res.status(500).json({ success: false, message: 'Error al enviar el correo: ' + error.message });
-    }
+    return res.status(200).json({ success: true, message: 'Correo enviado correctamente' });
   } catch (err: any) {
-    console.error('[WARRANTY] Outer error:', err);
-    return res.status(500).json({ success: false, message: 'Error interno del servidor' });
+    console.error('[WARRANTY] Error:', err.message);
+    return res.status(500).json({ success: false, message: 'No hemos podido enviar tu solicitud. Inténtalo de nuevo o escríbenos a garantiasydevoluciones@escapesymas.com.' });
   }
 });
 
@@ -6611,58 +6465,16 @@ app.get('/api/catalog/categories', async (req, res) => {
 
 async function sendShipmentNotificationEmail(orderId: number, email: string, firstName: string, trackingNumber: string, trackingUrl: string) {
   try {
-    const transporter = nodemailer.createTransport({
-      host: "smtp.buzondecorreo.com",
-      port: 465,
-      secure: true,
-      name: process.env.SMTP_HELO_NAME || "escapesymas.com",
-      auth: {
-        user: process.env.SMTP_USER || "web@escapesymas.com",
-        pass: process.env.SMTP_PASSWORD
-      },
-      tls: {
-        rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true'
-      }
+    const created = await pool.query('SELECT created_at FROM orders WHERE id = $1', [orderId]);
+    const result = await sendTemplatedEmail('order-shipped', email, {
+      orderId,
+      orderDate: created.rows[0]?.created_at,
+      customerName: firstName || '',
+      trackingNumber,
+      trackingUrl: trackingUrl || `https://www.google.com/search?q=${encodeURIComponent(`seguimiento ${trackingNumber}`)}`,
     });
-
-    const clientName = firstName || 'Motero';
-    const trackLink = trackingUrl || `https://www.google.com/search?q=tracking+${trackingNumber}`;
-
-    const mailOptions = {
-      from: '"Escapes y Más" <web@escapesymas.com>',
-      to: email,
-      subject: `🏍️ ¡Tu pedido #${orderId} ha sido enviado!`,
-      html: `
-        <div style="font-family: 'Inter', system-ui, -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background-color: #f8fafc; border-radius: 6px; color: #0f172a; border: 1px solid #e2e8f0;">
-          <div style="text-align: center; margin-bottom: 30px;">
-            <img src="https://www.escapesymas.com/logo-cabecera-negro.svg" alt="Escapes y Más" style="max-width: 250px;">
-          </div>
-          <h2 style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: #0f172a; text-align: center; font-size: 24px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;">¡HOLA ${clientName}!</h2>
-          <div style="background-color: #ffffff; padding: 25px; border-radius: 6px; border-left: 4px solid #eab308; margin: 20px 0; border-top: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0;">
-            <p style="color: #475569; font-size: 16px; line-height: 1.6; margin-top: 0;">
-              ¡Buenas noticias! Tu pedido <strong>#${orderId}</strong> ha sido empaquetado y enviado.
-            </p>
-            
-            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 15px; margin: 20px 0; text-align: center;">
-              <p style="margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase; color: #64748b; letter-spacing: 1px; font-weight: 600;">NÚMERO DE SEGUIMIENTO (TRACKING)</p>
-              <div style="font-size: 20px; font-weight: 700; color: #eab308; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: 1px;">${trackingNumber}</div>
-            </div>
-          </div>
-          
-          <div style="text-align: center; margin: 40px 0;">
-            <a href="${trackLink}" target="_blank" style="background-color: #eab308; color: #000000; padding: 16px 32px; text-decoration: none; font-size: 16px; border-radius: 6px; font-weight: 700; display: inline-block; text-transform: uppercase; letter-spacing: 0.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">Seguir Mi Envío</a>
-          </div>
-
-          <p style="color: #64748b; font-size: 14px; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 20px; margin-bottom: 0;">
-            ¿Tienes dudas? Responde a este correo o escríbenos a <a href="mailto:info@escapesymas.com" style="color: #0f172a; font-weight: 600;">info@escapesymas.com</a>.<br><br>
-            <strong>Escapes y Más</strong>
-          </p>
-        </div>
-      `
-    };
-
-    await transporter.sendMail(mailOptions);
-    console.log(`[SHIPMENT EMAIL]: Sent shipment email to ${email} for order #${orderId}`);
+    if (result.status === 'sent') console.log(`[SHIPMENT EMAIL]: Sent shipment email to ${email} for order #${orderId}`);
+    else console.error(`[SHIPMENT EMAIL ERROR] ${email}: ${result.lastError || result.status}`);
   } catch (error) {
     console.error(`[SHIPMENT EMAIL ERROR] Failed to send email to ${email}:`, error);
   }
