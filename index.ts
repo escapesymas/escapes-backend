@@ -5420,12 +5420,18 @@ app.post('/api/cart/quote', async (req: any, res: any) => {
       promo: q.promo,
       nextTier: q.nextTier ? { ...q.nextTier, missing: q.nextTier.missingCents / 100 } : null,
       stockErrors: q.stockErrors,
+      belowMinimum: q.totalCents < MIN_ORDER_CENTS,
+      minimumMessage: q.totalCents < MIN_ORDER_CENTS ? MIN_ORDER_MESSAGE : null,
     });
   } catch (err: any) {
     console.error('[CART QUOTE ERROR]:', err.message);
     res.status(500).json({ error: 'No se pudo calcular el total' });
   }
 });
+
+/** Importe mínimo que acepta Stripe (0,50 €). */
+const MIN_ORDER_CENTS = 50;
+const MIN_ORDER_MESSAGE = 'El importe mínimo para pagar es de 0,50 €. Añade algún producto más a tu pedido.';
 
 app.post('/api/orders/create', async (req: any, res: any) => {
   try {
@@ -5453,20 +5459,27 @@ app.post('/api/orders/create', async (req: any, res: any) => {
 
     // Importes calculados en el servidor (lib/order-pricing.ts, el mismo cálculo
     // que /api/cart/quote muestra en el carrito), con el impuesto del destino.
-    const quote = await quoteOrder({
+    const quoteInput = {
       cart: cart.map((i: any) => ({ id: parseInt(i.id), quantity: parseInt(i.quantity) })),
       country: shippingData.country || 'ES',
       postcode: shippingData.postcode || shippingData.zipCode || '',
       promoCode,
-    }, { redeemCoupon: true });
-    if (quote.missing.length) return res.status(400).json({ error: `Producto con ID ${quote.missing[0]} no existe` });
-    if (quote.stockErrors.length > 0) {
-      console.warn(`[ORDER CREATE] Stock insuficiente:`, quote.stockErrors);
+    };
+    // Primero se valida sin gastar el cupón; solo si el pedido es válido se canjea.
+    const check = await quoteOrder(quoteInput);
+    if (check.missing.length) return res.status(400).json({ error: `Producto con ID ${check.missing[0]} no existe` });
+    if (check.stockErrors.length > 0) {
+      console.warn(`[ORDER CREATE] Stock insuficiente:`, check.stockErrors);
       return res.status(409).json({
         error: 'Stock insuficiente para uno o más productos. Por favor, actualiza tu carrito.',
-        stockErrors: quote.stockErrors,
+        stockErrors: check.stockErrors,
       });
     }
+    // Stripe no admite cobros de menos de 0,50 €.
+    if (check.totalCents < MIN_ORDER_CENTS) {
+      return res.status(400).json({ error: MIN_ORDER_MESSAGE, code: 'below_minimum' });
+    }
+    const quote = await quoteOrder(quoteInput, { redeemCoupon: true });
     const itemsToInsert = quote.items;
     const { subtotalCents, discountCents, shippingCents, totalCents } = quote;
     const subtotalEur = subtotalCents / 100;
