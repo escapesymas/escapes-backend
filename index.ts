@@ -5787,14 +5787,9 @@ app.post('/api/orders/:id/refund-request', requireAuth, formsLimiter, async (req
       message: text,
     }, { replyTo: c.email || undefined, fromName: 'Reembolsos web' }).catch((e) => console.error('[REFUND REQUEST EMAIL]', e.message));
 
-    try {
-      const { sendNotificationToAll } = await import('./pushService.js');
-      await sendNotificationToAll({
-        title: `↩️ Solicitud de reembolso · Pedido #${order.id}`,
-        body: `${(amountCents / 100).toFixed(2)} € · ${reasonLabel}`,
-        url: '/orders', category: 'new_order', data: { orderId: order.id },
-      });
-    } catch { /* aviso opcional */ }
+    import('./pushService.js').then(({ notifyRefundRequest }) => notifyRefundRequest({
+      orderId: order.id, amount: amountCents, reason: reasonLabel, customerName: c.firstName, scope,
+    })).catch(() => {});
 
     return res.json({ success: true, request: refundRequestView(ins.rows[0]) });
   } catch (err: any) {
@@ -5995,6 +5990,47 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 processAbandonedCartEmails().catch(e => console.error('[ABANDONED CART CRON INITIAL ERROR]:', e));
+
+// ================================================================
+// RESUMEN DIARIO AL MÓVIL (21:00 hora peninsular)
+// ================================================================
+// Las fechas sin zona horaria de la base de datos están en UTC.
+const MADRID_DAY_NAIVE = (col: string) => `((${col} AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/Madrid')::date = (NOW() AT TIME ZONE 'Europe/Madrid')::date`;
+const MADRID_DAY_TZ = (col: string) => `(${col} AT TIME ZONE 'Europe/Madrid')::date = (NOW() AT TIME ZONE 'Europe/Madrid')::date`;
+
+async function sendDailySummary(force = false) {
+  const madrid = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const get = (t: string) => madrid.find((x) => x.type === t)?.value || '';
+  const today = `${get('year')}-${get('month')}-${get('day')}`;
+  if (!force && parseInt(get('hour')) < 21) return;
+  // Una sola vez al día, aunque haya varias réplicas o reinicios.
+  const claim = await pool.query(
+    `INSERT INTO catalog_meta (key, value) VALUES ('daily_summary_sent', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value WHERE catalog_meta.value <> EXCLUDED.value
+     RETURNING value`, [today]);
+  if (!force && !claim.rows.length) return;
+
+  const q = async (text: string) => (await pool.query(text)).rows[0] || {};
+  const paid = await q(`SELECT COUNT(*)::int AS n, COALESCE(SUM(total), 0)::bigint AS s FROM orders
+    WHERE status IN ('paid','processing','shipped','delivered','completed','refunded','partially_refunded')
+      AND ${MADRID_DAY_NAIVE('COALESCE(paid_at, created_at)')}`);
+  const refunds = await q(`SELECT COALESCE(SUM(refunded_cents), 0)::bigint AS s FROM refund_requests
+    WHERE status = 'refunded' AND ${MADRID_DAY_TZ('resolved_at')}`);
+  const pending = await q(`SELECT COUNT(*)::int AS n FROM refund_requests WHERE status = 'pending'`);
+  const abandoned = await q(`SELECT COUNT(*)::int AS n FROM cart_abandoned_emails WHERE recovered_at IS NULL AND ${MADRID_DAY_TZ('last_activity_at')}`);
+  const users = await q(`SELECT COUNT(*)::int AS n FROM users WHERE ${MADRID_DAY_NAIVE('created_at')}`);
+
+  const { notifyDailySummary, pruneNotifications } = await import('./pushService.js');
+  await notifyDailySummary({
+    sales: Number(paid.s) || 0, orders: paid.n || 0, refunds: Number(refunds.s) || 0,
+    pendingRefunds: pending.n || 0, abandoned: abandoned.n || 0, newUsers: users.n || 0,
+  });
+  await pruneNotifications().catch(() => {});
+}
+
+setInterval(() => {
+  sendDailySummary().catch((e) => console.error('[DAILY SUMMARY ERROR]:', e.message));
+}, 5 * 60_000);
 
 // ================================================================
 // PERSISTENT CART ENDPOINTS
@@ -6406,6 +6442,11 @@ app.post('/api/contact', formsLimiter, async (req: any, res: any) => {
     return res.status(400).json({ error: "Email no válido" });
   }
 
+  // El aviso va primero: si el correo falla, el mensaje queda en el historial del panel.
+  import('./pushService.js').then(({ notifyContact }) => notifyContact({
+    name: String(name), email: cleanEmail, subject: subject ? String(subject) : undefined, message: String(message),
+  })).catch(() => {});
+
   try {
     const sent = await sendTemplatedEmail('internal', 'info@escapesymas.com', {
       subject: `Consulta de ${String(subject || 'General').slice(0, 120)}`,
@@ -6448,6 +6489,10 @@ app.post('/api/warranty', formsLimiter, async (req: any, res: any) => {
       const ext = (type.split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '');
       return { filename: `evidencia_${index + 1}.${ext}`, content: Buffer.from(content, 'base64'), contentType: type };
     });
+
+    import('./pushService.js').then(({ notifyWarranty }) => notifyWarranty({
+      buyerName: String(buyerName), invoiceNumber: String(invoiceNumber), products: productList.length,
+    })).catch(() => {});
 
     const team = await sendTemplatedEmail('internal', 'garantiasydevoluciones@escapesymas.com', {
       subject: `[GARANTÍA] ${String(invoiceNumber).slice(0, 60)} - ${String(buyerName).slice(0, 80)}`,
@@ -6716,6 +6761,13 @@ async function checkPendingDropshippingOrders() {
           WHERE id = ${order.id}
         `);
 
+        // El cron solo revisa pedidos pendientes en Bihr: cualquier cambio es nuevo.
+        if (dropshippingStatus !== 'pending_bihr') {
+          import('./pushService.js').then(({ notifyDropshippingStatus }) => notifyDropshippingStatus({
+            orderId: order.id, status: dropshippingStatus, trackingNumber: trackingNumber || undefined,
+          })).catch(() => {});
+        }
+
         // Enviar correo si acaba de pasar a enviado
         if (dropshippingStatus === 'shipped' && trackingNumber && trackingNumber !== order.tracking_number) {
           const shippingData = order.shipping_data ? JSON.parse(order.shipping_data as string) : {};
@@ -6911,6 +6963,12 @@ app.post('/api/reviews', async (req, res) => {
       VALUES (${parseInt(product_id)}, ${userId}, ${parseInt(rating)}, ${title || null}, ${content || null}, ${verified_purchase})
       RETURNING *
     `);
+
+    pool.query('SELECT name FROM products WHERE id = $1', [parseInt(product_id)])
+      .then(async (r) => {
+        const { notifyReview } = await import('./pushService.js');
+        await notifyReview({ productName: r.rows[0]?.name || `Producto ${product_id}`, rating: parseInt(rating) || 0, title: title || null });
+      }).catch(() => {});
 
     res.status(201).json(result.rows[0]);
   } catch (err: any) {

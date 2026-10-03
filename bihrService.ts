@@ -11,6 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function updateCatalogSyncState(state: any) {
+  notifySyncResult(state);
   try {
     fs.writeFileSync('/tmp/catalog_sync_state.json', JSON.stringify({
       ...state,
@@ -19,6 +20,20 @@ function updateCatalogSyncState(state: any) {
   } catch (e) {
     console.error('[BIHR SERVICE]: Error writing catalog sync state file:', e);
   }
+}
+
+/** Aviso al panel cuando una sincronización con Bihr termina o falla. */
+function notifySyncResult(state: any) {
+  if (state.status !== 'completed' && state.status !== 'failed') return;
+  const names: Record<string, string> = { HardPart: 'recambios', RiderGear: 'equipación', Prices: 'precios' };
+  const what = names[state.catalogType] || state.catalogType || 'catálogo';
+  const mins = state.startTime && state.endTime ? Math.round((Date.parse(state.endTime) - Date.parse(state.startTime)) / 60000) : null;
+  const n = (x: any) => Number(x || 0).toLocaleString('es-ES');
+  const title = state.status === 'completed' ? `🔄 Bihr: ${what} sincronizado` : `❌ Bihr: falló la sincronización de ${what}`;
+  const body = state.status === 'completed'
+    ? `${state.inserted ? `${n(state.inserted)} nuevos · ` : ''}${n(state.updated)} actualizados${mins !== null ? ` · ${mins} min` : ''}`
+    : String(state.error || 'Error desconocido').slice(0, 200);
+  import('./pushService.js').then(({ notifySystem }) => notifySystem(title, body, { catalogType: state.catalogType })).catch(() => {});
 }
 
 // ================================================================

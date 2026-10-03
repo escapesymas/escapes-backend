@@ -211,6 +211,7 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
       `Marcando como 'payment_amount_mismatch' y NO aceptando el pago.`
     );
     await db.execute(sql`UPDATE orders SET status = 'payment_amount_mismatch', last_payment_error = ${`Charged ${chargedCents} cents vs expected ${expectedCents}`} WHERE id = ${orderId}`);
+    import('../pushService.js').then(({ notifyAmountMismatch }) => notifyAmountMismatch({ orderId: orderId as number, charged: chargedCents, expected: expectedCents })).catch(() => {});
     return;
   }
 
@@ -453,6 +454,11 @@ async function handleChargeRefunded(evt: Stripe.Event): Promise<void> {
 
   const isFullRefund = charge.amount_refunded >= charge.amount;
   const newStatus = isFullRefund ? 'refunded' : 'partially_refunded';
+  // Aviso al panel (cubre también los reembolsos hechos desde el panel de Stripe).
+  const lastRefund = (charge as any).refunds?.data?.[0]?.amount;
+  import('../pushService.js').then(({ notifyRefunded }) => notifyRefunded({
+    orderId: orderId as number, amount: Number(lastRefund ?? charge.amount_refunded) || 0, full: isFullRefund,
+  })).catch(() => {});
 
   const client = await pool.connect();
   try {
