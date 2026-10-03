@@ -25,14 +25,14 @@ import io
 # CONFIGURACION
 # ================================================================
 BIHR_API_BASE = 'https://api.bihr.net'
-BIHR_USERNAME = 'info@escapesymas.com'
-BIHR_MACKEY = '***ELIMINADO***'
+BIHR_USERNAME = os.environ.get('BIHR_USERNAME', 'info@escapesymas.com')
+BIHR_MACKEY = os.environ['BIHR_MACKEY']  # nunca en el código
 
 DB_HOST = 'localhost'
 DB_PORT = '5432'
 DB_NAME = 'escapes_db'
 DB_USER = 'postgres'
-DB_PASSWORD = '***ELIMINADO***'
+DB_PASSWORD = os.environ['DB_PASSWORD']  # nunca en el código
 
 UPLOADS_DIR = '/var/www/vhosts/backendescapes.com/server/uploads/optimized'
 
