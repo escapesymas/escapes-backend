@@ -1,4 +1,5 @@
 import { pool } from '../db.js';
+import { listFamilies, normalizeText, searchTerms } from '../lib/catalog-query.js';
 
 export interface CatalogHit {
   id: number;
@@ -210,7 +211,8 @@ async function searchByKeywords(
       `SELECT id, sku, name, brand, price, sale_price, stock, stock_status,
               images, compatibility, category2, category3
        FROM products
-       WHERE to_tsvector('simple',
+       WHERE status = 'published' AND price > 0
+         AND to_tsvector('simple',
                 coalesce(name,'') || ' ' ||
                 coalesce(brand,'') || ' ' ||
                 coalesce(sku,'') || ' ' ||
@@ -240,6 +242,64 @@ async function searchByKeywords(
     return filterAndRank(hits, options);
   } catch (err) {
     console.error('[chatbot] keyword search failed:', err);
+    return [];
+  }
+}
+
+// Palabras de conversación que no describen el producto («¿tenéis…?», «me
+// recomiendas…»): el buscador de la web exige que aparezcan todas.
+const CHAT_FILLER = new Set([
+  'hola', 'buenas', 'buenos', 'dias', 'tardes', 'noches', 'gracias', 'por', 'favor', 'porfa',
+  'teneis', 'tienes', 'tiene', 'tienen', 'hay', 'vendeis', 'venden', 'busco', 'buscando', 'buscaba',
+  'quiero', 'quisiera', 'queria', 'necesito', 'necesitaria', 'recomienda', 'recomiendas', 'recomendais',
+  'me', 'mi', 'mis', 'te', 'se', 'su', 'sus', 'yo', 'que', 'cual', 'cuales', 'algun', 'alguno', 'alguna',
+  'algo', 'unos', 'unas', 'uno', 'moto', 'compatible', 'compatibles', 'sirve', 'sirven', 'valen', 'vale',
+  'puedo', 'podeis', 'poner', 'montar', 'cambiar', 'comprar', 'precio', 'cuanto', 'cuesta', 'stock',
+  'tengo', 'mia', 'nueva', 'buena', 'bueno', 'mejor', 'barato', 'barata', 'es', 'son', 'si', 'no',
+  'este', 'esta', 'ese', 'esa', 'como', 'donde', 'pues', 'ok', 'tambien', 'o',
+]);
+
+/** Lo que el cliente busca, sin el relleno de la conversación. */
+function productSearchText(text: string): string {
+  return normalizeText(text)
+    .replace(/[^a-z0-9.\-/ ]+/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w && !CHAT_FILLER.has(w))
+    .join(' ')
+    .trim();
+}
+
+/**
+ * Busca como el catálogo de la web y devuelve un producto por modelo (el
+ * representativo: con stock y el más barato). Sin resultados aproximados, para
+ * no ofrecer piezas de otra moto.
+ */
+async function searchLikeWeb(search: string): Promise<CatalogHit[]> {
+  if (!search) return [];
+  try {
+    let res = await listFamilies({ search, inStock: true }, 'relevance', 1, 12);
+    if (res.total === 0 || res.fuzzy) res = await listFamilies({ search }, 'relevance', 1, 12);
+    if (res.total === 0 || res.fuzzy) return [];
+    const ids = res.rows.map((r) => r.rep_id);
+    const { rows } = await pool.query(
+      `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, stock_status,
+              images, compatibility, category2, category3
+       FROM products WHERE id = ANY($1::int[])`,
+      [ids]
+    );
+    const byId = new Map(rows.map((r: any) => [r.id, r]));
+    return ids
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .map((r: any) => {
+        // Precio que paga el cliente: promoción, o el menor entre PVP y DTO1.
+        const eff = Number(r.promo_price) > 0
+          ? Number(r.promo_price)
+          : Math.min(Number(r.price), Number(r.sale_price) > 0 ? Number(r.sale_price) : Number(r.price));
+        return mapHit({ ...r, sale_price: eff < Number(r.price) ? eff : null });
+      });
+  } catch (err) {
+    console.error('[chatbot] búsqueda como la web falló:', err);
     return [];
   }
 }
@@ -347,7 +407,7 @@ async function searchByCompatibility(
     SELECT id, sku, name, brand, price, sale_price, stock, stock_status,
            images, compatibility, category2, category3
     FROM products
-    WHERE (${conditions.join(' OR ')})
+    WHERE status = 'published' AND price > 0 AND (${conditions.join(' OR ')})
       AND stock > 0
       ${keywordFilter}
       ${nameILikeFilter}
@@ -563,6 +623,41 @@ export async function getCatalogContext(
 
   const queryMentionsGarage = mentionsGarage(query, garageMotos);
   const queryMoto = extractMotorcycleFromQuery(query);
+
+  // Primero, el mismo buscador que la web (nombre, categoría y modelos
+  // compatibles): «pastillas de freno para una MT-07» daba 0 aquí y 20 en la web.
+  // «Para mi moto» busca con la moto del garaje.
+  let search = productSearchText(query);
+  const garageMoto = !queryMoto && garageMotos[0] && (queryMentionsGarage || /\bmis? motos?\b/i.test(query))
+    ? garageMotos[0] : null;
+  if (garageMoto) search = `${search} ${productSearchText(`${garageMoto.brand} ${garageMoto.model}`)}`.trim();
+  let webHits = await searchLikeWeb(search);
+  let missing: string[] = [];
+  if (webHits.length === 0) {
+    // ¿Pide algo que no tenemos («escape Akrapovic para Z900»)? Se quita una
+    // palabra que no sea la moto y se ofrece lo que haya («escape Z900»).
+    const moto = queryMoto || garageMoto;
+    const motoTerms = new Set(moto ? searchTerms(`${moto.brand} ${moto.model}`) : []);
+    const terms = searchTerms(search);
+    for (const t of terms.filter((w) => !motoTerms.has(w))) {
+      if (terms.length < 2) break;
+      webHits = await searchLikeWeb(terms.filter((w) => w !== t).join(' '));
+      if (webHits.length > 0) { missing = [t]; break; }
+    }
+  }  if (webHits.length > 0) {
+    const hits = diversifyByBrand(webHits, 2).slice(0, 6);
+    const note = missing.length > 0
+      ? `NO HAY NADA QUE CUMPLA «${missing.join(' ')}» EN ESTA BÚSQUEDA. Díselo al cliente y ofrécele estas alternativas:\n`
+      : '';
+    return { hits, text: note + hits.map((h) => formatHitText(h, null)).join('\n') };
+  }
+  if ((queryMoto && (queryMoto.brand || queryMoto.model)) || garageMoto) {
+    // Sin resultados para la moto nombrada: mejor decirlo que ofrecer piezas de otra.
+    return {
+      hits: [],
+      text: `NO SE ENCONTRARON PRODUCTOS PARA «${search}». Informa al cliente amablemente de que ahora mismo no lo tenemos en el catálogo y ofrécele buscarlo por la web o contactar con la tienda.`,
+    };
+  }
 
   const targetMotos: GarageMotorcycle[] = [];
   if (queryMoto && (queryMoto.brand || queryMoto.model)) {

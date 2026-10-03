@@ -10,12 +10,13 @@ import { pool } from '../db.js';
 
 const BATCH = 2000;
 /** Subir este número cuando cambie products_search_text() en una migración. */
-const SEARCH_TEXT_VERSION = '3';
+const SEARCH_TEXT_VERSION = '4';
 
 const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// search_extra (categoría y modelos compatibles) se calcula en la misma sentencia.
-const EXTRA = `products_search_extra(p.category_id, p.compatibility)`;
+// search_extra (categoría más concreta con sus padres y modelos compatibles) se
+// calcula en la misma sentencia.
+const EXTRA = `products_search_extra(COALESCE(p.category3_id, p.category2_id, p.category_id), p.compatibility)`;
 const RECOMPUTE = `
   search_extra = ${EXTRA},
   search_text = products_search_text(p.name, p.supplier_name, p.brand, p.sku,
