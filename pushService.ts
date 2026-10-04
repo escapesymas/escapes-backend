@@ -37,6 +37,7 @@ export const NOTIFICATION_CATEGORIES = [
   { key: 'new_user', label: 'Clientes', description: 'Altas y bajas de cuentas', urgent: false },
   { key: 'system', label: 'Sistema', description: 'Sincronizaciones con Bihr y correos que no se han podido enviar', urgent: false },
   { key: 'daily_summary', label: 'Resumen diario', description: 'Ventas, reembolsos y pendientes del día a las 21:00', urgent: false },
+  { key: 'social_content', label: 'Contenido TikTok', description: 'Avisa cuando toca publicar y el contenido ya está preparado', urgent: true },
 ] as const;
 
 export type NotificationCategory = typeof NOTIFICATION_CATEGORIES[number]['key'];
