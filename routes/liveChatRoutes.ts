@@ -15,7 +15,7 @@ import {
   closeStaleConversations, agentNameFor, setAgentName, welcomeText, DEFAULT_WELCOME, type ChatMessageKind,
 } from '../lib/live-chat.js';
 import { quoteOrder, type PriceOverride } from '../lib/order-pricing.js';
-import { productEconomics, maxDiscountPct, discountedCents, commissionCents } from '../lib/chat-commission.js';
+import { productEconomics, maxDiscountPct, discountedCents, commissionCents, COMMISSION_HOLD_DAYS } from '../lib/chat-commission.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
 import { searchTerms } from '../lib/catalog-query.js';
 import { notifyLiveChat, sendPushToUser, saveSubscription } from '../pushService.js';
@@ -754,6 +754,139 @@ liveChatRouter.get('/admin/chat-orders', async (req: any, res: any) => {
   } catch (err: any) {
     console.error('[LIVE CHAT] chat-orders:', err.message);
     res.status(500).json({ error: 'No se pudieron cargar las ventas del chat' });
+  }
+});
+
+// ── Comisiones de los asesores ───────────────────────────────────────────
+
+type CommissionState = 'awaiting' | 'holding' | 'available' | 'paid_out' | 'void';
+const VOID_STATUSES = ['cancelled', 'refunded', 'payment_failed'];
+
+/**
+ * Estado de la comisión de un pedido del chat: pendiente de que el cliente
+ * pague, en periodo de devolución (30 días desde el pago), disponible para
+ * cobrar, cobrada o anulada (pedido cancelado o reembolsado).
+ */
+function commissionState(r: any): { state: CommissionState; availableOn: string | null } {
+  if (r.payout_id) return { state: 'paid_out', availableOn: null };
+  if (r.co_status === 'cancelled' || (r.order_id && VOID_STATUSES.includes(r.order_status))) return { state: 'void', availableOn: null };
+  if (!r.order_id || !PAID_STATUSES.includes(r.order_status)) return { state: 'awaiting', availableOn: null };
+  const paidAt = new Date(r.paid_at || r.order_created_at).getTime();
+  const availableOn = new Date(paidAt + COMMISSION_HOLD_DAYS * 86400_000);
+  return availableOn.getTime() > Date.now()
+    ? { state: 'holding', availableOn: availableOn.toISOString() }
+    : { state: 'available', availableOn: availableOn.toISOString() };
+}
+
+const COMMISSION_ROWS_SQL = `
+  SELECT co.id, co.created_at, co.agent_user_id, co.agent_name, co.status AS co_status, co.conversation_id,
+         co.commission_cents, co.estimate_commission_cents, co.attributed_cents, co.payout_id,
+         co.order_id, o.status AS order_status, o.total AS order_total, o.paid_at, o.created_at AS order_created_at,
+         NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS customer_name, u.email AS customer_email,
+         cp.paid_at AS payout_paid_at, cp.method AS payout_method, cp.reference AS payout_reference
+  FROM chat_orders co
+  LEFT JOIN orders o ON o.id = co.order_id
+  LEFT JOIN users u ON u.id = co.user_id
+  LEFT JOIN commission_payouts cp ON cp.id = co.payout_id`;
+
+function decorateCommission(r: any) {
+  const { state, availableOn } = commissionState(r);
+  return {
+    ...r,
+    state,
+    available_on: availableOn,
+    amount: Number(r.commission_cents ?? r.estimate_commission_cents) || 0,
+    order_number: r.order_id ? formatOrderNumber(r.order_id, r.order_created_at) : null,
+    status_label: !r.order_id ? 'enviado al cliente' : (ORDER_STATUS_ES[r.order_status] || r.order_status),
+  };
+}
+
+function commissionTotals(rows: any[]) {
+  const t: Record<CommissionState, number> = { awaiting: 0, holding: 0, available: 0, paid_out: 0, void: 0 };
+  for (const r of rows) t[r.state as CommissionState] += r.amount;
+  return t;
+}
+
+// GET /api/admin/my-commissions?agent=ID — histórico de comisiones de un asesor (por defecto, el propio).
+liveChatRouter.get('/admin/my-commissions', async (req: any, res: any) => {
+  const auth = admin(req, res);
+  if (!auth) return;
+  const agentId = parseId(req.query.agent) || auth.user_id;
+  try {
+    const [{ rows }, { rows: payouts }] = await Promise.all([
+      pool.query(`${COMMISSION_ROWS_SQL} WHERE co.agent_user_id = $1 ORDER BY co.created_at DESC LIMIT 500`, [agentId]),
+      pool.query(`SELECT id, amount_cents, method, reference, note, paid_at FROM commission_payouts
+                  WHERE agent_user_id = $1 ORDER BY paid_at DESC LIMIT 100`, [agentId]),
+    ]);
+    const list = rows.map(decorateCommission);
+    res.json({
+      agent: { id: agentId, name: await agentNameFor(agentId) },
+      holdDays: COMMISSION_HOLD_DAYS,
+      totals: commissionTotals(list),
+      commissions: list,
+      payouts,
+    });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] my-commissions:', err.message);
+    res.status(500).json({ error: 'No se pudieron cargar las comisiones' });
+  }
+});
+
+// GET /api/admin/commission-agents — lo que hay que pagar a cada asesor.
+liveChatRouter.get('/admin/commission-agents', async (req: any, res: any) => {
+  if (!admin(req, res)) return;
+  try {
+    const { rows } = await pool.query(`${COMMISSION_ROWS_SQL} ORDER BY co.created_at DESC LIMIT 5000`);
+    const byAgent = new Map<number, any>();
+    for (const r of rows.map(decorateCommission)) {
+      if (!r.agent_user_id) continue;
+      const a = byAgent.get(r.agent_user_id) || { agent_user_id: r.agent_user_id, agent_name: r.agent_name, totals: { awaiting: 0, holding: 0, available: 0, paid_out: 0, void: 0 }, availableCount: 0 };
+      a.totals[r.state] += r.amount;
+      if (r.state === 'available' && r.amount > 0) a.availableCount++;
+      byAgent.set(r.agent_user_id, a);
+    }
+    for (const a of byAgent.values()) a.agent_name = await agentNameFor(a.agent_user_id);
+    res.json({ holdDays: COMMISSION_HOLD_DAYS, agents: [...byAgent.values()] });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] commission-agents:', err.message);
+    res.status(500).json({ error: 'No se pudieron cargar los asesores' });
+  }
+});
+
+// POST /api/admin/commission-payouts { agentUserId, method, reference, note } — registra el pago
+// de todas las comisiones disponibles del asesor.
+liveChatRouter.post('/admin/commission-payouts', async (req: any, res: any) => {
+  const auth = admin(req, res);
+  if (!auth) return;
+  const agentId = parseId(req.body?.agentUserId);
+  if (!agentId) return res.status(400).json({ error: 'Falta el asesor' });
+  const method = clean(req.body?.method, 40) || 'transferencia';
+  const reference = clean(req.body?.reference, 120) || null;
+  const note = clean(req.body?.note, 500) || null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(`${COMMISSION_ROWS_SQL} WHERE co.agent_user_id = $1 AND co.payout_id IS NULL FOR UPDATE OF co`, [agentId]);
+    const available = rows.map(decorateCommission).filter((r) => r.state === 'available' && r.amount > 0);
+    const amount = available.reduce((a, r) => a + r.amount, 0);
+    if (!available.length || amount <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Este asesor no tiene comisiones disponibles para pagar' });
+    }
+    const name = await agentNameFor(agentId);
+    const { rows: [payout] } = await client.query(
+      `INSERT INTO commission_payouts (agent_user_id, agent_name, amount_cents, method, reference, note, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, amount_cents, method, reference, note, paid_at`,
+      [agentId, name, amount, method, reference, note, auth.user_id]);
+    await client.query(`UPDATE chat_orders SET payout_id = $1 WHERE id = ANY($2::int[])`, [payout.id, available.map((r) => r.id)]);
+    await client.query('COMMIT');
+    res.json({ payout, count: available.length });
+  } catch (err: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[LIVE CHAT] payout:', err.message);
+    res.status(500).json({ error: 'No se pudo registrar el pago' });
+  } finally {
+    client.release();
   }
 });
 

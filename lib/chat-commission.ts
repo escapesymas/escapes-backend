@@ -13,6 +13,8 @@ import { VAT, PAYMENT_FEE_PCT, PAYMENT_FEE_FIXED } from './pricing.js';
 
 export const MIN_MARKUP = 0.20;
 export const COMMISSION_SHARE = 0.5;
+/** Días desde el pago hasta que la comisión se puede cobrar (envío + 14 días de devolución). */
+export const COMMISSION_HOLD_DAYS = 30;
 
 export function netMarginCents(grossCents: number, costCents: number): number {
   return grossCents / VAT - costCents - (grossCents * PAYMENT_FEE_PCT + PAYMENT_FEE_FIXED);
