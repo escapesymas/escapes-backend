@@ -273,7 +273,8 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
         if (units <= 0) continue;
         left -= units;
         attributed += Number(oi.price) * units;
-        commission += (commissionCents(Number(oi.price), it.cost_cents) || 0) * units;
+        // Productos en promoción al preparar el pedido: sin comisión.
+        if (!it.promo) commission += (commissionCents(Number(oi.price), it.cost_cents) || 0) * units;
       }
     }
     await pool.query(`UPDATE chat_orders SET attributed_cents = $2, commission_cents = $3 WHERE id = $1`, [co.id, attributed, commission]);
@@ -461,7 +462,7 @@ async function productRow(productId: number) {
     id: p.id, sku: p.sku, name: p.name, brand: p.brand || '', price, sale_price: eff < price ? eff : null,
     stock: Number(p.stock) || 0, image: p.image || null, slug: p.sku, in_stock: Number(p.stock) > 0,
   };
-  return { card, eff, cost: Number(p.cost) > 0 ? Math.round(Number(p.cost)) : null };
+  return { card, eff, cost: Number(p.cost) > 0 ? Math.round(Number(p.cost)) : null, promo: Number(p.promo_price) > 0 };
 }
 
 /** Tarjeta de producto tal y como la ve el cliente (sin coste ni márgenes). */
@@ -472,7 +473,7 @@ async function productCard(productId: number) {
 /** Tarjeta para el panel: con el descuento máximo y la comisión mínima/máxima por unidad. */
 async function adminProductCard(productId: number) {
   const row = await productRow(productId);
-  return row ? { ...row.card, ...productEconomics(row.eff, row.cost) } : null;
+  return row ? { ...row.card, ...productEconomics(row.eff, row.cost, row.promo) } : null;
 }
 
 /**
@@ -489,16 +490,21 @@ async function priceProposal(rawItems: any[], strict: boolean) {
     const quantity = Math.max(1, Math.min(99, parseInt(raw?.quantity, 10) || 1));
     const row = await productRow(id);
     if (!row) { errors.push(`El producto ${id} ya no está disponible`); continue; }
-    const max = maxDiscountPct(row.eff, row.cost);
+    // En promoción (DTO2) no hay descuento ni comisión: ya va al margen mínimo.
+    const max = row.promo ? 0 : maxDiscountPct(row.eff, row.cost);
     let discount = Math.round(Math.max(0, Number(raw?.discount) || 0) * 10) / 10;
     if (discount > max) {
-      if (strict) errors.push(`${row.card.name}: el descuento máximo es ${String(max).replace('.', ',')} %`);
+      if (strict) {
+        errors.push(row.promo
+          ? `${row.card.name}: está en promoción y no admite descuento`
+          : `${row.card.name}: el descuento máximo es ${String(max).replace('.', ',')} %`);
+      }
       discount = max;
     }
     const unit = discountedCents(row.eff, discount);
-    const commissionUnit = commissionCents(unit, row.cost);
+    const commissionUnit = row.promo ? 0 : commissionCents(unit, row.cost);
     lines.push({
-      id, quantity, discount, list: row.eff, unit, cost: row.cost, max_discount_pct: max,
+      id, quantity, discount, list: row.eff, unit, cost: row.cost, max_discount_pct: max, in_promo: row.promo,
       commission_unit: commissionUnit, commission: commissionUnit != null ? commissionUnit * quantity : null,
       card: row.card,
     });
@@ -682,7 +688,7 @@ liveChatRouter.post('/admin/chats/:id/order', async (req: any, res: any) => {
     const token = crypto.randomUUID();
     const agentName = await agentNameFor(auth.user_id);
     const note = clean(req.body?.note, 500);
-    const stored = p.lines.map((l) => ({ id: l.id, quantity: l.quantity, discount: l.discount, unit_cents: l.unit, list_cents: l.list, cost_cents: l.cost }));
+    const stored = p.lines.map((l) => ({ id: l.id, quantity: l.quantity, discount: l.discount, unit_cents: l.unit, list_cents: l.list, cost_cents: l.cost, promo: l.in_promo }));
     const { rows: [co] } = await pool.query(
       `INSERT INTO chat_orders (token, conversation_id, user_id, agent_user_id, agent_name, items, note, estimate_cents, estimate_commission_cents)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,

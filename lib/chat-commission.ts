@@ -5,6 +5,8 @@
  * - El asesor puede descontar hasta dejar un margen neto del 20 % del coste.
  * - Su comisión es el 50 % del margen neto que queda después del descuento.
  * - Sin coste conocido no se puede descontar ni calcular la comisión.
+ * - Los productos en promoción (precio DTO2) ya van al margen mínimo: ni
+ *   descuento ni comisión.
  * Todos los importes en céntimos; los precios de venta llevan el IVA español.
  */
 import { VAT, PAYMENT_FEE_PCT, PAYMENT_FEE_FIXED } from './pricing.js';
@@ -38,11 +40,15 @@ export function commissionCents(grossCents: number, costCents: number | null | u
 }
 
 /** Lo que el asesor puede hacer con un producto: descuento máximo y comisión mínima/máxima por unidad. */
-export function productEconomics(listGrossCents: number, costCents: number | null | undefined) {
+export function productEconomics(listGrossCents: number, costCents: number | null | undefined, inPromo = false) {
   const hasCost = !!costCents && costCents > 0;
+  if (inPromo) {
+    return { has_cost: hasCost, in_promo: true, max_discount_pct: 0, commission_max: 0, commission_min: 0 };
+  }
   const max = maxDiscountPct(listGrossCents, costCents);
   return {
     has_cost: hasCost,
+    in_promo: false,
     max_discount_pct: max,
     commission_max: hasCost ? commissionCents(listGrossCents, costCents) : null,
     commission_min: hasCost ? commissionCents(discountedCents(listGrossCents, max), costCents) : null,
