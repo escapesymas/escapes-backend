@@ -14,8 +14,12 @@ export interface SupportSettings {
   /** auto: según el horario · on: disponible ahora · off: no disponible. */
   mode: SupportMode;
   timezone: string;
-  /** Nombre con el que firma el asesor en el chat. */
+  /** Nombre por defecto del asesor en el chat (si el asesor no ha puesto el suyo). */
   agentName: string;
+  /** Nombre de cada asesor en el chat (id de usuario → nombre). */
+  agents?: Record<string, string>;
+  /** Bienvenida al atender: {cliente} y {asesor} se sustituyen. */
+  welcomeTemplate?: string;
   /** Día de la semana (0 = domingo) → tramos ["HH:MM", "HH:MM"]. */
   days: Record<string, [string, string][]>;
 }
@@ -37,6 +41,8 @@ const DEFAULT_SETTINGS: SupportSettings = {
     3: [['10:00', '14:00'], ['16:00', '20:00']], 4: [['10:00', '14:00'], ['16:00', '20:00']],
     5: [['10:00', '14:00'], ['16:00', '20:00']], 6: [], 0: [] } as any,
 };
+
+export const DEFAULT_WELCOME = '¡Hola{cliente}! Soy {asesor}, del equipo de Escapes y Más, y voy a atenderte yo. Ya he leído tu consulta, dame un momento.';
 
 const DAY_NAMES = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
 const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0];
@@ -68,8 +74,12 @@ export async function saveSupportSettings(input: any): Promise<SupportSettings> 
       .map((r: any) => [r[0], r[1]] as [string, string])
       .sort((a: [string, string], b: [string, string]) => a[0].localeCompare(b[0]));
   }
-  const agentName = String(input?.agentName || '').trim().slice(0, 60) || DEFAULT_SETTINGS.agentName;
-  const value: SupportSettings = { mode, timezone: DEFAULT_SETTINGS.timezone, agentName, days };
+  const current = await getSupportSettings();
+  const agentName = String(input?.agentName ?? current.agentName ?? '').trim().slice(0, 60) || DEFAULT_SETTINGS.agentName;
+  const welcomeTemplate = String(input?.welcomeTemplate ?? current.welcomeTemplate ?? '').trim().slice(0, 500) || DEFAULT_WELCOME;
+  const value: SupportSettings = {
+    mode, timezone: DEFAULT_SETTINGS.timezone, agentName, days, welcomeTemplate, agents: current.agents || {},
+  };
   await pool.query(
     `INSERT INTO app_settings (key, value, updated_at) VALUES ('support_hours', $1, NOW())
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
@@ -133,19 +143,56 @@ export async function supportStatus(date = new Date()): Promise<SupportStatus> {
   return { available, mode: s.mode, hoursText: hoursText(s), nextOpen, agentName: s.agentName };
 }
 
+/** Nombre de un asesor en el chat: el que haya puesto, su nombre de pila o el genérico. */
+export async function agentNameFor(userId: number): Promise<string> {
+  const s = await getSupportSettings();
+  const own = s.agents?.[String(userId)];
+  if (own) return own;
+  try {
+    const { rows } = await pool.query(`SELECT first_name FROM users WHERE id = $1`, [userId]);
+    if (rows[0]?.first_name) return String(rows[0].first_name).trim();
+  } catch { /* nada */ }
+  return s.agentName;
+}
+
+export async function setAgentName(userId: number, name: string): Promise<void> {
+  const s = await getSupportSettings();
+  const agents = { ...(s.agents || {}) };
+  const clean = name.trim().slice(0, 60);
+  if (clean) agents[String(userId)] = clean; else delete agents[String(userId)];
+  const value = { ...s, agents };
+  await pool.query(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES ('support_hours', $1, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+    [JSON.stringify(value)],
+  );
+  cache = { at: Date.now(), value };
+}
+
+export function welcomeText(template: string, customerFirstName: string, agentName: string): string {
+  return (template || DEFAULT_WELCOME)
+    .replace(/\{cliente\}/g, customerFirstName ? ` ${customerFirstName}` : '')
+    .replace(/\{asesor\}/g, agentName)
+    .replace(/\s+([!,.?])/g, '$1');
+}
+
 // ── Conversaciones ───────────────────────────────────────────────────────
+
+export type ChatMessageKind = 'text' | 'product' | 'image' | 'order';
 
 export interface ChatMessageRow {
   id: number;
   sender: 'customer' | 'ai' | 'agent' | 'system';
+  kind: ChatMessageKind;
   content: string;
+  payload: any;
   created_at: string;
 }
 
 /** Conversación abierta del cliente (o la última cerrada hace menos de 2 h, para que vea el cierre). */
 export async function currentConversation(userId: number) {
   const { rows } = await pool.query(
-    `SELECT id, status, created_at, taken_at, closed_at, closed_by FROM chat_conversations
+    `SELECT id, status, created_at, taken_at, closed_at, closed_by, agent_user_id, agent_name FROM chat_conversations
      WHERE user_id = $1 AND (status <> 'closed' OR closed_at > NOW() - INTERVAL '2 hours')
      ORDER BY (status <> 'closed') DESC, id DESC LIMIT 1`,
     [userId],
@@ -155,17 +202,21 @@ export async function currentConversation(userId: number) {
 
 export async function messagesAfter(conversationId: number, afterId = 0): Promise<ChatMessageRow[]> {
   const { rows } = await pool.query(
-    `SELECT id::int, sender, content, created_at FROM chat_messages
+    `SELECT id::int, sender, kind, content, payload, created_at FROM chat_messages
      WHERE conversation_id = $1 AND id > $2 ORDER BY id LIMIT 200`,
     [conversationId, afterId],
   );
   return rows;
 }
 
-export async function addMessage(conversationId: number, sender: ChatMessageRow['sender'], content: string) {
+export async function addMessage(
+  conversationId: number, sender: ChatMessageRow['sender'], content: string,
+  kind: ChatMessageKind = 'text', payload: any = null,
+) {
   const { rows } = await pool.query(
-    `INSERT INTO chat_messages (conversation_id, sender, content) VALUES ($1, $2, $3) RETURNING id::int, sender, content, created_at`,
-    [conversationId, sender, content.slice(0, 4000)],
+    `INSERT INTO chat_messages (conversation_id, sender, content, kind, payload) VALUES ($1, $2, $3, $4, $5)
+     RETURNING id::int, sender, kind, content, payload, created_at`,
+    [conversationId, sender, content.slice(0, 4000), kind, payload ? JSON.stringify(payload) : null],
   );
   await pool.query(`UPDATE chat_conversations SET updated_at = NOW() WHERE id = $1`, [conversationId]);
   return rows[0] as ChatMessageRow;

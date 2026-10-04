@@ -48,7 +48,7 @@ import { authRouter } from './routes/auth.js';
 import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
-import { liveChatRouter } from './routes/liveChatRoutes.js';
+import { liveChatRouter, linkChatOrder, chatOrderPaid } from './routes/liveChatRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -5610,6 +5610,11 @@ app.post('/api/orders/create', async (req: any, res: any) => {
       txClient.release();
     }
 
+    // Pedido preparado por un asesor en el chat: queda a su nombre (comisiones).
+    if (typeof req.body?.chatProposal === 'string') {
+      await linkChatOrder(req.body.chatProposal, Number(newOrderId), dbUserId);
+    }
+
     res.status(201).json({
       success: true,
       orderId: newOrderId,
@@ -5835,6 +5840,7 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
     const transitioned = transition.rows.length > 0;
 
     if (paymentStatus === 'processing' && transitioned) {
+      chatOrderPaid(parsedOrderId).catch(() => {});
       const itemsRes = await db.execute(sql`
         SELECT product_id, quantity FROM order_items WHERE order_id = ${parsedOrderId}
       `);

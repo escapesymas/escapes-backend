@@ -265,6 +265,8 @@ async function handlePaymentSuccess(evt: Stripe.Event): Promise<void> {
 
     await client.query('COMMIT');
     console.log(`[STRIPE WEBHOOK] Transacción SQL completada: Pedido #${orderId} actualizado a 'paid' y stock descontado.`);
+    // Pedido preparado en el chat: aviso en la conversación (import dinámico: evita el ciclo con las rutas).
+    import('../routes/liveChatRoutes.js').then((m) => m.chatOrderPaid(Number(orderId))).catch(() => {});
   } catch (dbErr: any) {
     await client.query('ROLLBACK');
     console.error(`[STRIPE WEBHOOK ERROR] Error en la transacción SQL para pedido #${orderId}:`, dbErr);
