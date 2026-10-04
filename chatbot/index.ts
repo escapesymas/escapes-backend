@@ -5,6 +5,7 @@ import { sanitizeUserInput, containsPromptInjection, isOutOfScope } from './sani
 import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, extractMotorcycleFromQuery, buildSearchQuery, type CatalogHit } from './catalog.js';
 import { ORDER_TIERS } from '../lib/order-pricing.js';
 import { pool } from '../db.js';
+import { supportStatus, type SupportStatus } from '../lib/live-chat.js';
 import { isTechSpecQuery, searchMotorcycleTechSpecs } from './webSearch.js';
 
 interface ChatMessage {
@@ -58,7 +59,15 @@ async function storePolicies(): Promise<string> {
   return text;
 }
 
-function buildSystemPrompt(userContext: string, catalogContext: string, ordersContext: string, policies: string, webSearchText = ''): string {
+/** Qué hacer cuando el asistente no puede resolver la consulta. */
+function humanSupportRules(status: SupportStatus): string {
+  if (status.available) {
+    return `ATENCIÓN HUMANA: ahora hay un asesor conectado (${status.agentName}). Si no puedes resolver la consulta con los datos que tienes (incidencia con un pedido, devolución o garantía concreta, duda técnica sin datos suficientes, queja, presupuesto especial) o el cliente pide hablar con una persona, díselo en una frase, ofrécele hablar con un asesor y termina tu respuesta con la marca [[ASESOR]] (el cliente verá un botón para hablar con él). No uses la marca si has resuelto la duda.`;
+  }
+  return `ATENCIÓN HUMANA: ahora no hay asesores conectados. Horario del chat con asesor: ${status.hoursText}.${status.nextOpen ? ` Volvemos ${status.nextOpen}.` : ''} Si no puedes resolver la consulta o pide hablar con una persona, explícale el horario y que también puede escribir a info@escapesymas.com. No uses ninguna marca.`;
+}
+
+function buildSystemPrompt(userContext: string, catalogContext: string, ordersContext: string, policies: string, webSearchText = '', humanRules = ''): string {
   return `Eres el asistente de Escapes y Más (escapesymas.com), tienda online española de recambios, accesorios y equipamiento para moto. Hablas en español de España, con un tono cercano y profesional.
 
 ALCANCE: catálogo y compatibilidades, datos técnicos de motos, pedidos, envíos, pagos, devoluciones, garantía y uso de la web. Para cualquier otro tema responde EXACTAMENTE: "Lo siento, solo puedo ayudarte con temas de Escapes y Más (catálogo, pedidos o soporte web). ¿En qué producto o pedido te echo una mano?"
@@ -70,6 +79,8 @@ ${userContext || 'Cliente con sesión iniciada.'}
 
 ${ordersContext}
 ${webSearchText ? `\n${webSearchText}\nSon datos orientativos de internet: úsalos para explicar especificaciones de serie y relaciónalos con nuestros productos.\n` : ''}
+${humanRules}
+
 PRODUCTOS DEL CATÁLOGO PARA ESTA CONSULTA:
 ${catalogContext}
 
@@ -119,6 +130,9 @@ function stripThinking(text: string): string {
   return encoded.replace(re, '').replace(/\s{2,}/g, ' ').trim();
 }
 
+const ADVISOR_RE = /\[\[\s*ASESOR\s*\]\]/i;
+const ADVISOR_RE_G = /\s*\[\[\s*ASESOR\s*\]\]\s*/gi;
+const ASKS_HUMAN_RE = /\b(hablar|habla|contactar|pasar|atender|atienda|llamar|chatear)\b.{0,30}\b(persona|humano|humana|asesor|asesora|agente|alguien|empleado|operador|operadora|encargado|dependiente|vendedor)\b|\b(asesor|persona real|humano)\b\s*[?!.]*$/i;
 const CJK_RE = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]+/g;
 
 const recentByUser = new Map<number, number[]>();
@@ -213,7 +227,7 @@ export async function chatHandler(req: Request, res: Response) {
     const garageEntriesP = getGarageEntries(user.user_id)
       .then((g) => (selectedBike ? [selectedBike, ...g.filter((x) => x.toLowerCase() !== selectedBike.toLowerCase())] : g));
 
-    const [userContext, ordersContext, policies, webSearchText, catalog] = await Promise.all([
+    const [userContext, ordersContext, policies, webSearchText, catalog, support] = await Promise.all([
       getGarageContext(user.user_id),
       getRecentOrdersContext(user.user_id),
       storePolicies(),
@@ -221,10 +235,12 @@ export async function chatHandler(req: Request, res: Response) {
         ? searchMotorcycleTechSpecs(cleanInput, moto?.brand, moto?.model, moto?.year)
         : Promise.resolve(''),
       garageEntriesP.then((g) => getCatalogContext(searchQuery, g)),
+      supportStatus().catch(() => null),
     ]);
 
     const bikeContext = selectedBike ? `${userContext}\nMoto seleccionada ahora en la web: ${selectedBike}.` : userContext;
-    const systemPrompt = buildSystemPrompt(bikeContext, catalog.text, ordersContext, policies, webSearchText);
+    const systemPrompt = buildSystemPrompt(bikeContext, catalog.text, ordersContext, policies, webSearchText,
+      support ? humanSupportRules(support) : '');
     const finalMessages: ChatMessage[] = [{ role: 'system', content: systemPrompt }, ...truncateHistory(messages)];
 
     startStream();
@@ -261,6 +277,8 @@ export async function chatHandler(req: Request, res: Response) {
 
     let pending = '';
     let started = false;
+    // Si pide una persona expresamente, se le ofrece aunque el modelo no ponga la marca.
+    let offerHuman = ASKS_HUMAN_RE.test(cleanInput);
     let sentText = '';
     let finishReason: string | null = null;
     for await (const chunk of stream as any) {
@@ -283,13 +301,23 @@ export async function chatHandler(req: Request, res: Response) {
         if (!pending) continue;
         started = true;
       }
-      send({ delta: pending });
-      sentText += pending;
-      pending = '';
+      // La marca [[ASESOR]] no se muestra: activa el botón de hablar con un asesor.
+      // Un posible comienzo de marca al final se guarda hasta el siguiente trozo.
+      let out = pending;
+      if (ADVISOR_RE.test(out)) { offerHuman = true; out = out.replace(ADVISOR_RE_G, ''); }
+      const open = out.lastIndexOf('[');
+      if (open !== -1 && open >= out.length - 11 && !out.slice(open).includes(']')) {
+        pending = out.slice(open);
+        out = out.slice(0, open);
+      } else {
+        pending = '';
+      }
+      if (out) { send({ delta: out }); sentText += out; }
     }
-    if (!started && pending) {
-      const rest = stripThinking(pending);
-      if (rest) { send({ delta: rest }); sentText += rest; }
+    if (pending) {
+      let rest = started ? pending : stripThinking(pending);
+      if (ADVISOR_RE.test(rest)) { offerHuman = true; rest = rest.replace(ADVISOR_RE_G, ''); }
+      if (rest.trim()) { send({ delta: rest }); sentText += rest; }
     }
     if (!sentText.trim()) {
       send({ delta: 'Perdona, no he podido preparar la respuesta. ¿Me lo repites con otras palabras?' });
@@ -297,9 +325,11 @@ export async function chatHandler(req: Request, res: Response) {
       send({ delta: '…' });
     }
 
+    if (offerHuman && support?.available) send({ offerHuman: true, agentName: support.agentName });
+
     send({ done: true });
     res.end();
-    logRequest(user, cleanInput, 'ok', `chars=${sentText.length} hits=${catalog.hits.length}${finishReason === 'length' ? ' cortada' : ''}`);
+    logRequest(user, cleanInput, 'ok', `${offerHuman && support?.available ? 'asesor ' : ''}chars=${sentText.length} hits=${catalog.hits.length}${finishReason === 'length' ? ' cortada' : ''}`);
   } catch (err: any) {
     console.error('[chatbot] minimax error:', err.message || err);
     logRequest(user, cleanInput, 'error', err.message?.slice(0, 80));

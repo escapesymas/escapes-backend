@@ -48,6 +48,7 @@ import { authRouter } from './routes/auth.js';
 import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
+import { liveChatRouter } from './routes/liveChatRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -703,6 +704,7 @@ app.use('/api', authRouter);
 app.use('/api', bihrRouter);
 app.use('/api', adminRouter);
 app.use('/api', pushRouter);
+app.use('/api', liveChatRouter);
 
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
 // /uploads se sirve como estático en el mismo origen, así que nunca se debe

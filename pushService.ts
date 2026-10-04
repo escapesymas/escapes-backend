@@ -29,6 +29,7 @@ export const NOTIFICATION_CATEGORIES = [
   { key: 'payment_failed', label: 'Pagos con problemas', description: 'Pagos rechazados o con importe distinto al del pedido', urgent: true },
   { key: 'refund', label: 'Reembolsos', description: 'Solicitudes de los clientes y reembolsos realizados', urgent: true },
   { key: 'dropshipping_status', label: 'Envíos con Bihr', description: 'Pedidos enviados a Bihr, enviados por Bihr e incidencias', urgent: false },
+  { key: 'chat', label: 'Chat con clientes', description: 'Clientes que piden hablar con un asesor y sus mensajes', urgent: true },
   { key: 'contact', label: 'Mensajes de contacto', description: 'Consultas desde el formulario de la web', urgent: true },
   { key: 'warranty', label: 'Garantías', description: 'Nuevas solicitudes de garantía', urgent: true },
   { key: 'review', label: 'Reseñas', description: 'Opiniones nuevas de productos', urgent: false },
@@ -329,6 +330,17 @@ export async function notifyNewUser(user: { name: string; email: string }) {
     body: `${user.name} (${user.email})`,
     url: adminUrl('users'),
     category: 'new_user',
+  });
+}
+
+export async function notifyLiveChat(info: { conversationId: number; title: string; body: string }) {
+  await sendNotificationToAll({
+    title: info.title,
+    body: info.body,
+    url: adminUrl('chat', { chat: info.conversationId }),
+    category: 'chat',
+    tag: `chat-${info.conversationId}`,
+    data: { conversationId: info.conversationId },
   });
 }
 
