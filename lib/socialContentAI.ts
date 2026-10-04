@@ -108,15 +108,21 @@ async function geminiGenerateText(prompt: string): Promise<string> {
 }
 
 async function minimaxGenerateText(prompt: string): Promise<string> {
-  const r: any = await minimaxClient.chat.completions.create({
-    model: CHAT_MODEL, max_tokens: 4000, temperature: 0.7,
-    messages: [{ role: 'user', content: prompt }],
-    reasoning_split: true,
-  } as any);
-  return String(r.choices?.[0]?.message?.content || '')
-    .replace(/<think>[\s\S]*?<\/think>/gi, '')
-    .replace(/[぀-ヿ㐀-鿿豈-﫿＀-￯]+/g, '')
-    .trim();
+  // El razonamiento de MiniMax cuenta en max_tokens: con poco margen la respuesta llega vacía.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r: any = await minimaxClient.chat.completions.create({
+      model: CHAT_MODEL, max_tokens: 10000, temperature: 0.7,
+      messages: [{ role: 'user', content: prompt }],
+      reasoning_split: true,
+    } as any);
+    const content = String(r.choices?.[0]?.message?.content || '')
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]+/g, '')
+      .trim();
+    if (content) return content;
+    console.warn('[SOCIAL CONTENT] MiniMax sin texto:', r.choices?.[0]?.finish_reason, JSON.stringify(r.usage || {}));
+  }
+  throw new Error('MiniMax no devolvió texto');
 }
 
 /** Escapa saltos de línea y tabuladores sueltos dentro de las cadenas (JSON "casi válido" de los modelos). */
