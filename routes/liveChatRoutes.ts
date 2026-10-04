@@ -274,7 +274,7 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
         left -= units;
         attributed += Number(oi.price) * units;
         // Productos en promoción al preparar el pedido: sin comisión.
-        if (!it.promo) commission += (commissionCents(Number(oi.price), it.cost_cents) || 0) * units;
+        if (!it.promo) commission += (commissionCents(Number(oi.price), it.cost_cents, Number(it.list_cents) || Number(oi.price)) || 0) * units;
       }
     }
     await pool.query(`UPDATE chat_orders SET attributed_cents = $2, commission_cents = $3 WHERE id = $1`, [co.id, attributed, commission]);
@@ -502,7 +502,7 @@ async function priceProposal(rawItems: any[], strict: boolean) {
       discount = max;
     }
     const unit = discountedCents(row.eff, discount);
-    const commissionUnit = row.promo ? 0 : commissionCents(unit, row.cost);
+    const commissionUnit = row.promo ? 0 : commissionCents(unit, row.cost, row.eff);
     lines.push({
       id, quantity, discount, list: row.eff, unit, cost: row.cost, max_discount_pct: max, in_promo: row.promo,
       commission_unit: commissionUnit, commission: commissionUnit != null ? commissionUnit * quantity : null,
