@@ -98,17 +98,31 @@ export async function generateSlotContent(id: number) {
   }
 }
 
+/** El contenedor corre en UTC: convierte "esta hora en Madrid, este día" a su
+ * instante UTC real, teniendo en cuenta el cambio de horario (CET/CEST). */
+function madridHourToUtc(day: Date, hour: number): Date {
+  const y = day.getUTCFullYear(), m = day.getUTCMonth(), d = day.getUTCDate();
+  let guess = new Date(Date.UTC(y, m, d, hour, 0, 0));
+  const madridHour = parseInt(
+    new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Madrid', hour: '2-digit', hour12: false }).format(guess), 10);
+  const diff = hour - madridHour;
+  if (diff !== 0) guess = new Date(guess.getTime() + diff * 3600_000);
+  return guess;
+}
+
 /** Crea los próximos slots vacíos (en borrador) según las horas recomendadas, para N días vista. */
 export async function autoScheduleUpcoming(days = 7, formats: string[] = ['video', 'photo', 'carousel']) {
   const created: any[] = [];
   const now = new Date();
   for (let d = 0; d < days; d++) {
     const date = new Date(now);
-    date.setDate(date.getDate() + d);
-    const hours = DEFAULT_SLOT_HOURS[date.getDay()] || [20];
+    date.setUTCDate(date.getUTCDate() + d);
+    const weekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const madridWeekdayName = new Intl.DateTimeFormat('en-US', { timeZone: 'Europe/Madrid', weekday: 'short' }).format(date);
+    const madridWeekday = weekdayNames.indexOf(madridWeekdayName);
+    const hours = DEFAULT_SLOT_HOURS[madridWeekday >= 0 ? madridWeekday : date.getUTCDay()] || [20];
     for (let i = 0; i < hours.length; i++) {
-      const scheduledAt = new Date(date);
-      scheduledAt.setHours(hours[i], 0, 0, 0);
+      const scheduledAt = madridHourToUtc(date, hours[i]);
       if (scheduledAt <= now) continue;
       const exists = await pool.query(
         `SELECT 1 FROM social_content_calendar WHERE scheduled_at = $1`, [scheduledAt.toISOString()]);
