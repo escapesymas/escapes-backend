@@ -49,7 +49,7 @@ import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
 import { socialContentRouter } from './routes/socialContentRoutes.js';
-import { checkDueSlots } from './lib/socialContentCalendar.js';
+import { checkDueSlots, resetInterruptedGenerations } from './lib/socialContentCalendar.js';
 import { liveChatRouter, linkChatOrder, chatOrderPaid, proposalOverrides } from './routes/liveChatRoutes.js';
 import { agentRouter } from './routes/agentRoutes.js';
 import { chatToolsRouter, startChatJobs } from './routes/chatToolsRoutes.js';
@@ -6803,8 +6803,8 @@ setInterval(() => {
 }, 60 * 1000);
 
 // Calendario de contenido TikTok (cada 5 minutos). Avisa al panel admin
-// cuando toca publicar y el contenido está listo, o si se acerca la hora
-// y sigue sin preparar. Backed by migrations/031_social_content_calendar.sql.
+// cuando toca publicar y el contenido está listo, y una vez al día de lo que
+// queda por preparar. Backed by migrations/031_social_content_calendar.sql.
 setInterval(() => {
   checkDueSlots().catch(e => console.error('[SOCIAL CONTENT CRON]:', e));
 }, 5 * 60 * 1000);
@@ -7014,6 +7014,7 @@ app.use(sentryErrorHandler());
 app.listen(PORT, () => {
   // Tareas del chat con asesor: cierre por inactividad y recordatorio de pedidos sin pagar.
   startChatJobs();
+  resetInterruptedGenerations().catch((e) => console.error('[SOCIAL CONTENT] reset:', e.message));
   console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║  🏍️  ESCAPES Y MÁS — Backend API v1.0              ║

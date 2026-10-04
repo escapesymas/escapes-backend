@@ -1,25 +1,45 @@
 /**
- * Generación de contenido para TikTok (copy, guion, imagen) con Gemini, y
- * como alternativa de imagen, Minimax. El vídeo final (Veo) se deja para
- * cuando haya presupuesto/cuota confirmados: de momento se genera guion +
- * imágenes de apoyo para que el administrador grabe o monte el vídeo.
+ * Generación de contenido para TikTok: copy, guion y hashtags con Gemini (y
+ * MiniMax si Gemini falla o está saturado), a partir de un producto REAL del
+ * catálogo, con sus fotos reales. Si Gemini responde, se añade además una
+ * imagen de ambiente hecha con la foto real del producto como referencia, para
+ * no enseñar nunca un producto inventado. El vídeo final (Veo) se deja para
+ * cuando haya presupuesto/cuota confirmados.
  */
 import fs from 'fs';
 import path from 'path';
+import { pool } from '../db.js';
+import { minimaxClient, CHAT_MODEL } from '../chatbot/minimax.js';
+import { storePolicies } from '../chatbot/index.js';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
+const GEMINI_TIMEOUT_MS = 45_000;
 
 const uploadDir = path.join(process.cwd(), 'uploads', 'social-content');
 fs.mkdirSync(uploadDir, { recursive: true });
+
+/** Marcas que se promocionan cuando el hueco no tiene producto elegido. */
+export const FEATURED_BRANDS = ['IXIL', 'BELL', 'RST'];
 
 export const NICHE_CONTEXT = `Escapes y Más (escapesymas.com) vende recambios y equipamiento de moto de
 alto rendimiento: escapes/silenciadores IXIL, cascos BELL, ropa y equipamiento
 técnico RST (cazadoras, pantalones, guantes). Público: moteros en España,
 tono cercano y experto, nada de humo de marketing. El contenido debe generar
-deseo por el producto y dar un motivo claro para comprar ya (envío 24h,
-pocas unidades, sonido/estética del escape, protección real).`;
+deseo por el producto con argumentos reales (sonido y estética del escape,
+protección y comodidad del equipamiento, precio).`;
+
+export interface SlotProduct {
+  id: number;
+  sku: string;
+  name: string;
+  brand: string;
+  price: number;           // céntimos, precio que paga el cliente hoy
+  listPrice: number;       // céntimos, PVP sin oferta
+  inStock: boolean;
+  description: string;
+  images: string[];
+}
 
 export interface GeneratedCopy {
   hook: string;
@@ -28,26 +48,112 @@ export interface GeneratedCopy {
   hashtags: string;
 }
 
+const euros = (cents: number) => (cents / 100).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function rowToProduct(p: any): SlotProduct {
+  const list = Number(p.price);
+  const price = Number(p.promo_price) > 0 ? Number(p.promo_price)
+    : Math.min(list, Number(p.sale_price) > 0 ? Number(p.sale_price) : list);
+  const images = (Array.isArray(p.images) ? p.images : [])
+    .map((i: any) => (typeof i === 'string' ? i : i?.src))
+    .filter((s: any) => typeof s === 'string' && s)
+    .slice(0, 6);
+  const description = String(p.description || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200);
+  return {
+    id: p.id, sku: p.sku, name: p.name, brand: p.brand || '', price, listPrice: list,
+    inStock: Number(p.stock) > 0, description, images,
+  };
+}
+
+/** Producto publicado por SKU (con sus fotos). */
+export async function productBySku(sku: string): Promise<SlotProduct | null> {
+  const { rows: [p] } = await pool.query(
+    `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, description, images
+     FROM products WHERE upper(sku) = upper($1) AND status = 'published' AND price > 0
+     ORDER BY (duplicate_of IS NULL) DESC LIMIT 1`, [sku]);
+  return p ? rowToProduct(p) : null;
+}
+
+/**
+ * Elige un producto para un hueco sin producto: de las marcas destacadas, con
+ * stock y fotos, y que no se haya usado en el calendario en los últimos 60 días.
+ */
+export async function pickProduct(): Promise<SlotProduct | null> {
+  const { rows: [p] } = await pool.query(
+    `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, description, images
+     FROM products p
+     WHERE p.status = 'published' AND p.price > 0 AND p.stock > 0 AND p.duplicate_of IS NULL
+       AND upper(p.brand) = ANY($1) AND jsonb_array_length(COALESCE(p.images, '[]'::jsonb)) > 0
+       AND NOT EXISTS (SELECT 1 FROM social_content_calendar c
+                       WHERE upper(c.product_sku) = upper(p.sku) AND c.created_at > NOW() - INTERVAL '60 days')
+     ORDER BY random() LIMIT 1`, [FEATURED_BRANDS]);
+  return p ? rowToProduct(p) : null;
+}
+
+// ---------------------------------------------------------------- texto
+
 async function geminiGenerateText(prompt: string): Promise<string> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada');
   const res = await fetch(`${GEMINI_BASE}/models/gemini-flash-latest:generateContent?key=${GEMINI_API_KEY}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`Gemini text error ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Gemini texto ${res.status}`);
   const data: any = await res.json();
   const text = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join('') || '';
   if (!text) throw new Error('Gemini no devolvió texto');
   return text;
 }
 
-/** Copy, guion, hook y hashtags para un slot del calendario. */
-export async function generateCopy(opts: { format: string; topic?: string; productSku?: string }): Promise<GeneratedCopy> {
+async function minimaxGenerateText(prompt: string): Promise<string> {
+  const r: any = await minimaxClient.chat.completions.create({
+    model: CHAT_MODEL, max_tokens: 1500, temperature: 0.7,
+    messages: [{ role: 'user', content: prompt }],
+    reasoning_split: true,
+  } as any);
+  return String(r.choices?.[0]?.message?.content || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/[぀-ヿ㐀-鿿豈-﫿＀-￯]+/g, '')
+    .trim();
+}
+
+function parseCopy(text: string): GeneratedCopy {
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('La IA no devolvió JSON');
+  const parsed = JSON.parse(jsonMatch[0]);
+  const str = (v: any) => (Array.isArray(v) ? v.join('\n') : String(v || '')).trim();
+  const copy = { hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: str(parsed.hashtags) };
+  if (!copy.copy && !copy.hook) throw new Error('La IA devolvió el contenido vacío');
+  return copy;
+}
+
+/** Copy, guion, hook y hashtags. Gemini primero; si falla o está saturado, MiniMax. */
+export async function generateCopy(opts: { format: string; topic?: string | null; product: SlotProduct | null }): Promise<GeneratedCopy & { engine: string }> {
+  const p = opts.product;
+  const productBlock = p
+    ? `PRODUCTO (datos reales; no inventes características, medidas, homologaciones ni compatibilidades que no estén aquí):
+- Nombre: ${p.name}
+- Marca: ${p.brand}
+- Precio: ${euros(p.price)} €${p.price < p.listPrice ? ` (antes ${euros(p.listPrice)} €)` : ''}
+- ${p.inStock ? 'Disponible' : 'Ahora mismo sin stock'}
+- Enlace: escapesymas.com/producto/${encodeURIComponent(p.sku)}
+- Descripción: ${p.description || '(sin descripción)'}`
+    : 'Sin producto concreto: habla de la categoría sin nombrar modelos concretos ni inventar datos.';
+
   const prompt = `${NICHE_CONTEXT}
 
-Genera contenido para un TikTok de formato "${opts.format}" sobre: ${opts.topic || 'un producto destacado del catálogo (escape, casco o ropa técnica)'}.
-${opts.productSku ? `SKU de referencia: ${opts.productSku}.` : ''}
+${await storePolicies()}
+
+${productBlock}
+
+Genera contenido para un TikTok de formato "${opts.format}"${opts.topic ? ` con este enfoque: ${opts.topic}` : ''}.
+
+Reglas:
+- Usa solo datos reales de arriba. No prometas plazos de entrega, stock limitado, "últimas unidades" ni descuentos que no aparezcan.
+- Si mencionas el envío, usa exactamente los importes de los datos de la tienda.
+- Español de España, tono motero cercano.
 
 Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
 {"hook": "primera frase para enganchar en los 2 primeros segundos",
@@ -55,17 +161,15 @@ Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
  "script": "guion corto plano por escenas para grabar el vídeo o para el carrusel (3-5 pasos)",
  "hashtags": "6-8 hashtags separados por espacio, mezcla de nicho moto y genéricos de España"}`;
 
-  const text = await geminiGenerateText(prompt);
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('Gemini no devolvió JSON parseable: ' + text.slice(0, 200));
-  const parsed = JSON.parse(jsonMatch[0]);
-  return {
-    hook: parsed.hook || '',
-    copy: parsed.copy || '',
-    script: parsed.script || '',
-    hashtags: parsed.hashtags || '',
-  };
+  try {
+    return { ...parseCopy(await geminiGenerateText(prompt)), engine: 'gemini' };
+  } catch (err: any) {
+    console.warn('[SOCIAL CONTENT] Gemini texto falló, uso MiniMax:', err.message);
+    return { ...parseCopy(await minimaxGenerateText(prompt)), engine: 'minimax' };
+  }
 }
+
+// ---------------------------------------------------------------- imágenes
 
 async function saveBufferAsFile(buffer: Buffer, ext: string): Promise<string> {
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
@@ -73,63 +177,101 @@ async function saveBufferAsFile(buffer: Buffer, ext: string): Promise<string> {
   return `/uploads/social-content/${filename}`;
 }
 
-/** Imagen con Gemini (Nano Banana Pro). Devuelve la ruta local servida por /uploads. */
-async function geminiGenerateImage(prompt: string): Promise<string> {
+/** Lee una foto del catálogo (ruta /uploads local o URL) para usarla de referencia. */
+async function loadImage(src: string): Promise<{ data: string; mime: string } | null> {
+  try {
+    if (src.startsWith('/uploads/')) {
+      const file = path.join(process.cwd(), src.replace(/^\/+/, ''));
+      if (!file.startsWith(path.join(process.cwd(), 'uploads'))) return null;
+      const buf = fs.readFileSync(file);
+      const ext = path.extname(file).slice(1).toLowerCase();
+      return { data: buf.toString('base64'), mime: ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg' };
+    }
+    if (/^https?:\/\//.test(src)) {
+      const r = await fetch(src, { signal: AbortSignal.timeout(15_000) });
+      if (!r.ok) return null;
+      return { data: Buffer.from(await r.arrayBuffer()).toString('base64'), mime: r.headers.get('content-type') || 'image/jpeg' };
+    }
+  } catch { /* sin referencia */ }
+  return null;
+}
+
+/** Imagen con Gemini, con la foto real del producto como referencia si la hay. */
+async function geminiGenerateImage(prompt: string, reference: { data: string; mime: string } | null): Promise<string> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada');
+  const parts: any[] = [{ text: prompt }];
+  if (reference) parts.push({ inlineData: { mimeType: reference.mime, data: reference.data } });
   const res = await fetch(`${GEMINI_BASE}/models/gemini-3-pro-image:generateContent?key=${GEMINI_API_KEY}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    body: JSON.stringify({ contents: [{ parts }] }),
+    signal: AbortSignal.timeout(90_000),
   });
-  if (!res.ok) throw new Error(`Gemini image error ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Gemini imagen ${res.status}`);
   const data: any = await res.json();
   const part = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData?.data);
   if (!part) throw new Error('Gemini no devolvió imagen');
-  const buffer = Buffer.from(part.inlineData.data, 'base64');
-  return saveBufferAsFile(buffer, 'png');
+  return saveBufferAsFile(Buffer.from(part.inlineData.data, 'base64'), 'png');
 }
 
-/** Alternativa de imagen con Minimax (confirmado disponible en el plan actual). */
+/** Imagen solo a partir de texto con MiniMax (sin producto: escena genérica sin marcas). */
 async function minimaxGenerateImage(prompt: string): Promise<string> {
-  if (!MINIMAX_API_KEY) throw new Error('MINIMAX_API_KEY no configurada');
+  if (!process.env.MINIMAX_API_KEY) throw new Error('MINIMAX_API_KEY no configurada');
   const res = await fetch('https://api.minimax.io/v1/image_generation', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${MINIMAX_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'image-01', prompt, n: 1 }),
+    headers: { Authorization: `Bearer ${process.env.MINIMAX_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'image-01', prompt, n: 1, aspect_ratio: '9:16' }),
+    signal: AbortSignal.timeout(90_000),
   });
-  if (!res.ok) throw new Error(`Minimax image error ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`MiniMax imagen ${res.status}`);
   const data: any = await res.json();
   const url = data?.data?.image_urls?.[0];
-  if (!url) throw new Error('Minimax no devolvió imagen: ' + JSON.stringify(data).slice(0, 200));
+  if (!url) throw new Error('MiniMax no devolvió imagen');
   const imgRes = await fetch(url);
-  const buffer = Buffer.from(await imgRes.arrayBuffer());
-  return saveBufferAsFile(buffer, 'jpg');
+  return saveBufferAsFile(Buffer.from(await imgRes.arrayBuffer()), 'jpg');
 }
 
-/** Genera 1 imagen (foto) o varias (carrusel), con Minimax como respaldo si Gemini falla. */
-export async function generateImages(opts: { format: string; topic?: string; script?: string }): Promise<string[]> {
-  const count = opts.format === 'carousel' ? 4 : 1;
-  const basePrompt = `Fotografía publicitaria realista para TikTok, estilo producto de alto
-rendimiento para motos (escapes, cascos o ropa técnica), fondo de garaje/taller
-o carretera, buena luz, sin texto superpuesto. Tema: ${opts.topic || 'producto destacado'}.
-${opts.script ? `Contexto del guion: ${opts.script}` : ''}`;
+/**
+ * Imágenes del hueco. Con producto: sus fotos reales (1 para foto/vídeo, hasta
+ * 4 para carrusel) y, si Gemini responde, una escena de ambiente al principio
+ * hecha a partir de la foto real. Sin producto: escenas genéricas sin marcas.
+ */
+export async function generateImages(opts: { format: string; topic?: string | null; script?: string; product: SlotProduct | null }): Promise<{ urls: string[]; notes: string[] }> {
+  const notes: string[] = [];
+  const p = opts.product;
+  const scene = `Fotografía publicitaria realista en vertical (9:16) para TikTok, fondo de garaje/taller o carretera de
+montaña, buena luz, sin texto superpuesto. ${opts.topic ? `Enfoque: ${opts.topic}.` : ''}`;
 
+  if (p && p.images.length) {
+    const real = p.images.slice(0, opts.format === 'carousel' ? 4 : 1);
+    let ambient: string | null = null;
+    const reference = await loadImage(p.images[0]);
+    if (reference) {
+      try {
+        ambient = await geminiGenerateImage(
+          `${scene}\nColoca EXACTAMENTE el producto de la foto adjunta (${p.brand} ${p.name}) en la escena, sin cambiar su forma, colores ni logotipos.`,
+          reference);
+      } catch (err: any) {
+        notes.push('No se pudo crear la imagen de ambiente (Gemini no responde); se usan las fotos reales del producto.');
+        console.warn('[SOCIAL CONTENT] imagen de ambiente:', err.message);
+      }
+    }
+    return { urls: ambient ? [ambient, ...real].slice(0, Math.max(real.length, opts.format === 'carousel' ? 4 : 2)) : real, notes };
+  }
+
+  // Sin producto: escenas genéricas, nunca marcas ni modelos inventados.
+  const count = opts.format === 'carousel' ? 3 : 1;
   const urls: string[] = [];
   for (let i = 0; i < count; i++) {
-    const prompt = count > 1 ? `${basePrompt}\nEscena ${i + 1} de ${count} del carrusel, ángulo distinto.` : basePrompt;
+    const prompt = `${scene}\nMotos y equipamiento genéricos, sin logotipos ni marcas visibles.${count > 1 ? ` Escena ${i + 1} de ${count}, ángulo distinto.` : ''}`;
     try {
-      urls.push(await geminiGenerateImage(prompt));
-    } catch (err: any) {
-      console.error('[SOCIAL CONTENT] Gemini image failed, falling back to Minimax:', err.message);
-      urls.push(await minimaxGenerateImage(prompt));
+      urls.push(await geminiGenerateImage(prompt, null));
+    } catch {
+      try { urls.push(await minimaxGenerateImage(prompt)); } catch (err: any) {
+        notes.push('No se pudo generar alguna imagen.');
+        console.warn('[SOCIAL CONTENT] imagen genérica:', err.message);
+      }
     }
   }
-  return urls;
-}
-
-/** Genera copy + imágenes para un slot completo del calendario. */
-export async function generateFullContent(opts: { format: string; topic?: string; productSku?: string }) {
-  const copy = await generateCopy(opts);
-  const mediaUrls = await generateImages({ format: opts.format, topic: opts.topic, script: copy.script });
-  return { copy, mediaUrls };
+  return { urls, notes };
 }

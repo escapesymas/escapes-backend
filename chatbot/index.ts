@@ -24,7 +24,7 @@ interface ChatUser {
 // que el asistente nunca dé otros importes. Se refresca cada 10 min.
 let policyCache: { at: number; text: string } | null = null;
 
-async function storePolicies(): Promise<string> {
+export async function storePolicies(): Promise<string> {
   if (policyCache && Date.now() - policyCache.at < 10 * 60_000) return policyCache.text;
   let shipping = 'Los gastos de envío se calculan en el carrito según el destino.';
   try {
