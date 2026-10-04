@@ -64,7 +64,7 @@ function humanSupportRules(status: SupportStatus): string {
   if (status.available) {
     return `ATENCIÓN HUMANA: ahora hay un asesor conectado (${status.agentName}). Si no puedes resolver la consulta con los datos que tienes (incidencia con un pedido, devolución o garantía concreta, duda técnica sin datos suficientes, queja, presupuesto especial) o el cliente pide hablar con una persona, díselo en una frase, ofrécele hablar con un asesor y termina tu respuesta con la marca [[ASESOR]] (el cliente verá un botón para hablar con él). No uses la marca si has resuelto la duda.`;
   }
-  return `ATENCIÓN HUMANA: ahora no hay asesores conectados. Horario del chat con asesor: ${status.hoursText}.${status.nextOpen ? ` Volvemos ${status.nextOpen}.` : ''} Si no puedes resolver la consulta o pide hablar con una persona, explícale el horario y que también puede escribir a info@escapesymas.com. No uses ninguna marca.`;
+  return `ATENCIÓN HUMANA: ahora no hay asesores conectados. Horario del chat con asesor: ${status.hoursText}.${status.nextOpen ? ` Volvemos ${status.nextOpen}.` : ''} Si no puedes resolver la consulta o pide hablar con una persona, explícale el horario y ofrécele dejar aquí su mensaje: un asesor le responderá en cuanto se conecte y le avisaremos con una notificación y por email. En ese caso termina tu respuesta con la marca [[MENSAJE]] (verá un botón para dejarlo).`;
 }
 
 function buildSystemPrompt(userContext: string, catalogContext: string, ordersContext: string, policies: string, webSearchText = '', humanRules = ''): string {
@@ -130,8 +130,8 @@ function stripThinking(text: string): string {
   return encoded.replace(re, '').replace(/\s{2,}/g, ' ').trim();
 }
 
-const ADVISOR_RE = /\[\[\s*ASESOR\s*\]\]/i;
-const ADVISOR_RE_G = /\s*\[\[\s*ASESOR\s*\]\]\s*/gi;
+const ADVISOR_RE = /\[\[\s*(ASESOR|MENSAJE)\s*\]\]/i;
+const ADVISOR_RE_G = /\s*\[\[\s*(ASESOR|MENSAJE)\s*\]\]\s*/gi;
 const ASKS_HUMAN_RE = /\b(hablar|habla|contactar|pasar|atender|atienda|llamar|chatear)\b.{0,30}\b(persona|humano|humana|asesor|asesora|agente|alguien|empleado|operador|operadora|encargado|dependiente|vendedor)\b|\b(asesor|persona real|humano)\b\s*[?!.]*$/i;
 const CJK_RE = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]+/g;
 
@@ -325,7 +325,9 @@ export async function chatHandler(req: Request, res: Response) {
       send({ delta: '…' });
     }
 
+    // Con asesor disponible, botón «Hablar con un asesor»; sin él, «Dejar un mensaje».
     if (offerHuman && support?.available) send({ offerHuman: true, agentName: support.agentName });
+    else if (offerHuman && support && support.mode !== 'off') send({ offerMessage: true, hoursText: support.hoursText, nextOpen: support.nextOpen });
 
     send({ done: true });
     res.end();

@@ -50,6 +50,7 @@ import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
 import { liveChatRouter, linkChatOrder, chatOrderPaid, proposalOverrides } from './routes/liveChatRoutes.js';
 import { agentRouter } from './routes/agentRoutes.js';
+import { chatToolsRouter, startChatJobs } from './routes/chatToolsRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -708,6 +709,7 @@ app.use('/api', adminRouter);
 app.use('/api', pushRouter);
 app.use('/api', liveChatRouter);
 app.use('/api', agentRouter);
+app.use('/api', chatToolsRouter);
 
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
 // /uploads se sirve como estático en el mismo origen, así que nunca se debe
@@ -7000,6 +7002,8 @@ async function bootstrapCatalogCsv(): Promise<void> {
 app.use(sentryErrorHandler());
 
 app.listen(PORT, () => {
+  // Tareas del chat con asesor: cierre por inactividad y recordatorio de pedidos sin pagar.
+  startChatJobs();
   console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║  🏍️  ESCAPES Y MÁS — Backend API v1.0              ║

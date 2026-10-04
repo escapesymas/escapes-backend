@@ -13,7 +13,7 @@ import { authenticateRequest } from '../utils.js';
 import {
   supportStatus, getSupportSettings, saveSupportSettings, currentConversation, messagesAfter, addMessage,
   closeStaleConversations, agentNameFor, setAgentName, welcomeText, DEFAULT_WELCOME, type ChatMessageKind,
-  isAgentOnline, setAgentOnline,
+  isAgentOnline, setAgentOnline, setAgentPaused, isAgentPaused,
 } from '../lib/live-chat.js';
 import { quoteOrder, type PriceOverride } from '../lib/order-pricing.js';
 import { productEconomics, maxDiscountPct, discountedCents, commissionCents, COMMISSION_HOLD_DAYS } from '../lib/chat-commission.js';
@@ -26,9 +26,9 @@ import { sendTemplatedEmail } from '../lib/email.js';
 export const liveChatRouter = Router();
 
 const PUBLIC_URL = (process.env.PUBLIC_BASE_URL || 'https://escapesymas.com').replace(/\/$/, '');
-const clean = (v: unknown, max = 2000) => String(v ?? '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').trim().slice(0, max);
+export const clean = (v: unknown, max = 2000) => String(v ?? '').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').trim().slice(0, max);
 
-function customer(req: any, res: any): { user_id: number; email?: string } | null {
+export function customer(req: any, res: any): { user_id: number; email?: string } | null {
   const auth = authenticateRequest(req);
   if (!auth?.user_id) {
     res.status(401).json({ error: 'Inicia sesión para hablar con un asesor.' });
@@ -41,7 +41,7 @@ function customer(req: any, res: any): { user_id: number; email?: string } | nul
  * Asesor con acceso a una conversación: el administrador a todas; un asesor a
  * las suyas y a las que nadie atiende todavía (para cogerlas).
  */
-async function agentFor(req: any, res: any, conversationId?: number | null): Promise<AgentAuth | null> {
+export async function agentFor(req: any, res: any, conversationId?: number | null): Promise<AgentAuth | null> {
   const a = await requireAgent(req, res);
   if (!a) return null;
   if (conversationId && !a.isAdmin) {
@@ -58,7 +58,7 @@ async function agentFor(req: any, res: any, conversationId?: number | null): Pro
 /** Conversaciones que ve un asesor (SQL sobre el alias c). */
 const scopeSql = (a: AgentAuth) => (a.isAdmin ? 'TRUE' : `(c.agent_user_id = ${Number(a.user_id)} OR (c.agent_user_id IS NULL AND c.status <> 'closed'))`);
 
-async function customerName(userId: number): Promise<{ name: string; email: string }> {
+export async function customerName(userId: number): Promise<{ name: string; email: string }> {
   const { rows } = await pool.query(`SELECT first_name, last_name, email FROM users WHERE id = $1`, [userId]);
   const u = rows[0] || {};
   return { name: [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || u.email || `Cliente ${userId}`, email: u.email || '' };
@@ -88,8 +88,9 @@ liveChatRouter.get('/chat/live', async (req: any, res: any) => {
       await pool.query(`UPDATE chat_conversations SET customer_seen_at = NOW() WHERE id = $1`, [conv.id]);
     }
 
-    // Si nadie ha contestado en 5 minutos, se le avisa una vez de que puede tardar.
-    if (conv.status === 'waiting' && Date.now() - new Date(conv.created_at).getTime() > 5 * 60_000) {
+    // Si nadie ha contestado en 5 minutos, se le avisa una vez de que puede tardar
+    // (los mensajes de fuera de horario ya llevan su propio aviso).
+    if (conv.status === 'waiting' && !conv.offline && Date.now() - new Date(conv.created_at).getTime() > 5 * 60_000) {
       const { rows } = await pool.query(
         `SELECT 1 FROM chat_messages WHERE conversation_id = $1 AND sender = 'system' AND content LIKE 'Seguimos%' LIMIT 1`, [conv.id]);
       if (!rows.length) {
@@ -99,9 +100,28 @@ liveChatRouter.get('/chat/live', async (req: any, res: any) => {
     }
     const after = parseInt(String(req.query.after || '0'), 10) || 0;
     const status = await supportStatus();
+    const messages = await messagesAfter(conv.id, after);
+    // «Visto»: hasta qué mensaje ha leído el cliente (con la ventana del chat abierta).
+    if (req.query.active === '1' && messages.length) {
+      await pool.query(`UPDATE chat_conversations SET customer_read_id = GREATEST(customer_read_id, $2) WHERE id = $1`,
+        [conv.id, messages[messages.length - 1].id]);
+    }
+    // Posición en la cola mientras nadie la atiende.
+    let queuePosition: number | null = null;
+    if (conv.status === 'waiting' && conv.agent_user_id == null) {
+      const { rows: [q] } = await pool.query(
+        `SELECT count(*)::int + 1 AS pos FROM chat_conversations
+         WHERE status = 'waiting' AND agent_user_id IS NULL AND created_at < $1`, [conv.created_at]);
+      queuePosition = q.pos;
+    }
     res.json({
-      conversation: { id: conv.id, status: conv.status, closedBy: conv.closed_by, agentName: conv.agent_name || status.agentName },
-      messages: await messagesAfter(conv.id, after),
+      conversation: {
+        id: conv.id, status: conv.status, closedBy: conv.closed_by, agentName: conv.agent_name || status.agentName,
+        offline: !!conv.offline, rated: conv.rating != null, queuePosition,
+        agentTyping: !!conv.agent_typing_at && Date.now() - new Date(conv.agent_typing_at).getTime() < 6000,
+        agentReadId: Number(conv.agent_read_id) || 0,
+      },
+      messages,
     });
   } catch (err: any) {
     console.error('[LIVE CHAT] live:', err.message);
@@ -119,15 +139,19 @@ liveChatRouter.post('/chat/handoff', async (req: any, res: any) => {
     if (existing && existing.status !== 'closed') {
       return res.json({ conversation: { id: existing.id, status: existing.status, agentName: status.agentName } });
     }
-    if (!status.available) {
+    // Sin asesores: el cliente puede dejar su mensaje (offline) y se le responde
+    // en cuanto alguien se conecte, con notificación y email.
+    const offline = !status.available;
+    if (offline && req.body?.offline !== true) {
       return res.status(409).json({
+        code: 'unavailable',
         error: `Ahora mismo no hay asesores conectados. Horario: ${status.hoursText}.` +
-          `${status.nextOpen ? ` Volvemos ${status.nextOpen}.` : ''} También puedes escribir a info@escapesymas.com.`,
+          `${status.nextOpen ? ` Volvemos ${status.nextOpen}.` : ''} Puedes dejarnos tu mensaje y te responderemos en cuanto podamos.`,
       });
     }
 
     const { rows: [conv] } = await pool.query(
-      `INSERT INTO chat_conversations (user_id) VALUES ($1) RETURNING id, status`, [auth.user_id]);
+      `INSERT INTO chat_conversations (user_id, offline) VALUES ($1, $2) RETURNING id, status`, [auth.user_id, offline]);
     // La conversación previa con el asistente, para que el asesor tenga el contexto.
     const transcript: any[] = Array.isArray(req.body?.messages) ? req.body.messages.slice(-20) : [];
     for (const m of transcript) {
@@ -135,13 +159,16 @@ liveChatRouter.post('/chat/handoff', async (req: any, res: any) => {
       if (!content || (m?.role !== 'user' && m?.role !== 'assistant')) continue;
       await addMessage(conv.id, m.role === 'user' ? 'customer' : 'ai', content);
     }
-    await addMessage(conv.id, 'system', 'Has pedido hablar con un asesor. Te atenderemos en breve.');
+    await addMessage(conv.id, 'system', offline
+      ? `Ahora no hay asesores conectados (horario: ${status.hoursText}). Escríbenos aquí tu consulta: te responderemos ` +
+        `en cuanto un asesor se conecte y te avisaremos con una notificación y por email.`
+      : 'Has pedido hablar con un asesor. Te atenderemos en breve.');
 
     const who = await customerName(auth.user_id);
     const lastQuestion = [...transcript].reverse().find((m) => m?.role === 'user');
     notifyLiveChat({
       conversationId: conv.id,
-      title: `💬 ${who.name} quiere hablar con un asesor`,
+      title: offline ? `📩 ${who.name} ha dejado un mensaje` : `💬 ${who.name} quiere hablar con un asesor`,
       body: clean(lastQuestion?.content, 160) || 'Nueva conversación en el chat de la web.',
     }).catch(() => {});
     await pool.query(`UPDATE chat_conversations SET last_push_at = NOW() WHERE id = $1`, [conv.id]);
@@ -164,7 +191,9 @@ liveChatRouter.post('/chat/live/message', async (req: any, res: any) => {
     const msg = await addMessage(conv.id, 'customer', content);
 
     // Aviso al móvil con cada mensaje (se agrupan en la notificación de la conversación).
-    await pool.query(`UPDATE chat_conversations SET customer_seen_at = NOW(), last_push_at = NOW() WHERE id = $1`, [conv.id]);
+    await pool.query(
+      `UPDATE chat_conversations SET customer_seen_at = NOW(), last_push_at = NOW(), inactivity_warned_at = NULL, customer_typing_at = NULL
+       WHERE id = $1`, [conv.id]);
     const who = await customerName(auth.user_id);
     notifyLiveChat({ conversationId: conv.id, title: `💬 ${who.name}`, body: content.slice(0, 160), agentUserId: conv.agent_user_id }).catch(() => {});
     res.json({ message: msg });
@@ -372,7 +401,8 @@ liveChatRouter.get('/admin/chats/:id', async (req: any, res: any) => {
   try {
     const { rows: [conv] } = await pool.query(
       `UPDATE chat_conversations SET admin_seen_at = NOW() WHERE id = $1
-       RETURNING id, user_id, status, created_at, closed_by, customer_seen_at, agent_user_id, agent_name`, [id]);
+       RETURNING id, user_id, status, created_at, closed_by, customer_seen_at, agent_user_id, agent_name,
+                 offline, summary, rating, rating_comment, customer_typing_at, customer_read_id`, [id]);
     if (!conv) return res.status(404).json({ error: 'Conversación no encontrada' });
     const after = parseInt(String(req.query.after || '0'), 10) || 0;
     const [messages, who, orders, garage] = await Promise.all([
@@ -388,10 +418,17 @@ liveChatRouter.get('/admin/chats/:id', async (req: any, res: any) => {
     const { rows: chatOrders } = await pool.query(
       `SELECT co.id, co.created_at, co.estimate_commission_cents, co.commission_cents, co.order_id, o.status AS order_status
        FROM chat_orders co LEFT JOIN orders o ON o.id = co.order_id WHERE co.conversation_id = $1 ORDER BY co.id DESC LIMIT 5`, [id]);
+    if (messages.length) {
+      await pool.query(`UPDATE chat_conversations SET agent_read_id = GREATEST(agent_read_id, $2) WHERE id = $1`,
+        [id, messages[messages.length - 1].id]);
+    }
+    const { customer_typing_at: typingAt, ...rest } = conv;
     res.json({
       conversation: {
-        ...conv,
+        ...rest,
         customerOnline: Date.now() - new Date(conv.customer_seen_at).getTime() < 45_000,
+        customerTyping: !!typingAt && Date.now() - new Date(typingAt).getTime() < 6000,
+        customerReadId: Number(conv.customer_read_id) || 0,
         customer: who, orders, garage, chatOrders,
       },
       messages,
@@ -410,14 +447,14 @@ const ORDER_STATUS_ES: Record<string, string> = {
   delivered: 'entregado', completed: 'completado', cancelled: 'cancelado', refunded: 'reembolsado',
   partially_refunded: 'reembolso parcial',
 };
-const PAID_STATUSES = ['paid', 'processing', 'shipped', 'delivered', 'completed', 'partially_refunded'];
+export const PAID_STATUSES = ['paid', 'processing', 'shipped', 'delivered', 'completed', 'partially_refunded'];
 
 /**
  * Asigna la conversación al asesor si aún no la atiende nadie y envía la
  * bienvenida con su nombre. Devuelve la bienvenida (si se ha enviado).
  */
 /** Un asesor solo atiende un chat a la vez (el administrador, los que quiera). */
-class AgentBusyError extends Error {
+export class AgentBusyError extends Error {
   constructor() { super('Ya estás atendiendo un chat: ciérralo antes de coger otro.'); }
 }
 
@@ -427,7 +464,7 @@ class AgentBusyError extends Error {
  * asesor con otro chat abierto no puede cogerla (AgentBusyError); la
  * comprobación va en la misma sentencia para que no se cuele con dos clics.
  */
-async function ensureTaken(conversationId: number, agent: AgentAuth) {
+export async function ensureTaken(conversationId: number, agent: AgentAuth) {
   const name = await agentNameFor(agent.user_id);
   const { rows: [conv] } = await pool.query(
     `UPDATE chat_conversations SET agent_user_id = $2, agent_name = $3, status = 'open', taken_at = COALESCE(taken_at, NOW())
@@ -445,11 +482,13 @@ async function ensureTaken(conversationId: number, agent: AgentAuth) {
   const settings = await getSupportSettings();
   const who = await customerName(conv.user_id);
   const firstName = who.name.includes('@') ? '' : who.name.split(' ')[0];
+  // Resumen de la IA para el asesor (en segundo plano).
+  import('./chatToolsRoutes.js').then((m) => m.generateSummary(conversationId)).catch(() => {});
   return addMessage(conversationId, 'agent', welcomeText(settings.welcomeTemplate || DEFAULT_WELCOME, firstName, name));
 }
 
 /** Avisa al cliente de un mensaje del asesor: push si no está mirando y email si se ha ido. */
-async function notifyCustomer(conv: any, agentName: string, preview: string) {
+export async function notifyCustomer(conv: any, agentName: string, preview: string) {
   const sinceSeen = Date.now() - new Date(conv.customer_seen_at).getTime();
   if (sinceSeen > 8_000) {
     sendPushToUser(conv.user_id, {
@@ -476,7 +515,9 @@ async function agentSend(
   const adminUserId = agent.user_id;
   const welcome = await ensureTaken(conversationId, agent);
   const { rows: [conv] } = await pool.query(
-    `UPDATE chat_conversations SET admin_seen_at = NOW() WHERE id = $1 AND status <> 'closed'
+    `UPDATE chat_conversations SET admin_seen_at = NOW(), first_response_at = COALESCE(first_response_at, NOW()),
+            agent_typing_at = NULL
+     WHERE id = $1 AND status <> 'closed'
      RETURNING id, user_id, agent_name, customer_seen_at, last_email_at`, [conversationId]);
   if (!conv) return null;
   const msg = await addMessage(conversationId, 'agent', content, kind, payload);
@@ -555,7 +596,7 @@ async function priceProposal(rawItems: any[], strict: boolean) {
   return { lines, overrides, quote, commissionTotal, errors };
 }
 
-const parseId = (v: unknown) => { const n = parseInt(String(v), 10); return Number.isFinite(n) && n > 0 ? n : null; };
+export const parseId = (v: unknown) => { const n = parseInt(String(v), 10); return Number.isFinite(n) && n > 0 ? n : null; };
 
 // POST /api/admin/chats/:id/take — atender: se asigna al asesor y se envía la bienvenida.
 liveChatRouter.post('/admin/chats/:id/take', async (req: any, res: any) => {
@@ -617,8 +658,8 @@ liveChatRouter.post('/admin/chats/:id/product', async (req: any, res: any) => {
 });
 
 // POST /api/admin/chats/:id/image (multipart «image») — foto de la galería o pegada.
-const CHAT_UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'chat');
-const imageUpload = multer({
+export const CHAT_UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'chat');
+export const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 12 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => cb(null, /^image\/(jpeg|png|webp|gif|heic|heif|avif)$/.test(file.mimetype)),
@@ -963,6 +1004,7 @@ liveChatRouter.get('/admin/support-settings', async (req: any, res: any) => {
     status: await supportStatus(),
     myAgentName: await agentNameFor(auth.user_id),
     myOnline: await isAgentOnline(auth.user_id),
+    myPaused: await isAgentPaused(auth.user_id),
     isAdmin: auth.isAdmin,
     myUserId: auth.user_id,
   });
@@ -973,9 +1015,27 @@ liveChatRouter.post('/admin/agent-status', async (req: any, res: any) => {
   const auth = await requireAgent(req, res);
   if (!auth) return;
   try {
+    const wasAvailable = (await isAgentOnline(auth.user_id)) && !(await isAgentPaused(auth.user_id));
     if (typeof req.body?.online === 'boolean') await setAgentOnline(auth.user_id, req.body.online);
+    if (typeof req.body?.paused === 'boolean') await setAgentPaused(auth.user_id, req.body.paused);
     if (typeof req.body?.name === 'string') await setAgentName(auth.user_id, req.body.name);
-    res.json({ myOnline: await isAgentOnline(auth.user_id), myAgentName: await agentNameFor(auth.user_id), status: await supportStatus() });
+    const online = await isAgentOnline(auth.user_id);
+    const paused = await isAgentPaused(auth.user_id);
+    // Al conectarse: si hay clientes esperando (p. ej. mensajes de fuera de horario), aviso.
+    let waiting = 0;
+    if (online && !paused && !wasAvailable) {
+      const { rows: [w] } = await pool.query(
+        `SELECT count(*)::int AS n FROM chat_conversations WHERE status = 'waiting' AND agent_user_id IS NULL`);
+      waiting = w.n;
+      if (waiting > 0) {
+        sendPushToUser(auth.user_id, {
+          title: `📩 ${waiting} cliente${waiting === 1 ? '' : 's'} esperando`,
+          body: 'Tienes conversaciones sin atender en el chat.',
+          url: '/?tab=chat', tag: 'chat-waiting',
+        }).catch(() => {});
+      }
+    }
+    res.json({ myOnline: online, myPaused: paused, waiting, myAgentName: await agentNameFor(auth.user_id), status: await supportStatus() });
   } catch (err: any) {
     console.error('[LIVE CHAT] agent-status:', err.message);
     res.status(500).json({ error: 'No se pudo guardar' });

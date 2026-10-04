@@ -381,7 +381,7 @@ export async function notifyLiveChat(info: { conversationId: number; title: stri
       // Conversación nueva: a los asesores conectados y libres (un chat a la vez).
       : await pool.query(
         `SELECT u.id FROM users u JOIN chat_agents a ON a.user_id = u.id
-         WHERE u.role = 'asesor' AND a.online
+         WHERE u.role = 'asesor' AND a.online AND NOT a.paused
            AND NOT EXISTS (SELECT 1 FROM chat_conversations c WHERE c.agent_user_id = u.id AND c.status <> 'closed')`);
     await Promise.all(rows.map((r: any) => sendPushToUser(r.id, {
       title: info.title, body: info.body, url, tag: `chat-${info.conversationId}`,

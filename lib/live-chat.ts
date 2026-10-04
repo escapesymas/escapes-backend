@@ -152,9 +152,10 @@ export async function supportStatus(date = new Date()): Promise<SupportStatus> {
 
 /** Asesores (y administradores) conectados para atender el chat. */
 export async function onlineAgentIds(): Promise<number[]> {
+  // En pausa no cuenta: sigue con su chat pero no recibe clientes nuevos.
   const { rows } = await pool.query(
     `SELECT a.user_id FROM chat_agents a JOIN users u ON u.id = a.user_id
-     WHERE a.online AND u.role IN ('admin', 'asesor')`);
+     WHERE a.online AND NOT a.paused AND u.role IN ('admin', 'asesor')`);
   return rows.map((r: any) => Number(r.user_id));
 }
 
@@ -164,9 +165,21 @@ export async function isAgentOnline(userId: number): Promise<boolean> {
 }
 
 export async function setAgentOnline(userId: number, online: boolean): Promise<void> {
+  // Conectarse o desconectarse quita la pausa.
   await pool.query(
-    `INSERT INTO chat_agents (user_id, online, updated_at) VALUES ($1, $2, NOW())
-     ON CONFLICT (user_id) DO UPDATE SET online = EXCLUDED.online, updated_at = NOW()`, [userId, online]);
+    `INSERT INTO chat_agents (user_id, online, paused, updated_at) VALUES ($1, $2, FALSE, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET online = EXCLUDED.online, paused = FALSE, updated_at = NOW()`, [userId, online]);
+}
+
+export async function setAgentPaused(userId: number, paused: boolean): Promise<void> {
+  await pool.query(
+    `INSERT INTO chat_agents (user_id, online, paused, updated_at) VALUES ($1, TRUE, $2, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET online = TRUE, paused = EXCLUDED.paused, updated_at = NOW()`, [userId, paused]);
+}
+
+export async function isAgentPaused(userId: number): Promise<boolean> {
+  const { rows } = await pool.query(`SELECT paused FROM chat_agents WHERE user_id = $1`, [userId]);
+  return !!rows[0]?.paused;
 }
 
 /** Nombre de un asesor en el chat: el que haya puesto, su nombre de pila o el genérico. */
@@ -218,7 +231,8 @@ export interface ChatMessageRow {
 /** Conversación abierta del cliente (o la última cerrada hace menos de 2 h, para que vea el cierre). */
 export async function currentConversation(userId: number) {
   const { rows } = await pool.query(
-    `SELECT id, status, created_at, taken_at, closed_at, closed_by, agent_user_id, agent_name FROM chat_conversations
+    `SELECT id, status, created_at, taken_at, closed_at, closed_by, agent_user_id, agent_name, offline, rating,
+            agent_typing_at, agent_read_id FROM chat_conversations
      WHERE user_id = $1 AND (status <> 'closed' OR closed_at > NOW() - INTERVAL '2 hours')
      ORDER BY (status <> 'closed') DESC, id DESC LIMIT 1`,
     [userId],
@@ -252,7 +266,10 @@ export async function addMessage(
 export async function closeStaleConversations() {
   const { rows } = await pool.query(
     `UPDATE chat_conversations SET status = 'closed', closed_at = NOW(), closed_by = 'auto'
-     WHERE status <> 'closed' AND updated_at < NOW() - INTERVAL '24 hours' RETURNING id`,
+     WHERE status <> 'closed' AND updated_at < NOW() - INTERVAL '24 hours'
+       -- Los mensajes dejados fuera de horario esperan hasta 7 días (fines de semana, festivos).
+       AND NOT (offline AND status = 'waiting' AND updated_at > NOW() - INTERVAL '7 days')
+     RETURNING id`,
   );
   for (const r of rows) {
     await addMessage(r.id, 'system', 'Conversación cerrada por inactividad.').catch(() => {});
