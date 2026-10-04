@@ -5880,7 +5880,8 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
       await cacheBust('cache:filters');
     }
 
-    res.json({ success: true, orderId: parsedOrderId, alreadyProcessed: !transitioned });
+    // totalCents: para registrar la compra con su importe en las estadísticas (Umami).
+    res.json({ success: true, orderId: parsedOrderId, alreadyProcessed: !transitioned, totalCents: expectedCents });
   } catch (err: any) {
     console.error('[ORDER FINALIZE ERROR]:', err);
     res.status(500).json({ error: err.message });
