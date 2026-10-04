@@ -15,9 +15,9 @@
  */
 import { pool } from '../db.js';
 
-const VAT = 1.21;
-const PAYMENT_FEE_PCT = 0.015; // Stripe, tarjetas UE
-const PAYMENT_FEE_FIXED = 25;  // céntimos
+export const VAT = 1.21;
+export const PAYMENT_FEE_PCT = 0.015; // Stripe, tarjetas UE
+export const PAYMENT_FEE_FIXED = 25;  // céntimos
 export const DEFAULT_RULE = { discount: 0, minMargin: 15 };
 
 export interface PricingRule { type: 'global' | 'category' | 'brand'; target: string | null; discount: number; minMargin: number }

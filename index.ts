@@ -48,7 +48,7 @@ import { authRouter } from './routes/auth.js';
 import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
-import { liveChatRouter, linkChatOrder, chatOrderPaid } from './routes/liveChatRoutes.js';
+import { liveChatRouter, linkChatOrder, chatOrderPaid, proposalOverrides } from './routes/liveChatRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -5465,12 +5465,13 @@ app.post('/api/shipping-estimate', async (req: any, res: any) => {
 // POST /api/cart/quote — lo que costará el pedido (mismo cálculo que al crearlo).
 app.post('/api/cart/quote', async (req: any, res: any) => {
   try {
-    const { cart, country, postcode, promoCode } = req.body || {};
+    const { cart, country, postcode, promoCode, chatProposal } = req.body || {};
     if (!Array.isArray(cart) || cart.length > 100) return res.status(400).json({ error: 'Carrito inválido' });
     const lines = cart
       .map((i: any) => ({ id: parseInt(i?.id), quantity: parseInt(i?.quantity) }))
       .filter((l: any) => Number.isInteger(l.id) && l.id > 0 && Number.isInteger(l.quantity) && l.quantity >= 1 && l.quantity <= 99);
-    const q = await quoteOrder({ cart: lines, country, postcode, promoCode });
+    const overrides = await proposalOverrides(chatProposal, req.user?.user_id ?? null);
+    const q = await quoteOrder({ cart: lines, country, postcode, promoCode, overrides });
     res.json({
       subtotal: q.subtotalCents / 100,
       discountPercent: q.discountPercent,
@@ -5528,6 +5529,8 @@ app.post('/api/orders/create', async (req: any, res: any) => {
       country: shippingData.country || 'ES',
       postcode: shippingData.postcode || shippingData.zipCode || '',
       promoCode,
+      // Descuentos pactados con un asesor del chat (solo para ese cliente).
+      overrides: await proposalOverrides(req.body?.chatProposal, dbUserId),
     };
     // Primero se valida sin gastar el cupón; solo si el pedido es válido se canjea.
     const check = await quoteOrder(quoteInput);

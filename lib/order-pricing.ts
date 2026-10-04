@@ -15,7 +15,13 @@ export const ORDER_TIERS = [
 const DEFAULT_SHIPPING_CENTS = 1999;
 
 export interface CartLine { id: number; quantity: number }
-export interface QuoteInput { cart: CartLine[]; country?: string; postcode?: string; promoCode?: string | null }
+/** Precio pactado por un asesor del chat para un producto (hasta `maxQty` unidades). */
+export interface PriceOverride { productId: number; unitCents: number; maxQty: number }
+export interface QuoteInput {
+  cart: CartLine[]; country?: string; postcode?: string; promoCode?: string | null;
+  /** Precios con descuento del asesor: no admiten descuentos por importe ni cupones. */
+  overrides?: PriceOverride[];
+}
 
 export interface Quote {
   items: { productId: number; quantity: number; price: number }[];
@@ -64,7 +70,8 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
   const byId = new Map(rows.map((r: any) => [r.id, r]));
 
   let subtotalCents = 0;
-  // Líneas en promoción (precio DTO2, el mínimo sin pérdidas): no admiten más descuentos.
+  // Líneas en promoción (precio DTO2, el mínimo sin pérdidas) o con descuento del
+  // asesor del chat: no admiten más descuentos.
   let promoCents = 0;
   const items: Quote['items'] = [];
   const stockErrors: Quote['stockErrors'] = [];
@@ -76,11 +83,22 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
     const list = Number(row.price) || 0;
     const sale = Number(row.sale_price) || 0;
     const price = Number(row.promo_price) || (sale > 0 && sale < list ? sale : list);
-    subtotalCents += price * line.quantity;
-    if (Number(row.promo_price) > 0) promoCents += price * line.quantity;
     const stock = Number(row.stock) || 0;
     if (stock < line.quantity) stockErrors.push({ id: line.id, requested: line.quantity, available: stock });
-    items.push({ productId: line.id, quantity: line.quantity, price });
+    // Unidades con el precio del asesor (las que preparó); el resto, a precio normal.
+    const ov = input.overrides?.find((o) => o.productId === line.id && o.unitCents > 0 && o.unitCents < price);
+    const ovQty = ov ? Math.min(line.quantity, ov.maxQty) : 0;
+    if (ovQty > 0) {
+      subtotalCents += ov!.unitCents * ovQty;
+      promoCents += ov!.unitCents * ovQty;
+      items.push({ productId: line.id, quantity: ovQty, price: ov!.unitCents });
+    }
+    const rest = line.quantity - ovQty;
+    if (rest > 0) {
+      subtotalCents += price * rest;
+      if (Number(row.promo_price) > 0) promoCents += price * rest;
+      items.push({ productId: line.id, quantity: rest, price });
+    }
   }
   const subtotalEur = subtotalCents / 100;
 

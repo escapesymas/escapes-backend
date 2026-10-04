@@ -14,7 +14,8 @@ import {
   supportStatus, getSupportSettings, saveSupportSettings, currentConversation, messagesAfter, addMessage,
   closeStaleConversations, agentNameFor, setAgentName, welcomeText, DEFAULT_WELCOME, type ChatMessageKind,
 } from '../lib/live-chat.js';
-import { quoteOrder } from '../lib/order-pricing.js';
+import { quoteOrder, type PriceOverride } from '../lib/order-pricing.js';
+import { productEconomics, maxDiscountPct, discountedCents, commissionCents } from '../lib/chat-commission.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
 import { searchTerms } from '../lib/catalog-query.js';
 import { notifyLiveChat, sendPushToUser, saveSubscription } from '../pushService.js';
@@ -209,8 +210,11 @@ liveChatRouter.get('/chat/proposal/:token', async (req: any, res: any) => {
     if (!co || co.status === 'cancelled') return res.status(404).json({ error: 'Este pedido ya no está disponible' });
     if (co.order_id && PAID_STATUSES.includes(co.order_status)) return res.status(409).json({ error: 'Este pedido ya está pagado' });
     const items = (await Promise.all((co.items || []).map(async (i: any) => {
-      const card = await productCard(parseInt(i.id, 10));
-      return card ? { ...card, quantity: Math.max(1, Math.min(99, parseInt(i.quantity, 10) || 1)) } : null;
+      const row = await productRow(parseInt(i.id, 10));
+      if (!row) return null;
+      const unit = Number(i.unit_cents) > 0 && Number(i.unit_cents) < row.eff ? Number(i.unit_cents) : row.eff;
+      // price = precio sin el descuento del asesor; sale_price = el pactado.
+      return { ...row.card, price: row.eff, sale_price: unit < row.eff ? unit : null, quantity: Math.max(1, Math.min(99, parseInt(i.quantity, 10) || 1)) };
     }))).filter(Boolean);
     if (!items.length) return res.status(409).json({ error: 'Los productos de este pedido ya no están disponibles' });
     res.json({ agentName: co.agent_name, items });
@@ -219,6 +223,26 @@ liveChatRouter.get('/chat/proposal/:token', async (req: any, res: any) => {
     res.status(500).json({ error: 'No se pudo cargar el pedido' });
   }
 });
+
+/**
+ * Precios pactados en un pedido del chat, para el presupuesto y la creación del
+ * pedido en el checkout. Solo para el cliente de esa conversación y mientras
+ * el pedido no esté pagado ni cancelado.
+ */
+export async function proposalOverrides(token: unknown, userId: number | null): Promise<PriceOverride[]> {
+  try {
+    if (typeof token !== 'string' || !/^[0-9a-f-]{36}$/i.test(token) || !userId) return [];
+    const { rows: [co] } = await pool.query(
+      `SELECT co.items, co.status, o.status AS order_status FROM chat_orders co LEFT JOIN orders o ON o.id = co.order_id
+       WHERE co.token = $1 AND co.user_id = $2`, [token, userId]);
+    if (!co || co.status === 'cancelled' || PAID_STATUSES.includes(co.order_status)) return [];
+    return (co.items || [])
+      .filter((i: any) => Number(i.unit_cents) > 0 && Number(i.discount) > 0)
+      .map((i: any) => ({ productId: Number(i.id), unitCents: Number(i.unit_cents), maxQty: Number(i.quantity) || 1 }));
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Al crear el pedido en el checkout con una propuesta del chat: queda ligado al
@@ -235,13 +259,24 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
     const { rows: [o] } = await pool.query(
       `UPDATE orders SET created_by_user_id = $2, sales_channel = 'chat', chat_order_id = $3 WHERE id = $1
        RETURNING total, created_at`, [orderId, co.agent_user_id, co.id]);
-    // Atribuible al asesor: sus productos (hasta la cantidad que preparó), sin el resto del carrito.
-    await pool.query(
-      `UPDATE chat_orders co SET attributed_cents = (
-         SELECT COALESCE(SUM(oi.price * LEAST(oi.quantity, p.quantity)), 0)::int
-         FROM order_items oi JOIN jsonb_to_recordset(co.items) AS p(id int, quantity int) ON p.id = oi.product_id
-         WHERE oi.order_id = $2)
-       WHERE co.id = $1`, [co.id, orderId]);
+    // Atribuible al asesor: sus productos (hasta la cantidad que preparó), sin el
+    // resto del carrito ni el envío; comisión = 50 % del margen neto de lo cobrado.
+    const { rows: [full] } = await pool.query(`SELECT items FROM chat_orders WHERE id = $1`, [co.id]);
+    const { rows: orderItems } = await pool.query(
+      `SELECT product_id, quantity, price FROM order_items WHERE order_id = $1 ORDER BY price`, [orderId]);
+    let attributed = 0;
+    let commission = 0;
+    for (const it of full?.items || []) {
+      let left = Number(it.quantity) || 0;
+      for (const oi of orderItems.filter((r: any) => Number(r.product_id) === Number(it.id))) {
+        const units = Math.min(left, Number(oi.quantity) || 0);
+        if (units <= 0) continue;
+        left -= units;
+        attributed += Number(oi.price) * units;
+        commission += (commissionCents(Number(oi.price), it.cost_cents) || 0) * units;
+      }
+    }
+    await pool.query(`UPDATE chat_orders SET attributed_cents = $2, commission_cents = $3 WHERE id = $1`, [co.id, attributed, commission]);
     if (co.conversation_id) {
       const num = formatOrderNumber(orderId, o?.created_at);
       await addMessage(co.conversation_id, 'system', `🧾 Pedido ${num} creado (${((o?.total || 0) / 100).toFixed(2).replace('.', ',')} €), pendiente de pago.`);
@@ -333,11 +368,14 @@ liveChatRouter.get('/admin/chats/:id', async (req: any, res: any) => {
         `SELECT brand, model, year FROM garage WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5`,
         [conv.user_id]).then((r) => r.rows).catch(() => []),
     ]);
+    const { rows: chatOrders } = await pool.query(
+      `SELECT co.id, co.created_at, co.estimate_commission_cents, co.commission_cents, co.order_id, o.status AS order_status
+       FROM chat_orders co LEFT JOIN orders o ON o.id = co.order_id WHERE co.conversation_id = $1 ORDER BY co.id DESC LIMIT 5`, [id]);
     res.json({
       conversation: {
         ...conv,
         customerOnline: Date.now() - new Date(conv.customer_seen_at).getTime() < 45_000,
-        customer: who, orders, garage,
+        customer: who, orders, garage, chatOrders,
       },
       messages,
     });
@@ -410,19 +448,69 @@ async function agentSend(
   return { messages: welcome ? [welcome, msg] : [msg] };
 }
 
-/** Tarjeta de producto con el precio que paga el cliente (céntimos). */
-async function productCard(productId: number) {
+/** Producto con el precio que paga el cliente (céntimos) y su coste (solo para uso interno). */
+async function productRow(productId: number) {
   const { rows: [p] } = await pool.query(
-    `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, images->0->>'src' AS image
+    `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, cost, images->0->>'src' AS image
      FROM products WHERE id = $1 AND status = 'published' AND price > 0`, [productId]);
   if (!p) return null;
   const price = Number(p.price);
   const eff = Number(p.promo_price) > 0 ? Number(p.promo_price)
     : Math.min(price, Number(p.sale_price) > 0 ? Number(p.sale_price) : price);
-  return {
+  const card = {
     id: p.id, sku: p.sku, name: p.name, brand: p.brand || '', price, sale_price: eff < price ? eff : null,
     stock: Number(p.stock) || 0, image: p.image || null, slug: p.sku, in_stock: Number(p.stock) > 0,
   };
+  return { card, eff, cost: Number(p.cost) > 0 ? Math.round(Number(p.cost)) : null };
+}
+
+/** Tarjeta de producto tal y como la ve el cliente (sin coste ni márgenes). */
+async function productCard(productId: number) {
+  return (await productRow(productId))?.card || null;
+}
+
+/** Tarjeta para el panel: con el descuento máximo y la comisión mínima/máxima por unidad. */
+async function adminProductCard(productId: number) {
+  const row = await productRow(productId);
+  return row ? { ...row.card, ...productEconomics(row.eff, row.cost) } : null;
+}
+
+/**
+ * Precios de un pedido del asesor: valida cada descuento contra el margen
+ * mínimo y calcula la comisión. `strict` rechaza descuentos por encima del
+ * máximo (al enviar); sin él se recortan (vista previa).
+ */
+async function priceProposal(rawItems: any[], strict: boolean) {
+  const lines: any[] = [];
+  const errors: string[] = [];
+  for (const raw of rawItems.slice(0, 30)) {
+    const id = parseId(raw?.id);
+    if (!id) continue;
+    const quantity = Math.max(1, Math.min(99, parseInt(raw?.quantity, 10) || 1));
+    const row = await productRow(id);
+    if (!row) { errors.push(`El producto ${id} ya no está disponible`); continue; }
+    const max = maxDiscountPct(row.eff, row.cost);
+    let discount = Math.round(Math.max(0, Number(raw?.discount) || 0) * 10) / 10;
+    if (discount > max) {
+      if (strict) errors.push(`${row.card.name}: el descuento máximo es ${String(max).replace('.', ',')} %`);
+      discount = max;
+    }
+    const unit = discountedCents(row.eff, discount);
+    const commissionUnit = commissionCents(unit, row.cost);
+    lines.push({
+      id, quantity, discount, list: row.eff, unit, cost: row.cost, max_discount_pct: max,
+      commission_unit: commissionUnit, commission: commissionUnit != null ? commissionUnit * quantity : null,
+      card: row.card,
+    });
+  }
+  const overrides: PriceOverride[] = lines
+    .filter((l) => l.unit < l.list)
+    .map((l) => ({ productId: l.id, unitCents: l.unit, maxQty: l.quantity }));
+  const quote = lines.length
+    ? await quoteOrder({ cart: lines.map((l) => ({ id: l.id, quantity: l.quantity })), country: 'ES', postcode: '28001', overrides })
+    : null;
+  const commissionTotal = lines.reduce((a, l) => a + (l.commission || 0), 0);
+  return { lines, overrides, quote, commissionTotal, errors };
 }
 
 const parseId = (v: unknown) => { const n = parseInt(String(v), 10); return Number.isFinite(n) && n > 0 ? n : null; };
@@ -526,7 +614,7 @@ liveChatRouter.get('/admin/chat-products', async (req: any, res: any) => {
       `SELECT p.id FROM products p WHERE p.status = 'published' AND p.price > 0 AND ${conds}
        ORDER BY (upper(p.sku) = upper($${terms.length + 1})) DESC, (p.stock > 0) DESC, p.name LIMIT 20`,
       [...terms.map((t) => `%${t}%`), q]);
-    const products = (await Promise.all(rows.map((r: any) => productCard(r.id)))).filter(Boolean);
+    const products = (await Promise.all(rows.map((r: any) => adminProductCard(r.id)))).filter(Boolean);
     res.json({ products });
   } catch (err: any) {
     console.error('[LIVE CHAT] products:', err.message);
@@ -548,7 +636,7 @@ liveChatRouter.get('/admin/chats/:id/cart', async (req: any, res: any) => {
     let raw: any[] = [];
     try { raw = JSON.parse(cart?.items || '[]'); } catch { raw = []; }
     const items = (await Promise.all(raw.slice(0, 50).map(async (it: any) => {
-      const card = await productCard(parseInt(it.id, 10));
+      const card = await adminProductCard(parseInt(it.id, 10));
       const quantity = Math.max(1, Math.min(99, parseInt(it.quantity, 10) || 1));
       return card ? { ...card, quantity } : { id: it.id, name: it.title || it.name || 'Producto', quantity, unavailable: true };
     })));
@@ -559,42 +647,58 @@ liveChatRouter.get('/admin/chats/:id/cart', async (req: any, res: any) => {
   }
 });
 
-// POST /api/admin/chats/:id/order { items: [{id, quantity}], note } — pedido con botón de pago.
+// POST /api/admin/chats/:id/order-preview { items: [{id, quantity, discount}] } — importes y comisión.
+liveChatRouter.post('/admin/chats/:id/order-preview', async (req: any, res: any) => {
+  if (!admin(req, res)) return;
+  try {
+    const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], false);
+    res.json({
+      lines: p.lines.map(({ card, cost, ...l }) => l),
+      quote: p.quote && {
+        subtotal: p.quote.subtotalCents, discount: p.quote.discountCents, discountPercent: p.quote.discountPercent,
+        shipping: p.quote.shippingCents, total: p.quote.totalCents,
+      },
+      commissionTotal: p.commissionTotal,
+    });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] preview:', err.message);
+    res.status(500).json({ error: 'No se pudo calcular el pedido' });
+  }
+});
+
+// POST /api/admin/chats/:id/order { items: [{id, quantity, discount}], note } — pedido con botón de pago.
 liveChatRouter.post('/admin/chats/:id/order', async (req: any, res: any) => {
   const auth = admin(req, res);
   if (!auth) return;
   const id = parseId(req.params.id);
-  const rawItems: any[] = Array.isArray(req.body?.items) ? req.body.items.slice(0, 30) : [];
-  const items = rawItems
-    .map((i) => ({ id: parseId(i?.id), quantity: Math.max(1, Math.min(99, parseInt(i?.quantity, 10) || 1)) }))
-    .filter((i): i is { id: number; quantity: number } => !!i.id);
-  if (!id || !items.length) return res.status(400).json({ error: 'Añade al menos un producto' });
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
   try {
     const { rows: [conv] } = await pool.query(`SELECT id, user_id, status FROM chat_conversations WHERE id = $1`, [id]);
     if (!conv || conv.status === 'closed') return res.status(409).json({ error: 'La conversación está cerrada.' });
-    const cards = await Promise.all(items.map((i) => productCard(i.id)));
-    if (cards.some((c) => !c)) return res.status(400).json({ error: 'Algún producto ya no está disponible' });
+    const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], true);
+    if (p.errors.length) return res.status(400).json({ error: p.errors.join(' · ') });
+    if (!p.lines.length || !p.quote) return res.status(400).json({ error: 'Añade al menos un producto' });
 
-    // Importe orientativo (Península); el definitivo sale en el checkout con su dirección.
-    const quote = await quoteOrder({ cart: items, country: 'ES', postcode: '28001' });
     const token = crypto.randomUUID();
     const agentName = await agentNameFor(auth.user_id);
     const note = clean(req.body?.note, 500);
+    const stored = p.lines.map((l) => ({ id: l.id, quantity: l.quantity, discount: l.discount, unit_cents: l.unit, list_cents: l.list, cost_cents: l.cost }));
     const { rows: [co] } = await pool.query(
-      `INSERT INTO chat_orders (token, conversation_id, user_id, agent_user_id, agent_name, items, note, estimate_cents)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-      [token, id, conv.user_id, auth.user_id, agentName, JSON.stringify(items), note || null, quote.totalCents]);
+      `INSERT INTO chat_orders (token, conversation_id, user_id, agent_user_id, agent_name, items, note, estimate_cents, estimate_commission_cents)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [token, id, conv.user_id, auth.user_id, agentName, JSON.stringify(stored), note || null, p.quote.totalCents, p.commissionTotal]);
+    // Lo que ve el cliente: productos, precio (con descuento, si lo hay) e importe orientativo.
     const payload = {
       chatOrderId: co.id,
       url: `${PUBLIC_URL}/checkout?propuesta=${token}`,
-      lines: items.map((i, k) => ({
-        id: i.id, quantity: i.quantity, name: cards[k]!.name, image: cards[k]!.image,
-        unit: cards[k]!.sale_price ?? cards[k]!.price,
+      lines: p.lines.map((l) => ({
+        id: l.id, quantity: l.quantity, name: l.card.name, image: l.card.image,
+        unit: l.unit, list: l.unit < l.list ? l.list : null, discount: l.discount || 0,
       })),
-      subtotal: quote.subtotalCents, discount: quote.discountCents, shipping: quote.shippingCents,
-      tax: quote.taxCents, total: quote.totalCents, note: note || null,
+      subtotal: p.quote.subtotalCents, discount: p.quote.discountCents, shipping: p.quote.shippingCents,
+      tax: p.quote.taxCents, total: p.quote.totalCents, note: note || null,
     };
-    const n = items.reduce((a, i) => a + i.quantity, 0);
+    const n = p.lines.reduce((a, l) => a + l.quantity, 0);
     const out = await agentSend(id, auth.user_id, 'order', note || `Pedido preparado por ${agentName}`, payload,
       `Te ha preparado un pedido (${n} producto${n === 1 ? '' : 's'}). Pulsa para revisar el envío y pagar.`);
     res.json({ ...out, chatOrderId: co.id });
@@ -611,7 +715,8 @@ liveChatRouter.get('/admin/chat-orders', async (req: any, res: any) => {
   try {
     const { rows } = await pool.query(
       `SELECT co.id, co.created_at, co.agent_user_id, co.agent_name, co.user_id, co.conversation_id,
-              co.estimate_cents, co.attributed_cents, co.order_id, o.status AS order_status, o.total AS order_total, o.paid_at, o.created_at AS order_created_at,
+              co.estimate_cents, co.attributed_cents, co.estimate_commission_cents, co.commission_cents,
+              co.order_id, o.status AS order_status, o.total AS order_total, o.paid_at, o.created_at AS order_created_at,
               NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS customer_name, u.email AS customer_email
        FROM chat_orders co
        LEFT JOIN orders o ON o.id = co.order_id
@@ -627,10 +732,16 @@ liveChatRouter.get('/admin/chat-orders', async (req: any, res: any) => {
     const byAgent = new Map<string, any>();
     for (const o of orders) {
       const key = String(o.agent_user_id ?? 'sin');
-      const a = byAgent.get(key) || { agent_user_id: o.agent_user_id, agent_name: o.agent_name, sent: 0, ordered: 0, paid: 0, paid_cents: 0 };
+      const a = byAgent.get(key) || { agent_user_id: o.agent_user_id, agent_name: o.agent_name, sent: 0, ordered: 0, paid: 0, paid_cents: 0, commission_paid: 0, commission_pending: 0 };
       a.sent++;
       if (o.order_id) a.ordered++;
-      if (o.paid) { a.paid++; a.paid_cents += Number(o.attributed_cents ?? o.order_total) || 0; }
+      if (o.paid) {
+        a.paid++;
+        a.paid_cents += Number(o.attributed_cents ?? o.order_total) || 0;
+        a.commission_paid += Number(o.commission_cents ?? o.estimate_commission_cents) || 0;
+      } else if (!['cancelled', 'refunded', 'payment_failed'].includes(o.order_status)) {
+        a.commission_pending += Number(o.commission_cents ?? o.estimate_commission_cents) || 0;
+      }
       byAgent.set(key, a);
     }
     res.json({ month, orders, agents: [...byAgent.values()] });
