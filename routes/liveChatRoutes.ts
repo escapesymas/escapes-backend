@@ -9,7 +9,7 @@ import {
   supportStatus, getSupportSettings, saveSupportSettings, currentConversation, messagesAfter, addMessage,
   closeStaleConversations,
 } from '../lib/live-chat.js';
-import { notifyLiveChat } from '../pushService.js';
+import { notifyLiveChat, sendPushToUser, saveSubscription } from '../pushService.js';
 import { sendTemplatedEmail } from '../lib/email.js';
 
 export const liveChatRouter = Router();
@@ -60,7 +60,10 @@ liveChatRouter.get('/chat/live', async (req: any, res: any) => {
   try {
     const conv = await currentConversation(auth.user_id);
     if (!conv) return res.json({ conversation: null, messages: [] });
-    await pool.query(`UPDATE chat_conversations SET customer_seen_at = NOW() WHERE id = $1`, [conv.id]);
+    // Solo cuenta como «en el chat» si tiene la ventana del chat abierta.
+    if (req.query.active === '1') {
+      await pool.query(`UPDATE chat_conversations SET customer_seen_at = NOW() WHERE id = $1`, [conv.id]);
+    }
 
     // Si nadie ha contestado en 5 minutos, se le avisa una vez de que puede tardar.
     if (conv.status === 'waiting' && Date.now() - new Date(conv.created_at).getTime() > 5 * 60_000) {
@@ -137,17 +140,10 @@ liveChatRouter.post('/chat/live/message', async (req: any, res: any) => {
     if (!conv || conv.status === 'closed') return res.status(409).json({ error: 'La conversación ya está cerrada.' });
     const msg = await addMessage(conv.id, 'customer', content);
 
-    // Aviso al móvil si el asesor no está mirando (como mucho uno cada 2 minutos).
-    const { rows: [c] } = await pool.query(
-      `UPDATE chat_conversations SET customer_seen_at = NOW(),
-              last_push_at = CASE WHEN (admin_seen_at IS NULL OR admin_seen_at < NOW() - INTERVAL '1 minute')
-                                   AND (last_push_at IS NULL OR last_push_at < NOW() - INTERVAL '2 minutes')
-                                  THEN NOW() ELSE last_push_at END
-       WHERE id = $1 RETURNING (last_push_at > NOW() - INTERVAL '2 seconds') AS notify`, [conv.id]);
-    if (c?.notify) {
-      const who = await customerName(auth.user_id);
-      notifyLiveChat({ conversationId: conv.id, title: `💬 ${who.name}`, body: content.slice(0, 160) }).catch(() => {});
-    }
+    // Aviso al móvil con cada mensaje (se agrupan en la notificación de la conversación).
+    await pool.query(`UPDATE chat_conversations SET customer_seen_at = NOW(), last_push_at = NOW() WHERE id = $1`, [conv.id]);
+    const who = await customerName(auth.user_id);
+    notifyLiveChat({ conversationId: conv.id, title: `💬 ${who.name}`, body: content.slice(0, 160) }).catch(() => {});
     res.json({ message: msg });
   } catch (err: any) {
     console.error('[LIVE CHAT] customer message:', err.message);
@@ -170,6 +166,28 @@ liveChatRouter.post('/chat/live/close', async (req: any, res: any) => {
     console.error('[LIVE CHAT] close:', err.message);
     res.status(500).json({ error: 'No se pudo cerrar la conversación' });
   }
+});
+
+// POST /api/chat/push/subscribe { subscription } — avisos de respuesta del asesor.
+liveChatRouter.post('/chat/push/subscribe', async (req: any, res: any) => {
+  const auth = customer(req, res);
+  if (!auth) return;
+  try {
+    await saveSubscription(auth.user_id, req.body?.subscription);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Suscripción inválida' });
+  }
+});
+
+liveChatRouter.post('/chat/push/unsubscribe', async (req: any, res: any) => {
+  const auth = customer(req, res);
+  if (!auth) return;
+  const endpoint = String(req.body?.endpoint || '');
+  if (endpoint) {
+    await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_id = $2`, [endpoint, auth.user_id]).catch(() => {});
+  }
+  res.json({ ok: true });
 });
 
 // ── Panel de administración ──────────────────────────────────────────────
@@ -266,13 +284,23 @@ liveChatRouter.post('/admin/chats/:id/message', async (req: any, res: any) => {
        RETURNING id, user_id, customer_seen_at, last_email_at`, [id]);
     if (!conv) return res.status(409).json({ error: 'La conversación está cerrada.' });
     const msg = await addMessage(id, 'agent', content);
+    const status = await supportStatus();
+
+    // Notificación push al cliente salvo que esté mirando el chat en ese momento.
+    if (Date.now() - new Date(conv.customer_seen_at).getTime() > 8_000) {
+      sendPushToUser(conv.user_id, {
+        title: `${status.agentName} te ha respondido`,
+        body: content.slice(0, 180),
+        url: '/?chat=1',
+        tag: `chat-${id}`,
+      }).catch(() => {});
+    }
 
     // Si el cliente ya no tiene el chat abierto, se le avisa por email (como mucho cada 15 min).
     const away = Date.now() - new Date(conv.customer_seen_at).getTime() > 60_000;
     const recentlyEmailed = conv.last_email_at && Date.now() - new Date(conv.last_email_at).getTime() < 15 * 60_000;
     if (away && !recentlyEmailed) {
       const who = await customerName(conv.user_id);
-      const status = await supportStatus();
       if (who.email) {
         await pool.query(`UPDATE chat_conversations SET last_email_at = NOW() WHERE id = $1`, [id]);
         sendTemplatedEmail('generic', who.email, {

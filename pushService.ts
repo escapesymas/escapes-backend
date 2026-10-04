@@ -190,6 +190,33 @@ export async function sendNotificationToAll(payload: AdminNotification) {
   }
 }
 
+/**
+ * Notificación a los dispositivos de un cliente (p. ej. «te hemos respondido en
+ * el chat»). No pasa por el historial del panel. Nunca lanza.
+ */
+export async function sendPushToUser(userId: number, payload: { title: string; body: string; url: string; tag?: string }) {
+  try {
+    const res = await pool.query(`SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1`, [userId]);
+    const body = JSON.stringify({ ...payload, icon: '/icon-192.png' });
+    await Promise.all(res.rows.map(async (sub: any) => {
+      try {
+        await webPush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          body,
+          { TTL: 24 * 3600, urgency: 'high' },
+        );
+      } catch (err: any) {
+        if (err.statusCode === 404 || err.statusCode === 410) await removeSubscription(sub.endpoint);
+        else console.error('[PUSH USER ERROR]:', err.statusCode || '', err.body || err.message);
+      }
+    }));
+    return res.rows.length;
+  } catch (err: any) {
+    console.error('[PUSH USER ERROR]:', err.message);
+    return 0;
+  }
+}
+
 // ── Historial ────────────────────────────────────────────────────────────
 
 export async function unreadCount(): Promise<number> {
