@@ -26,6 +26,10 @@ export interface SupportSettings {
 
 export interface SupportStatus {
   available: boolean;
+  /** Dentro del horario (o modo «disponible»), aunque no haya nadie conectado. */
+  inHours: boolean;
+  /** Asesores conectados ahora mismo. */
+  onlineAgents: number;
   mode: SupportMode;
   hoursText: string;
   /** «hoy a las 16:00», «el lunes a las 10:00»… o null si no hay horario. */
@@ -126,12 +130,15 @@ export function hoursText(s: SupportSettings): string {
 export async function supportStatus(date = new Date()): Promise<SupportStatus> {
   const s = await getSupportSettings();
   const { day, minutes } = localNow(s.timezone, date);
-  const inHours = (s.days[day] || []).some(([a, b]) => minutes >= toMin(a) && minutes < toMin(b));
-  const available = s.mode === 'on' || (s.mode === 'auto' && inHours);
+  const inSchedule = (s.days[day] || []).some(([a, b]) => minutes >= toMin(a) && minutes < toMin(b));
+  const open = s.mode === 'on' || (s.mode === 'auto' && inSchedule);
+  // Hace falta al menos un asesor conectado (botón «Conectado» de su panel).
+  const onlineAgents = await onlineAgentIds().then((ids) => ids.length).catch(() => 0);
+  const available = open && onlineAgents > 0;
 
   // Próxima apertura (para decírselo al cliente fuera de horario).
   let nextOpen: string | null = null;
-  if (!available && s.mode !== 'off') {
+  if (!open && s.mode !== 'off') {
     for (let offset = 0; offset < 8 && !nextOpen; offset++) {
       const d = (day + offset) % 7;
       const start = (s.days[d] || []).map(([a]) => a).find((a) => offset > 0 || toMin(a) > minutes);
@@ -140,7 +147,26 @@ export async function supportStatus(date = new Date()): Promise<SupportStatus> {
       }
     }
   }
-  return { available, mode: s.mode, hoursText: hoursText(s), nextOpen, agentName: s.agentName };
+  return { available, inHours: open, onlineAgents, mode: s.mode, hoursText: hoursText(s), nextOpen, agentName: s.agentName };
+}
+
+/** Asesores (y administradores) conectados para atender el chat. */
+export async function onlineAgentIds(): Promise<number[]> {
+  const { rows } = await pool.query(
+    `SELECT a.user_id FROM chat_agents a JOIN users u ON u.id = a.user_id
+     WHERE a.online AND u.role IN ('admin', 'asesor')`);
+  return rows.map((r: any) => Number(r.user_id));
+}
+
+export async function isAgentOnline(userId: number): Promise<boolean> {
+  const { rows } = await pool.query(`SELECT online FROM chat_agents WHERE user_id = $1`, [userId]);
+  return !!rows[0]?.online;
+}
+
+export async function setAgentOnline(userId: number, online: boolean): Promise<void> {
+  await pool.query(
+    `INSERT INTO chat_agents (user_id, online, updated_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET online = EXCLUDED.online, updated_at = NOW()`, [userId, online]);
 }
 
 /** Nombre de un asesor en el chat: el que haya puesto, su nombre de pila o el genérico. */

@@ -13,12 +13,14 @@ import { authenticateRequest } from '../utils.js';
 import {
   supportStatus, getSupportSettings, saveSupportSettings, currentConversation, messagesAfter, addMessage,
   closeStaleConversations, agentNameFor, setAgentName, welcomeText, DEFAULT_WELCOME, type ChatMessageKind,
+  isAgentOnline, setAgentOnline,
 } from '../lib/live-chat.js';
 import { quoteOrder, type PriceOverride } from '../lib/order-pricing.js';
 import { productEconomics, maxDiscountPct, discountedCents, commissionCents, COMMISSION_HOLD_DAYS } from '../lib/chat-commission.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
 import { searchTerms } from '../lib/catalog-query.js';
 import { notifyLiveChat, sendPushToUser, saveSubscription } from '../pushService.js';
+import { requireAgent, requireAdminRole, type AgentAuth } from '../lib/agent-auth.js';
 import { sendTemplatedEmail } from '../lib/email.js';
 
 export const liveChatRouter = Router();
@@ -35,14 +37,26 @@ function customer(req: any, res: any): { user_id: number; email?: string } | nul
   return auth;
 }
 
-function admin(req: any, res: any): any | null {
-  const auth = authenticateRequest(req);
-  if (!auth || auth.role !== 'admin') {
-    res.status(403).json({ error: 'Solo administradores' });
-    return null;
+/**
+ * Asesor con acceso a una conversación: el administrador a todas; un asesor a
+ * las suyas y a las que nadie atiende todavía (para cogerlas).
+ */
+async function agentFor(req: any, res: any, conversationId?: number | null): Promise<AgentAuth | null> {
+  const a = await requireAgent(req, res);
+  if (!a) return null;
+  if (conversationId && !a.isAdmin) {
+    const { rows: [c] } = await pool.query(`SELECT agent_user_id, status FROM chat_conversations WHERE id = $1`, [conversationId]);
+    const ok = c && (Number(c.agent_user_id) === a.user_id || (c.agent_user_id == null && c.status !== 'closed'));
+    if (!ok) {
+      res.status(403).json({ error: 'Esta conversación la atiende otro asesor' });
+      return null;
+    }
   }
-  return auth;
+  return a;
 }
+
+/** Conversaciones que ve un asesor (SQL sobre el alias c). */
+const scopeSql = (a: AgentAuth) => (a.isAdmin ? 'TRUE' : `(c.agent_user_id = ${Number(a.user_id)} OR (c.agent_user_id IS NULL AND c.status <> 'closed'))`);
 
 async function customerName(userId: number): Promise<{ name: string; email: string }> {
   const { rows } = await pool.query(`SELECT first_name, last_name, email FROM users WHERE id = $1`, [userId]);
@@ -152,7 +166,7 @@ liveChatRouter.post('/chat/live/message', async (req: any, res: any) => {
     // Aviso al móvil con cada mensaje (se agrupan en la notificación de la conversación).
     await pool.query(`UPDATE chat_conversations SET customer_seen_at = NOW(), last_push_at = NOW() WHERE id = $1`, [conv.id]);
     const who = await customerName(auth.user_id);
-    notifyLiveChat({ conversationId: conv.id, title: `💬 ${who.name}`, body: content.slice(0, 160) }).catch(() => {});
+    notifyLiveChat({ conversationId: conv.id, title: `💬 ${who.name}`, body: content.slice(0, 160), agentUserId: conv.agent_user_id }).catch(() => {});
     res.json({ message: msg });
   } catch (err: any) {
     console.error('[LIVE CHAT] customer message:', err.message);
@@ -281,7 +295,7 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
     if (co.conversation_id) {
       const num = formatOrderNumber(orderId, o?.created_at);
       await addMessage(co.conversation_id, 'system', `🧾 Pedido ${num} creado (${((o?.total || 0) / 100).toFixed(2).replace('.', ',')} €), pendiente de pago.`);
-      notifyLiveChat({ conversationId: co.conversation_id, title: `🧾 Pedido ${num} creado desde el chat`, body: 'El cliente está en la pasarela de pago.' }).catch(() => {});
+      notifyLiveChat({ conversationId: co.conversation_id, title: `🧾 Pedido ${num} creado desde el chat`, body: 'El cliente está en la pasarela de pago.', agentUserId: co.agent_user_id }).catch(() => {});
     }
   } catch (err: any) {
     console.error('[LIVE CHAT] link order:', err.message);
@@ -292,12 +306,12 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
 export async function chatOrderPaid(orderId: number) {
   try {
     const { rows: [o] } = await pool.query(
-      `SELECT o.total, o.created_at, co.conversation_id FROM orders o JOIN chat_orders co ON co.id = o.chat_order_id
+      `SELECT o.total, o.created_at, co.conversation_id, co.agent_user_id FROM orders o JOIN chat_orders co ON co.id = o.chat_order_id
        WHERE o.id = $1`, [orderId]);
     if (!o?.conversation_id) return;
     const num = formatOrderNumber(orderId, o.created_at);
     await addMessage(o.conversation_id, 'system', `✅ Pedido ${num} pagado. ¡Gracias por tu compra!`);
-    notifyLiveChat({ conversationId: o.conversation_id, title: `✅ Pedido ${num} pagado (chat)`, body: `${(Number(o.total) / 100).toFixed(2).replace('.', ',')} €` }).catch(() => {});
+    notifyLiveChat({ conversationId: o.conversation_id, title: `✅ Pedido ${num} pagado (chat)`, body: `${(Number(o.total) / 100).toFixed(2).replace('.', ',')} €`, agentUserId: o.agent_user_id }).catch(() => {});
   } catch (err: any) {
     console.error('[LIVE CHAT] order paid:', err.message);
   }
@@ -307,7 +321,8 @@ export async function chatOrderPaid(orderId: number) {
 
 // GET /api/admin/chats/summary — para el contador del menú.
 liveChatRouter.get('/admin/chats/summary', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
+  const a = await agentFor(req, res);
+  if (!a) return;
   try {
     const { rows: [r] } = await pool.query(
       `SELECT count(*) FILTER (WHERE c.status = 'waiting')::int AS waiting,
@@ -317,8 +332,8 @@ liveChatRouter.get('/admin/chats/summary', async (req: any, res: any) => {
               count(*) FILTER (WHERE c.status <> 'closed' AND EXISTS (
                 SELECT 1 FROM chat_messages m WHERE m.conversation_id = c.id AND m.sender = 'customer'
                   AND m.created_at > COALESCE(c.admin_seen_at, 'epoch')))::int AS unread
-       FROM chat_conversations c WHERE c.status <> 'closed'`);
-    res.json({ ...r, status: await supportStatus() });
+       FROM chat_conversations c WHERE c.status <> 'closed' AND ${scopeSql(a)}`);
+    res.json({ ...r, status: await supportStatus(), online: await isAgentOnline(a.user_id) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -326,7 +341,8 @@ liveChatRouter.get('/admin/chats/summary', async (req: any, res: any) => {
 
 // GET /api/admin/chats?scope=open|closed — lista de conversaciones.
 liveChatRouter.get('/admin/chats', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
+  const a = await agentFor(req, res);
+  if (!a) return;
   try {
     await closeStaleConversations();
     const closed = req.query.scope === 'closed';
@@ -338,7 +354,7 @@ liveChatRouter.get('/admin/chats', async (req: any, res: any) => {
               (SELECT count(*)::int FROM chat_messages m WHERE m.conversation_id = c.id AND m.sender = 'customer'
                 AND m.created_at > COALESCE(c.admin_seen_at, 'epoch')) AS unread
        FROM chat_conversations c LEFT JOIN users u ON u.id = c.user_id
-       WHERE ${closed ? `c.status = 'closed'` : `c.status <> 'closed'`}
+       WHERE ${closed ? `c.status = 'closed'` : `c.status <> 'closed'`} AND ${scopeSql(a)}
        ORDER BY ${closed ? 'c.closed_at DESC' : `(c.status = 'waiting') DESC, c.updated_at DESC`}
        LIMIT 100`);
     res.json({ conversations: rows });
@@ -350,9 +366,9 @@ liveChatRouter.get('/admin/chats', async (req: any, res: any) => {
 
 // GET /api/admin/chats/:id?after=ID — conversación, datos del cliente y mensajes.
 liveChatRouter.get('/admin/chats/:id', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
   const id = parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
+  if (!(await agentFor(req, res, id))) return;
   try {
     const { rows: [conv] } = await pool.query(
       `UPDATE chat_conversations SET admin_seen_at = NOW() WHERE id = $1
@@ -523,9 +539,10 @@ const parseId = (v: unknown) => { const n = parseInt(String(v), 10); return Numb
 
 // POST /api/admin/chats/:id/take — atender: se asigna al asesor y se envía la bienvenida.
 liveChatRouter.post('/admin/chats/:id/take', async (req: any, res: any) => {
-  const auth = admin(req, res);
   const id = parseId(req.params.id);
-  if (!auth || !id) return auth && res.status(400).json({ error: 'ID inválido' });
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
+  const auth = await agentFor(req, res, id);
+  if (!auth) return;
   try {
     const welcome = await ensureTaken(id, auth.user_id);
     if (welcome) {
@@ -542,9 +559,9 @@ liveChatRouter.post('/admin/chats/:id/take', async (req: any, res: any) => {
 
 // POST /api/admin/chats/:id/message { content } — respuesta del asesor.
 liveChatRouter.post('/admin/chats/:id/message', async (req: any, res: any) => {
-  const auth = admin(req, res);
-  if (!auth) return;
   const id = parseId(req.params.id);
+  const auth = await agentFor(req, res, id);
+  if (!auth) return;
   const content = clean(req.body?.content, 2000);
   if (!id || !content) return res.status(400).json({ error: 'Escribe un mensaje.' });
   try {
@@ -559,9 +576,9 @@ liveChatRouter.post('/admin/chats/:id/message', async (req: any, res: any) => {
 
 // POST /api/admin/chats/:id/product { productId } — tarjeta de producto.
 liveChatRouter.post('/admin/chats/:id/product', async (req: any, res: any) => {
-  const auth = admin(req, res);
-  if (!auth) return;
   const id = parseId(req.params.id);
+  const auth = await agentFor(req, res, id);
+  if (!auth) return;
   const productId = parseId(req.body?.productId);
   if (!id || !productId) return res.status(400).json({ error: 'Falta el producto' });
   try {
@@ -583,11 +600,13 @@ const imageUpload = multer({
   limits: { fileSize: 12 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => cb(null, /^image\/(jpeg|png|webp|gif|heic|heif|avif)$/.test(file.mimetype)),
 });
-liveChatRouter.post('/admin/chats/:id/image', (req: any, res: any, next: any) => {
-  if (!admin(req, res)) return;
+liveChatRouter.post('/admin/chats/:id/image', async (req: any, res: any, next: any) => {
+  const a = await agentFor(req, res, parseId(req.params.id));
+  if (!a) return;
+  req.agent = a;
   next();
 }, imageUpload.single('image'), async (req: any, res: any) => {
-  const auth = authenticateRequest(req);
+  const auth: AgentAuth = req.agent;
   const id = parseId(req.params.id);
   if (!id || !req.file) return res.status(400).json({ error: 'Falta la imagen (JPG, PNG, WEBP o GIF de hasta 12 MB)' });
   try {
@@ -610,7 +629,7 @@ liveChatRouter.post('/admin/chats/:id/image', (req: any, res: any, next: any) =>
 
 // GET /api/admin/chat-products?q= — buscador de productos para enviar o añadir al pedido.
 liveChatRouter.get('/admin/chat-products', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
+  if (!(await requireAgent(req, res))) return;
   const q = clean(req.query.q, 120);
   const terms = searchTerms(q).filter((t) => !t.includes(' ')).slice(0, 6);
   if (!terms.length) return res.json({ products: [] });
@@ -630,9 +649,9 @@ liveChatRouter.get('/admin/chat-products', async (req: any, res: any) => {
 
 // GET /api/admin/chats/:id/cart — carrito actual del cliente.
 liveChatRouter.get('/admin/chats/:id/cart', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ error: 'ID inválido' });
+  if (!(await agentFor(req, res, id))) return;
   try {
     const { rows: [conv] } = await pool.query(`SELECT user_id FROM chat_conversations WHERE id = $1`, [id]);
     if (!conv) return res.status(404).json({ error: 'Conversación no encontrada' });
@@ -655,7 +674,7 @@ liveChatRouter.get('/admin/chats/:id/cart', async (req: any, res: any) => {
 
 // POST /api/admin/chats/:id/order-preview { items: [{id, quantity, discount}] } — importes y comisión.
 liveChatRouter.post('/admin/chats/:id/order-preview', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
+  if (!(await agentFor(req, res, parseId(req.params.id)))) return;
   try {
     const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], false);
     res.json({
@@ -674,9 +693,9 @@ liveChatRouter.post('/admin/chats/:id/order-preview', async (req: any, res: any)
 
 // POST /api/admin/chats/:id/order { items: [{id, quantity, discount}], note } — pedido con botón de pago.
 liveChatRouter.post('/admin/chats/:id/order', async (req: any, res: any) => {
-  const auth = admin(req, res);
-  if (!auth) return;
   const id = parseId(req.params.id);
+  const auth = await agentFor(req, res, id);
+  if (!auth) return;
   if (!id) return res.status(400).json({ error: 'ID inválido' });
   try {
     const { rows: [conv] } = await pool.query(`SELECT id, user_id, status FROM chat_conversations WHERE id = $1`, [id]);
@@ -716,7 +735,7 @@ liveChatRouter.post('/admin/chats/:id/order', async (req: any, res: any) => {
 
 // GET /api/admin/chat-orders?month=YYYY-MM — pedidos del chat por asesor (comisiones).
 liveChatRouter.get('/admin/chat-orders', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
+  if (!(await requireAdminRole(req, res))) return;
   const month = /^\d{4}-\d{2}$/.test(String(req.query.month)) ? String(req.query.month) : new Date().toISOString().slice(0, 7);
   try {
     const { rows } = await pool.query(
@@ -809,9 +828,10 @@ function commissionTotals(rows: any[]) {
 
 // GET /api/admin/my-commissions?agent=ID — histórico de comisiones de un asesor (por defecto, el propio).
 liveChatRouter.get('/admin/my-commissions', async (req: any, res: any) => {
-  const auth = admin(req, res);
+  const auth = await requireAgent(req, res);
   if (!auth) return;
-  const agentId = parseId(req.query.agent) || auth.user_id;
+  // Un asesor solo ve las suyas; el administrador puede consultar las de cualquiera.
+  const agentId = (auth.isAdmin && parseId(req.query.agent)) || auth.user_id;
   try {
     const [{ rows }, { rows: payouts }] = await Promise.all([
       pool.query(`${COMMISSION_ROWS_SQL} WHERE co.agent_user_id = $1 ORDER BY co.created_at DESC LIMIT 500`, [agentId]),
@@ -834,7 +854,7 @@ liveChatRouter.get('/admin/my-commissions', async (req: any, res: any) => {
 
 // GET /api/admin/commission-agents — lo que hay que pagar a cada asesor.
 liveChatRouter.get('/admin/commission-agents', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
+  if (!(await requireAdminRole(req, res))) return;
   try {
     const { rows } = await pool.query(`${COMMISSION_ROWS_SQL} ORDER BY co.created_at DESC LIMIT 5000`);
     const byAgent = new Map<number, any>();
@@ -856,7 +876,7 @@ liveChatRouter.get('/admin/commission-agents', async (req: any, res: any) => {
 // POST /api/admin/commission-payouts { agentUserId, method, reference, note } — registra el pago
 // de todas las comisiones disponibles del asesor.
 liveChatRouter.post('/admin/commission-payouts', async (req: any, res: any) => {
-  const auth = admin(req, res);
+  const auth = await requireAdminRole(req, res);
   if (!auth) return;
   const agentId = parseId(req.body?.agentUserId);
   if (!agentId) return res.status(400).json({ error: 'Falta el asesor' });
@@ -892,9 +912,9 @@ liveChatRouter.post('/admin/commission-payouts', async (req: any, res: any) => {
 
 // POST /api/admin/chats/:id/close — el asesor cierra la conversación.
 liveChatRouter.post('/admin/chats/:id/close', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
   const id = parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
+  if (!(await agentFor(req, res, id))) return;
   try {
     const { rowCount } = await pool.query(
       `UPDATE chat_conversations SET status = 'closed', closed_at = NOW(), closed_by = 'agent' WHERE id = $1 AND status <> 'closed'`, [id]);
@@ -907,20 +927,36 @@ liveChatRouter.post('/admin/chats/:id/close', async (req: any, res: any) => {
 
 // GET/PUT /api/admin/support-settings — horario y disponibilidad.
 liveChatRouter.get('/admin/support-settings', async (req: any, res: any) => {
-  const auth = admin(req, res);
+  const auth = await requireAgent(req, res);
   if (!auth) return;
   const settings = await getSupportSettings();
   res.json({
-    settings: { ...settings, welcomeTemplate: settings.welcomeTemplate || DEFAULT_WELCOME },
+    settings: { ...settings, welcomeTemplate: settings.welcomeTemplate || DEFAULT_WELCOME, agents: undefined },
     status: await supportStatus(),
     myAgentName: await agentNameFor(auth.user_id),
+    myOnline: await isAgentOnline(auth.user_id),
+    isAdmin: auth.isAdmin,
   });
 });
 
-liveChatRouter.put('/admin/support-settings', async (req: any, res: any) => {
-  if (!admin(req, res)) return;
+// POST /api/admin/agent-status { online?, name? } — el asesor se conecta/desconecta o cambia su nombre.
+liveChatRouter.post('/admin/agent-status', async (req: any, res: any) => {
+  const auth = await requireAgent(req, res);
+  if (!auth) return;
   try {
-    const auth = authenticateRequest(req);
+    if (typeof req.body?.online === 'boolean') await setAgentOnline(auth.user_id, req.body.online);
+    if (typeof req.body?.name === 'string') await setAgentName(auth.user_id, req.body.name);
+    res.json({ myOnline: await isAgentOnline(auth.user_id), myAgentName: await agentNameFor(auth.user_id), status: await supportStatus() });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] agent-status:', err.message);
+    res.status(500).json({ error: 'No se pudo guardar' });
+  }
+});
+
+liveChatRouter.put('/admin/support-settings', async (req: any, res: any) => {
+  const auth = await requireAdminRole(req, res);
+  if (!auth) return;
+  try {
     if (typeof req.body?.myAgentName === 'string') await setAgentName(auth.user_id, req.body.myAgentName);
     const settings = await saveSupportSettings(req.body || {});
     res.json({ settings, status: await supportStatus(), myAgentName: await agentNameFor(auth.user_id) });

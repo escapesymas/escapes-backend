@@ -17,6 +17,16 @@ function requireAdmin(req: any, res: any): any | null {
   return auth;
 }
 
+/** Los asesores también registran su móvil para los avisos del chat. */
+function requireAdminOrAgent(req: any, res: any): any | null {
+  const auth = authenticateRequest(req);
+  if (!auth || (auth.role !== 'admin' && auth.role !== 'asesor')) {
+    res.status(403).json({ error: 'Solo administradores y asesores' });
+    return null;
+  }
+  return auth;
+}
+
 // GET /api/push/vapid-public-key
 pushRouter.get('/push/vapid-public-key', (_req, res) => {
   return res.json({ publicKey: getVapidPublicKey() });
@@ -24,7 +34,7 @@ pushRouter.get('/push/vapid-public-key', (_req, res) => {
 
 // POST /api/push/subscribe
 pushRouter.post('/push/subscribe', async (req, res) => {
-  const auth = requireAdmin(req, res);
+  const auth = requireAdminOrAgent(req, res);
   if (!auth) return;
   try {
     await saveSubscription(auth.user_id, req.body);
@@ -64,7 +74,7 @@ pushRouter.post('/push/preferences', async (req, res) => {
 
 // POST /api/push/unsubscribe
 pushRouter.post('/push/unsubscribe', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!requireAdminOrAgent(req, res)) return;
   try {
     const { endpoint } = req.body || {};
     if (!endpoint) return res.status(400).json({ error: 'Endpoint requerido' });

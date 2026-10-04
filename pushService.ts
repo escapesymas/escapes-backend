@@ -360,15 +360,32 @@ export async function notifyNewUser(user: { name: string; email: string }) {
   });
 }
 
-export async function notifyLiveChat(info: { conversationId: number; title: string; body: string }) {
+/**
+ * Aviso del chat con asesor. Los administradores reciben todos (historial y
+ * móvil); de los asesores, el que atiende la conversación o, si nadie la
+ * atiende aún, los que están conectados.
+ */
+export async function notifyLiveChat(info: { conversationId: number; title: string; body: string; agentUserId?: number | null }) {
+  const url = adminUrl('chat', { chat: info.conversationId });
   await sendNotificationToAll({
     title: info.title,
     body: info.body,
-    url: adminUrl('chat', { chat: info.conversationId }),
+    url,
     category: 'chat',
     tag: `chat-${info.conversationId}`,
     data: { conversationId: info.conversationId },
   });
+  try {
+    const { rows } = info.agentUserId
+      ? await pool.query(`SELECT id FROM users WHERE id = $1 AND role = 'asesor'`, [info.agentUserId])
+      : await pool.query(
+        `SELECT u.id FROM users u JOIN chat_agents a ON a.user_id = u.id WHERE u.role = 'asesor' AND a.online`);
+    await Promise.all(rows.map((r: any) => sendPushToUser(r.id, {
+      title: info.title, body: info.body, url, tag: `chat-${info.conversationId}`,
+    })));
+  } catch (err: any) {
+    console.error('[PUSH CHAT AGENTS ERROR]:', err.message);
+  }
 }
 
 export async function notifyContact(msg: { name: string; email: string; subject?: string; message: string }) {

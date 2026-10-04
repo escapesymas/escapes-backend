@@ -49,6 +49,7 @@ import { bihrRouter } from './routes/bihr.js';
 import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
 import { liveChatRouter, linkChatOrder, chatOrderPaid, proposalOverrides } from './routes/liveChatRoutes.js';
+import { agentRouter } from './routes/agentRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -526,6 +527,7 @@ const allowedOrigins = isProduction
       'https://escapesymas.com',
       'https://www.escapesymas.com',
       'https://admin.escapesymas.com',
+      'https://asesores.escapesymas.com',
       'https://backendescapes.com',
       'http://localhost:3000',
       'http://127.0.0.1:3000',
@@ -705,6 +707,7 @@ app.use('/api', bihrRouter);
 app.use('/api', adminRouter);
 app.use('/api', pushRouter);
 app.use('/api', liveChatRouter);
+app.use('/api', agentRouter);
 
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
 // /uploads se sirve como estático en el mismo origen, así que nunca se debe
