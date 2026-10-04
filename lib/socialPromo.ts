@@ -89,6 +89,34 @@ const topShade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W
     <stop offset="0" stop-color="#000" stop-opacity="0.72"/><stop offset="1" stop-color="#000" stop-opacity="0"/>
   </linearGradient></defs><rect width="${W}" height="560" fill="url(#g)"/></svg>`);
 
+/** Logo de la marca en su cápsula blanca, para fondos variados (escenas y vídeos). */
+async function brandPillLayers(logoFile: string): Promise<sharp.OverlayOptions[]> {
+  const logo = await sharp(logoFile).resize({ width: BRAND_BOX.w, height: BRAND_BOX.h, fit: 'inside' }).png().toBuffer();
+  const lm = await sharp(logo).metadata();
+  const pad = 22;
+  const pw = (lm.width || BRAND_BOX.w) + pad * 2;
+  const ph = (lm.height || BRAND_BOX.h) + pad * 2;
+  return [
+    { input: pill(pw, ph), left: W - SIDE - pw, top: TOP - 10 },
+    { input: logo, left: W - SIDE - pw + pad, top: TOP - 10 + pad },
+  ];
+}
+
+/**
+ * Capa transparente de 1080x1920 con el degradado y los logos, para ponerla
+ * encima de un vídeo (ffmpeg). Devuelve la ruta del PNG.
+ */
+export async function logoOverlayFile(brand: string | null | undefined): Promise<{ file: string; missingBrandLogo: boolean }> {
+  const layers: sharp.OverlayOptions[] = [{ input: topShade, left: 0, top: 0 }, { input: await storeLogo('blanco'), left: SIDE, top: TOP }];
+  const logoFile = await brandLogoPath(brand);
+  if (logoFile) layers.push(...(await brandPillLayers(logoFile)));
+  await fs.promises.mkdir(PROMO_DIR, { recursive: true });
+  const file = path.join(PROMO_DIR, `overlay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`);
+  await sharp({ create: { width: W, height: H, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite(layers).png().toFile(file);
+  return { file, missingBrandLogo: !!brand && !logoFile };
+}
+
 /**
  * Compone la imagen promocional y devuelve su ruta en /uploads.
  * - Escena vertical (de la IA o subida): a pantalla completa, logo blanco y marca en una cápsula blanca.
@@ -123,11 +151,7 @@ export async function composePromo(src: string, brand: string | null | undefined
     if (isProductPhoto) {
       layers.push({ input: logo, left: W - SIDE - lw, top: TOP + Math.round((97 - lh) / 2) });
     } else {
-      const pad = 22;
-      const pw = lw + pad * 2;
-      const ph = lh + pad * 2;
-      layers.push({ input: pill(pw, ph), left: W - SIDE - pw, top: TOP - 10 });
-      layers.push({ input: logo, left: W - SIDE - pw + pad, top: TOP - 10 + pad });
+      layers.push(...(await brandPillLayers(logoFile)));
     }
   }
 

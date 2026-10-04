@@ -50,6 +50,7 @@ import { adminRouter } from './routes/admin.js';
 import { pushRouter } from './routes/pushRoutes.js';
 import { socialContentRouter } from './routes/socialContentRoutes.js';
 import { checkDueSlots, resetInterruptedGenerations } from './lib/socialContentCalendar.js';
+import { pollVideos } from './lib/socialVideo.js';
 import { liveChatRouter, linkChatOrder, chatOrderPaid, proposalOverrides } from './routes/liveChatRoutes.js';
 import { agentRouter } from './routes/agentRoutes.js';
 import { chatToolsRouter, startChatJobs } from './routes/chatToolsRoutes.js';
@@ -6808,6 +6809,10 @@ setInterval(() => {
 setInterval(() => {
   checkDueSlots().catch(e => console.error('[SOCIAL CONTENT CRON]:', e));
 }, 5 * 60 * 1000);
+// Vídeos de Veo en curso: se consulta su operación cada 20 s hasta que terminan.
+setInterval(() => {
+  pollVideos().catch(e => console.error('[SOCIAL VIDEO CRON]:', e));
+}, 20 * 1000);
 
 // Open tracking pixel hit by customer email clients. Returns a 1x1
 // transparent GIF so the request resolves immediately with no visible

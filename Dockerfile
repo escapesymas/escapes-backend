@@ -26,7 +26,8 @@ RUN npm run build
 # STAGE 2: Production Execution Runtime
 # ================================================================
 FROM node:22-alpine AS runner
-RUN apk add --no-cache wget curl unzip
+# ffmpeg: logos encima de los vídeos de TikTok generados con Veo
+RUN apk add --no-cache wget curl unzip ffmpeg
 WORKDIR /app/server
 ENV NODE_ENV=production PORT=3001 NODE_OPTIONS="--max-old-space-size=4096"
 

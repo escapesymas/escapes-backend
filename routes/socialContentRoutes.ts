@@ -9,6 +9,7 @@ import {
   FORMATS, STATUSES,
 } from '../lib/socialContentCalendar.js';
 import { saveBrandLogo } from '../lib/socialPromo.js';
+import { startVideo, VIDEO_MODELS } from '../lib/socialVideo.js';
 import { pool } from '../db.js';
 import { FEATURED_BRANDS } from '../lib/socialContentAI.js';
 import { productBySku } from '../lib/socialContentAI.js';
@@ -160,7 +161,7 @@ socialContentRouter.delete('/social-content/:id/final', async (req, res) => {
   if (!(await requireAdminRole(req, res))) return;
   const id = parseId(req.params.id);
   const url = String(req.query.url || '');
-  const m = url.match(/^\/uploads\/social-content\/(final|promo)\/([\w.-]+)$/);
+  const m = url.match(/^\/uploads\/social-content\/(final|promo|video)\/([\w.-]+)$/);
   if (!id || !m) return res.status(400).json({ error: 'Datos inválidos' });
   try {
     const files = await removeFinalMedia(id, url);
@@ -172,6 +173,36 @@ socialContentRouter.delete('/social-content/:id/final', async (req, res) => {
   } catch (err: any) {
     console.error('[SOCIAL CONTENT FINAL DELETE ERROR]:', err.message);
     return res.status(500).json({ error: 'No se pudo quitar el archivo' });
+  }
+});
+
+// POST /api/social-content/:id/video  { sourceUrl, prompt, model: fast|lite } — vídeo de 8 s con Veo.
+socialContentRouter.post('/social-content/:id/video', async (req, res) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const id = parseId(req.params.id);
+  const { sourceUrl, prompt, model } = req.body || {};
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
+  if (!VIDEO_MODELS[model]) return res.status(400).json({ error: 'Modelo no válido' });
+  const text = String(prompt || '').trim().slice(0, 2000);
+  if (text.length < 10) return res.status(400).json({ error: 'Escribe el prompt del vídeo' });
+  try {
+    // Solo imágenes de la propia publicación (o la foto del producto).
+    const { rows: [slot] } = await pool.query(
+      `SELECT c.base_media, c.media_urls, c.final_media, p.images->0->>'src' AS product_image
+       FROM social_content_calendar c
+       LEFT JOIN LATERAL (SELECT images FROM products WHERE upper(sku) = upper(c.product_sku) LIMIT 1) p ON TRUE
+       WHERE c.id = $1`, [id]);
+    if (!slot) return res.status(404).json({ error: 'Publicación no encontrada' });
+    const allowed = new Set<string>([
+      ...(slot.base_media || []), ...(slot.media_urls || []), slot.product_image,
+      ...(slot.final_media || []).filter((m: any) => m.type === 'image').flatMap((m: any) => [m.url, m.original]),
+    ].filter(Boolean));
+    if (!allowed.has(String(sourceUrl))) return res.status(400).json({ error: 'Elige una de las imágenes de la publicación' });
+    await startVideo(id, { sourceUrl: String(sourceUrl), prompt: text, model });
+    return res.status(202).json({ status: 'generating' });
+  } catch (err: any) {
+    console.error('[SOCIAL CONTENT VIDEO ERROR]:', err.message);
+    return res.status(400).json({ error: err.message || 'No se pudo empezar el vídeo' });
   }
 });
 
