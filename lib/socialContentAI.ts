@@ -46,6 +46,8 @@ export interface GeneratedCopy {
   copy: string;
   script: string;
   hashtags: string;
+  imagePrompt: string;   // para la app de Gemini (Nano Banana Pro) con la foto real adjunta
+  videoPrompt: string;   // para Flow/Veo: vídeo vertical de 8 s
 }
 
 const euros = (cents: number) => (cents / 100).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -150,7 +152,10 @@ function parseCopy(text: string): GeneratedCopy {
   let parsed: any;
   try { parsed = JSON.parse(jsonMatch[0]); } catch { parsed = JSON.parse(repairJson(jsonMatch[0])); }
   const str = (v: any) => (Array.isArray(v) ? v.join('\n') : String(v || '')).trim();
-  const copy = { hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: str(parsed.hashtags) };
+  const copy = {
+    hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: str(parsed.hashtags),
+    imagePrompt: str(parsed.image_prompt), videoPrompt: str(parsed.video_prompt),
+  };
   if (!copy.copy && !copy.hook) throw new Error('La IA devolvió el contenido vacío');
   return copy;
 }
@@ -185,7 +190,9 @@ Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
 {"hook": "primera frase para enganchar en los 2 primeros segundos",
  "copy": "texto para la descripción del TikTok, máx 2 líneas, con 1 emoji máximo",
  "script": "guion corto plano por escenas para grabar el vídeo o para el carrusel (3-5 pasos)",
- "hashtags": "6-8 hashtags separados por espacio, mezcla de nicho moto y genéricos de España"}`;
+ "hashtags": "6-8 hashtags separados por espacio, mezcla de nicho moto y genéricos de España",
+ "image_prompt": "instrucciones en español para generar en la app de Gemini una foto vertical 9:16 de ambiente con la FOTO REAL DEL PRODUCTO ADJUNTA: escena, luz, encuadre; pide conservar exactamente forma, colores y logotipos del producto y no añadir texto",
+ "video_prompt": "instrucciones en español para generar en Flow (Veo) un vídeo vertical 9:16 de 8 segundos a partir de la foto del producto: planos, movimiento de cámara, ambiente y sonido (p. ej. el escape al acelerar); sin texto en pantalla y sin cambiar el producto"}`;
 
   try {
     return { ...parseCopy(await geminiGenerateText(prompt)), engine: 'gemini' };

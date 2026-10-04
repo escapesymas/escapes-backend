@@ -1,12 +1,30 @@
 import { Router } from 'express';
+import fs from 'fs';
+import path from 'path';
+import multer from 'multer';
 import { requireAdminRole } from '../lib/agent-auth.js';
 import {
   listSlots, createSlot, deleteSlot, updateSlot, markPublished,
-  startSlotGeneration, autoScheduleUpcoming, FORMATS, STATUSES,
+  startSlotGeneration, autoScheduleUpcoming, addFinalMedia, removeFinalMedia, FORMATS, STATUSES,
 } from '../lib/socialContentCalendar.js';
 import { productBySku } from '../lib/socialContentAI.js';
 
 export const socialContentRouter = Router();
+
+// Imagen o vídeo final hecho con la app de Gemini / Flow (vídeos de móvil: hasta 300 MB).
+const FINAL_DIR = path.join(process.cwd(), 'uploads', 'social-content', 'final');
+const FINAL_TYPES: Record<string, string> = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/heic': 'heic',
+  'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm',
+};
+const finalUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => { fs.mkdirSync(FINAL_DIR, { recursive: true }); cb(null, FINAL_DIR); },
+    filename: (_req, file, cb) => cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${FINAL_TYPES[file.mimetype] || 'bin'}`),
+  }),
+  limits: { fileSize: 300 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => cb(null, !!FINAL_TYPES[file.mimetype]),
+});
 
 const parseId = (v: any) => { const n = parseInt(String(v), 10); return Number.isFinite(n) && n > 0 ? n : null; };
 const validDate = (v: any) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
@@ -101,6 +119,51 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
   } catch (err: any) {
     console.error('[SOCIAL CONTENT UPDATE ERROR]:', err.message);
     return res.status(500).json({ error: 'No se pudo guardar' });
+  }
+});
+
+// POST /api/social-content/:id/final  (multipart, campo "file") — imagen o vídeo final.
+socialContentRouter.post('/social-content/:id/final', async (req, res, next) => {
+  if (!(await requireAdminRole(req, res))) return;
+  next();
+}, (req, res, next) => {
+  finalUpload.single('file')(req, res, (err: any) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'El archivo pasa de 300 MB' : 'No se pudo subir el archivo' });
+    next();
+  });
+}, async (req: any, res) => {
+  const id = parseId(req.params.id);
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'Sube una imagen (JPG, PNG, WEBP, HEIC) o un vídeo (MP4, MOV, WEBM)' });
+  if (!id) { fs.unlink(file.path, () => {}); return res.status(400).json({ error: 'ID inválido' }); }
+  try {
+    const item = {
+      url: `/uploads/social-content/final/${file.filename}`,
+      type: (file.mimetype.startsWith('video/') ? 'video' : 'image') as 'image' | 'video',
+      name: String(file.originalname || file.filename).slice(0, 120),
+    };
+    if (!(await addFinalMedia(id, item))) { fs.unlink(file.path, () => {}); return res.status(404).json({ error: 'Publicación no encontrada' }); }
+    return res.json({ item });
+  } catch (err: any) {
+    fs.unlink(file.path, () => {});
+    console.error('[SOCIAL CONTENT FINAL ERROR]:', err.message);
+    return res.status(500).json({ error: 'No se pudo guardar el archivo' });
+  }
+});
+
+// DELETE /api/social-content/:id/final?url=/uploads/social-content/final/...
+socialContentRouter.delete('/social-content/:id/final', async (req, res) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const id = parseId(req.params.id);
+  const url = String(req.query.url || '');
+  const m = url.match(/^\/uploads\/social-content\/final\/([\w.-]+)$/);
+  if (!id || !m) return res.status(400).json({ error: 'Datos inválidos' });
+  try {
+    if (await removeFinalMedia(id, url)) fs.unlink(path.join(FINAL_DIR, m[1]), () => {});
+    return res.json({ success: true });
+  } catch (err: any) {
+    console.error('[SOCIAL CONTENT FINAL DELETE ERROR]:', err.message);
+    return res.status(500).json({ error: 'No se pudo quitar el archivo' });
   }
 });
 

@@ -18,6 +18,9 @@ export interface ContentSlot {
   hashtags: string | null;
   script: string | null;
   media_urls: string[];
+  image_prompt?: string | null;
+  video_prompt?: string | null;
+  final_media?: { url: string; type: 'image' | 'video'; name: string }[];
   status: 'draft' | 'generating' | 'ready' | 'published' | 'skipped';
   error: string | null;
   notified_at: string | null;
@@ -83,6 +86,27 @@ export async function updateSlot(id: number, fields: Partial<Pick<ContentSlot, '
   await pool.query(`UPDATE social_content_calendar SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`, params);
 }
 
+/** Añade la imagen o el vídeo final (hecho a mano en Gemini/Flow) a la publicación. */
+export async function addFinalMedia(id: number, item: { url: string; type: 'image' | 'video'; name: string }) {
+  const { rowCount } = await pool.query(
+    `UPDATE social_content_calendar
+       SET final_media = final_media || $2::jsonb,
+           status = CASE WHEN status IN ('draft', 'skipped') THEN 'ready' ELSE status END, updated_at = NOW()
+     WHERE id = $1`, [id, JSON.stringify([item])]);
+  return rowCount > 0;
+}
+
+/** Quita un fichero final de la publicación; devuelve si estaba. */
+export async function removeFinalMedia(id: number, url: string) {
+  const { rows: [r] } = await pool.query(
+    `UPDATE social_content_calendar c
+       SET final_media = COALESCE((SELECT jsonb_agg(e) FROM jsonb_array_elements(c.final_media) e WHERE e->>'url' <> $2), '[]'::jsonb),
+           updated_at = NOW()
+     WHERE id = $1 AND final_media @> jsonb_build_array(jsonb_build_object('url', $2::text))
+     RETURNING id`, [id, url]);
+  return !!r;
+}
+
 export async function markPublished(id: number) {
   await pool.query(`UPDATE social_content_calendar SET status = 'published', published_at = NOW(), updated_at = NOW() WHERE id = $1`, [id]);
 }
@@ -122,10 +146,10 @@ async function generateSlotContent(id: number) {
     await pool.query(
       `UPDATE social_content_calendar
          SET copy = $1, hashtags = $2, script = $3, media_urls = $4::jsonb, product_sku = $5,
-             status = 'ready', error = $6, updated_at = NOW()
-       WHERE id = $7`,
+             status = 'ready', error = $6, image_prompt = $7, video_prompt = $8, updated_at = NOW()
+       WHERE id = $9`,
       [[copy.hook, copy.copy].filter(Boolean).join('\n\n'), copy.hashtags, copy.script, JSON.stringify(urls),
-        product?.sku || null, notes.length ? notes.join(' ') : null, id]);
+        product?.sku || null, notes.length ? notes.join(' ') : null, copy.imagePrompt || null, copy.videoPrompt || null, id]);
   } catch (err: any) {
     await pool.query(
       `UPDATE social_content_calendar SET status = 'draft', error = $1, updated_at = NOW() WHERE id = $2`,
