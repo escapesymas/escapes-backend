@@ -296,13 +296,14 @@ async function generateCustomerNotes(conversationId: number) {
     'Eres el ayudante de los asesores de Escapes y Más, tienda de recambios de moto. A partir del chat, apunta hasta 3 notas internas ' +
     'útiles para futuras atenciones de este cliente: su moto (marca, modelo y año), preferencias (marcas, presupuesto, uso), qué quería o compró ' +
     'y lo que quedó pendiente o se le prometió. Una nota por línea, que empiece por «- », de 20 palabras como mucho. ' +
-    'No apuntes datos sensibles (teléfonos, direcciones, emails, datos de pago, salud) ni saludos o cortesías. ' +
+    'Apunta solo hechos que el chat dice; nunca notas sobre lo que no se sabe. No apuntes datos sensibles (teléfonos, direcciones, emails, datos de pago, salud) ni saludos o cortesías. ' +
     'No repitas lo que ya dicen las notas existentes. Si no hay nada útil, responde solo: NINGUNA.',
     `Notas existentes:\n${existing.map((n: any) => `- ${n.body}`).join('\n') || '(ninguna)'}\n\nChat:\n${text}`, 500);
   if (!answer || /^\s*NINGUNA/i.test(answer)) return;
   const notes = answer.split('\n')
     .map((l) => l.replace(/^\s*[-•*\d.)]+\s*/, '').trim())
-    .filter((l) => l.length >= 4 && !/^NINGUNA/i.test(l))
+    // Fuera las que solo dicen que no se sabe nada («Sin datos de…», «No indica…»).
+    .filter((l) => l.length >= 4 && !/^(NINGUNA|sin (datos|informaci)|no (hay|se sabe|indica|consta|menciona|aporta))/i.test(l))
     .slice(0, 3);
   for (const body of notes) {
     await pool.query(
