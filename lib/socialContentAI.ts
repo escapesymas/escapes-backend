@@ -278,7 +278,9 @@ montaña, buena luz, sin texto superpuesto. ${opts.topic ? `Enfoque: ${opts.topi
           `${scene}\nColoca EXACTAMENTE el producto de la foto adjunta (${p.brand} ${p.name}) en la escena, sin cambiar su forma, colores ni logotipos.`,
           reference);
       } catch (err: any) {
-        notes.push('No se pudo crear la imagen de ambiente (Gemini no responde); se usan las fotos reales del producto.');
+        notes.push(/ 429$/.test(err.message)
+          ? 'Sin imagen de ambiente: la cuenta de Gemini no tiene cuota para imágenes (plan gratuito). Activa la facturación en Google AI Studio. Se usan las fotos reales del producto.'
+          : 'No se pudo crear la imagen de ambiente (Gemini no responde); se usan las fotos reales del producto.');
         console.warn('[SOCIAL CONTENT] imagen de ambiente:', err.message);
       }
     }
