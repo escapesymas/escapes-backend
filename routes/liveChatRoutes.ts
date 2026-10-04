@@ -235,6 +235,13 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
     const { rows: [o] } = await pool.query(
       `UPDATE orders SET created_by_user_id = $2, sales_channel = 'chat', chat_order_id = $3 WHERE id = $1
        RETURNING total, created_at`, [orderId, co.agent_user_id, co.id]);
+    // Atribuible al asesor: sus productos (hasta la cantidad que preparó), sin el resto del carrito.
+    await pool.query(
+      `UPDATE chat_orders co SET attributed_cents = (
+         SELECT COALESCE(SUM(oi.price * LEAST(oi.quantity, p.quantity)), 0)::int
+         FROM order_items oi JOIN jsonb_to_recordset(co.items) AS p(id int, quantity int) ON p.id = oi.product_id
+         WHERE oi.order_id = $2)
+       WHERE co.id = $1`, [co.id, orderId]);
     if (co.conversation_id) {
       const num = formatOrderNumber(orderId, o?.created_at);
       await addMessage(co.conversation_id, 'system', `🧾 Pedido ${num} creado (${((o?.total || 0) / 100).toFixed(2).replace('.', ',')} €), pendiente de pago.`);
@@ -604,7 +611,7 @@ liveChatRouter.get('/admin/chat-orders', async (req: any, res: any) => {
   try {
     const { rows } = await pool.query(
       `SELECT co.id, co.created_at, co.agent_user_id, co.agent_name, co.user_id, co.conversation_id,
-              co.estimate_cents, co.order_id, o.status AS order_status, o.total AS order_total, o.paid_at, o.created_at AS order_created_at,
+              co.estimate_cents, co.attributed_cents, co.order_id, o.status AS order_status, o.total AS order_total, o.paid_at, o.created_at AS order_created_at,
               NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS customer_name, u.email AS customer_email
        FROM chat_orders co
        LEFT JOIN orders o ON o.id = co.order_id
@@ -623,7 +630,7 @@ liveChatRouter.get('/admin/chat-orders', async (req: any, res: any) => {
       const a = byAgent.get(key) || { agent_user_id: o.agent_user_id, agent_name: o.agent_name, sent: 0, ordered: 0, paid: 0, paid_cents: 0 };
       a.sent++;
       if (o.order_id) a.ordered++;
-      if (o.paid) { a.paid++; a.paid_cents += Number(o.order_total) || 0; }
+      if (o.paid) { a.paid++; a.paid_cents += Number(o.attributed_cents ?? o.order_total) || 0; }
       byAgent.set(key, a);
     }
     res.json({ month, orders, agents: [...byAgent.values()] });
