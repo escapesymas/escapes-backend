@@ -310,13 +310,17 @@ export function extractMotorcycleFromQuery(query: string): GarageMotorcycle | nu
   }
 
   if (!modelStr) {
-    const modelPattern = /\b([a-z]{1,3}\s*\d{2,4}\s*[a-z]{0,4}|[a-z]+\s*\d{2,4})\b/gi;
-    const matches = lower.match(modelPattern) || [];
-    for (const m of matches) {
-      const cleanM = m.trim().toUpperCase();
-      if (KNOWN_BRANDS.has(cleanM)) continue;
-      if (/^(PARA|COMO|TENGO|TIENES|QUIERO|BUSCO|HOLA|CAMBIAR|COMPRAR|RECAMBIO|ESCAPE|TRANSMISION|CADENA|PIÑON|CORONA|KIT)$/i.test(cleanM)) continue;
-      modelStr = cleanM;
+    // Modelo suelto en cualquier parte de la frase (también si la marca va después
+    // o no se dice): «pcx 125», «mt-07», «z900», «r1250gs», «cb500f». Sin palabras
+    // detrás («pcx 125 es de 2022» → «PCX 125») ni falsos modelos («talla 58», «kit 520»).
+    const modelPattern = /\b([a-z]{1,4})[\s-]?(\d{2,4})([a-z]{0,3})\b/gi;
+    const notModels = /^(kit|paso|talla|ref|mm|cm|cc|tipo|num|nº|pack|euro|anos|años|ano|año|de|del|es|la|el|los|las|una|un|para|con|y|o)$/i;
+    let m: RegExpExecArray | null;
+    while ((m = modelPattern.exec(lower))) {
+      const letters = m[1];
+      if (notModels.test(letters) || KNOWN_BRANDS.has(letters.toUpperCase()) || /^(19|20)\d\d$/.test(m[2]) && !m[3] && letters.length > 3) continue;
+      if (BRAND_ALIASES[letters]) continue;
+      modelStr = `${letters}${m[0].includes('-') ? '-' : m[0].includes(' ') ? ' ' : ''}${m[2]}${m[3]}`.toUpperCase();
       break;
     }
   }
@@ -390,18 +394,20 @@ function productTerms(text: string): string[] {
  */
 export function buildSearchQuery(userMessages: string[]): string {
   const msgs = userMessages.map((m) => m.trim()).filter(Boolean);
-  const last = msgs[msgs.length - 1] || '';
-  const previous = msgs.slice(0, -1).reverse().slice(0, 3);
-  let query = last;
-  // Sin producto propio («¿y alguna más barata?», «¿y la trasera?») se arrastra la
-  // petición anterior; con producto propio («¿y pastillas?») solo la moto.
-  if (previous.length > 0 && productTerms(last).length <= 1) {
-    const lastRequest = previous.find((m) => productTerms(m).length > 0);
-    if (lastRequest) query = `${lastRequest} ${last}`;
+  if (msgs.length === 0) return '';
+  // Respuestas cortas encadenadas («es de 2022», «es honda», «¿y la trasera?») se
+  // suman a la última petición de verdad (con al menos dos términos de producto).
+  const parts: string[] = [msgs[msgs.length - 1]];
+  if (productTerms(parts[0]).length <= 1) {
+    for (let i = msgs.length - 2; i >= Math.max(0, msgs.length - 6); i--) {
+      parts.unshift(msgs[i]);
+      if (productTerms(msgs[i]).length >= 2) break;
+    }
   }
+  let query = parts.join(' ');
   if (!extractMotorcycleFromQuery(query)?.brand) {
-    for (const m of previous) {
-      const moto = extractMotorcycleFromQuery(m);
+    for (let i = msgs.length - parts.length - 1; i >= Math.max(0, msgs.length - 8); i--) {
+      const moto = extractMotorcycleFromQuery(msgs[i]);
       if (moto?.brand) { query = `${query} ${moto.brand} ${moto.model}${moto.year ? ` ${moto.year}` : ''}`.trim(); break; }
     }
   }
@@ -424,7 +430,8 @@ export async function getCatalogContext(
   // El año de la moto no está en el texto de búsqueda (se filtra después con la
   // compatibilidad): «pastillas mt-07 2019» buscaría «2019» y no daría nada.
   if (queryMoto?.year) base = base.replace(new RegExp(`\\b${queryMoto.year}\\b`, 'g'), ' ').replace(/\s+/g, ' ').trim();
-  const garageMoto = !queryMoto
+  // Si nombra un modelo aunque no diga la marca («pcx 125»), no se usa el garaje.
+  const garageMoto = !queryMoto && !parsed?.model
     ? garageEntries.map(parseGarageMotorcycle).find((m): m is GarageMotorcycle => !!m && !!m.brand) || null
     : null;
 
@@ -485,12 +492,18 @@ export async function getCatalogContext(
   }).slice(0, 6);
 
   const notes: string[] = [];
-  if (missing) notes.push(`NO HAY NADA QUE CUMPLA «${missing}» EN ESTA BÚSQUEDA. Díselo al cliente y ofrécele estas alternativas.`);
+  if (missing) {
+    notes.push(`Ningún producto lleva «${missing}» en su nombre: estos son los más parecidos. Ofrécelos aclarando que «${missing}» no figura ` +
+      `en su descripción (si es una marca, que ahora mismo no la tenemos; si es una posición o variante, que lo compruebe en la ficha).`);
+  }
   if (moto && moto === garageMoto) {
     notes.push(`Resultados para su moto ${moto.brand} ${moto.model}${moto.year ? ` (${moto.year})` : ''} (la elegida en la web o la primera de su garaje).`);
     if (garageEntries.length > 1) {
       notes.push(`Tiene más motos guardadas (${garageEntries.slice(1, 4).join(', ')}): menciona para cuál son y ofrece buscar para otra.`);
     }
+  }
+  if (!queryMoto && parsed?.model) {
+    notes.push(`Ha nombrado el modelo ${parsed.model} sin la marca: estos productos no están filtrados por su moto. Pregúntale marca y año para confirmar la compatibilidad.`);
   }
   if (moto && !moto.year) {
     notes.push('NO SABEMOS EL AÑO DE LA MOTO: indica los años compatibles de cada producto y pregúntale el año para confirmar.');
