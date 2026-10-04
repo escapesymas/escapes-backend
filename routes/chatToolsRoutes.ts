@@ -238,20 +238,86 @@ async function askAI(system: string, user: string, maxTokens = 500): Promise<str
     .trim();
 }
 
-/** Resumen para el asesor de lo hablado (sobre todo con la IA) antes de atender. */
+const summarizing = new Set<number>();
+
+/**
+ * Resumen para el asesor de lo hablado (sobre todo con la IA). Se guarda con el
+ * último mensaje incluido para rehacerlo solo si hay mensajes nuevos.
+ */
 export async function generateSummary(conversationId: number): Promise<string | null> {
+  if (summarizing.has(conversationId)) return null;
+  summarizing.add(conversationId);
   try {
+    const { rows: [last] } = await pool.query(
+      `SELECT max(id)::bigint AS id FROM chat_messages WHERE conversation_id = $1 AND sender <> 'system'`, [conversationId]);
     const text = await transcript(conversationId);
-    if (!text) return null;
+    if (!text || !last?.id) return null;
     const summary = await askAI(
-      'Eres el ayudante de los asesores de Escapes y Más, tienda de recambios de moto. Resume la conversación para el asesor que va a atender al cliente: en 3 líneas cortas, qué quiere el cliente, su moto (marca, modelo y año) si se sabe y qué le ha ofrecido o respondido ya el asistente. Español, sin títulos ni markdown, máximo 60 palabras.',
+      'Eres el ayudante de los asesores de Escapes y Más, tienda de recambios de moto. Resume la conversación para el asesor que va a atender al cliente: en 3 líneas cortas, qué quiere el cliente, su moto (marca, modelo y año) si se sabe y qué le ha ofrecido o respondido ya el asistente o el asesor. Español, sin títulos ni markdown, máximo 60 palabras.',
       text, 400);
-    if (summary) await pool.query(`UPDATE chat_conversations SET summary = $2 WHERE id = $1`, [conversationId, summary.slice(0, 1000)]);
+    if (summary) {
+      await pool.query(`UPDATE chat_conversations SET summary = $2, summary_msg_id = $3 WHERE id = $1`,
+        [conversationId, summary.slice(0, 1000), last.id]);
+    }
     return summary || null;
   } catch (err: any) {
     console.error('[CHAT TOOLS] summary:', err.message);
     return null;
+  } finally {
+    summarizing.delete(conversationId);
   }
+}
+
+/** Al abrir una conversación: resumen nuevo si no lo tiene o hay mensajes después del último resumen. */
+export async function ensureFreshSummary(conversationId: number) {
+  const { rows: [c] } = await pool.query(
+    `SELECT c.summary_msg_id,
+            (SELECT max(id) FROM chat_messages m WHERE m.conversation_id = c.id AND m.sender <> 'system') AS last_id
+     FROM chat_conversations c WHERE c.id = $1`, [conversationId]);
+  if (c?.last_id && (!c.summary_msg_id || Number(c.last_id) > Number(c.summary_msg_id))) {
+    generateSummary(conversationId).catch(() => {});
+  }
+}
+
+/**
+ * Notas internas que la IA apunta en la ficha del cliente al cerrarse una
+ * conversación: lo útil para la próxima vez (moto, preferencias, qué quería o
+ * compró, pendientes). Sin datos sensibles y sin repetir las que ya hay.
+ */
+async function generateCustomerNotes(conversationId: number) {
+  const { rows: [conv] } = await pool.query(
+    `UPDATE chat_conversations SET notes_ai_at = NOW() WHERE id = $1 AND notes_ai_at IS NULL RETURNING user_id`, [conversationId]);
+  if (!conv) return;
+  const text = await transcript(conversationId);
+  if (!text.includes('Cliente:')) return;
+  const { rows: existing } = await pool.query(
+    `SELECT body FROM customer_notes WHERE customer_user_id = $1 ORDER BY created_at DESC LIMIT 30`, [conv.user_id]);
+  const answer = await askAI(
+    'Eres el ayudante de los asesores de Escapes y Más, tienda de recambios de moto. A partir del chat, apunta hasta 3 notas internas ' +
+    'útiles para futuras atenciones de este cliente: su moto (marca, modelo y año), preferencias (marcas, presupuesto, uso), qué quería o compró ' +
+    'y lo que quedó pendiente o se le prometió. Una nota por línea, que empiece por «- », de 20 palabras como mucho. ' +
+    'No apuntes datos sensibles (teléfonos, direcciones, emails, datos de pago, salud) ni saludos o cortesías. ' +
+    'No repitas lo que ya dicen las notas existentes. Si no hay nada útil, responde solo: NINGUNA.',
+    `Notas existentes:\n${existing.map((n: any) => `- ${n.body}`).join('\n') || '(ninguna)'}\n\nChat:\n${text}`, 500);
+  if (!answer || /^\s*NINGUNA/i.test(answer)) return;
+  const notes = answer.split('\n')
+    .map((l) => l.replace(/^\s*[-•*\d.)]+\s*/, '').trim())
+    .filter((l) => l.length >= 4 && !/^NINGUNA/i.test(l))
+    .slice(0, 3);
+  for (const body of notes) {
+    await pool.query(
+      `INSERT INTO customer_notes (customer_user_id, author_user_id, author_name, body, source, conversation_id)
+       VALUES ($1, NULL, 'IA', $2, 'ia', $3)`, [conv.user_id, body.slice(0, 500), conversationId]);
+  }
+}
+
+/** Conversaciones cerradas (por quien sea) en los últimos 2 días sin notas de la IA. */
+async function customerNotesJob() {
+  const { rows } = await pool.query(
+    `SELECT id FROM chat_conversations
+     WHERE status = 'closed' AND notes_ai_at IS NULL AND closed_at > NOW() - INTERVAL '2 days'
+     ORDER BY closed_at LIMIT 5`);
+  for (const r of rows) await generateCustomerNotes(r.id);
 }
 
 // POST /api/admin/chats/:id/summary — (re)genera el resumen.
@@ -303,7 +369,7 @@ chatToolsRouter.get('/admin/chats/:id/profile', async (req: any, res: any) => {
          FROM chat_conversations c WHERE c.user_id = $1 AND c.id <> $2 ORDER BY c.created_at DESC LIMIT 20`, [uid, id]).then((r) => r.rows),
       pool.query(`SELECT id, status, total, created_at, sales_channel FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [uid])
         .then((r) => r.rows.map((o: any) => ({ ...o, number: formatOrderNumber(o.id, o.created_at) }))),
-      pool.query(`SELECT id, author_user_id, author_name, body, created_at FROM customer_notes WHERE customer_user_id = $1 ORDER BY created_at DESC LIMIT 100`, [uid])
+      pool.query(`SELECT id, author_user_id, author_name, body, source, created_at FROM customer_notes WHERE customer_user_id = $1 ORDER BY created_at DESC LIMIT 100`, [uid])
         .then((r) => r.rows),
     ]);
     const spent = orders.filter((o: any) => PAID_STATUSES.includes(o.status)).reduce((a: number, o: any) => a + Number(o.total || 0), 0);
@@ -335,7 +401,7 @@ chatToolsRouter.delete('/admin/chats/:id/notes/:noteId', async (req: any, res: a
   const auth = id ? await agentFor(req, res, id) : null;
   if (!id || !auth) return;
   const { rowCount } = await pool.query(
-    `DELETE FROM customer_notes WHERE id = $1 AND ($2 OR author_user_id = $3)`, [parseId(req.params.noteId) || 0, auth.isAdmin, auth.user_id]);
+    `DELETE FROM customer_notes WHERE id = $1 AND ($2 OR author_user_id = $3 OR source = 'ia')`, [parseId(req.params.noteId) || 0, auth.isAdmin, auth.user_id]);
   if (!rowCount) return res.status(403).json({ error: 'No puedes borrar esta nota' });
   res.json({ ok: true });
 });
@@ -471,5 +537,6 @@ export function startChatJobs() {
   const run = (name: string, fn: () => Promise<void>) => fn().catch((err) => console.error(`[CHAT JOBS] ${name}:`, err.message));
   setInterval(() => run('inactividad', inactivityJob), 60_000);
   setInterval(() => run('pedidos sin pagar', unpaidOrdersJob), 10 * 60_000);
+  setInterval(() => run('notas de la IA', customerNotesJob), 60_000);
   setTimeout(() => run('pedidos sin pagar', unpaidOrdersJob), 60_000);
 }

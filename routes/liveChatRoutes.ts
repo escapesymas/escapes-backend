@@ -398,11 +398,17 @@ liveChatRouter.get('/admin/chats/:id', async (req: any, res: any) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
   if (!(await agentFor(req, res, id))) return;
+  // Al abrirla (carga completa), resumen de la IA si falta o hay mensajes nuevos.
+  if (!req.query.after || req.query.after === '0') {
+    import('./chatToolsRoutes.js').then((m) => m.ensureFreshSummary(id)).catch(() => {});
+  }
   try {
     const { rows: [conv] } = await pool.query(
       `UPDATE chat_conversations SET admin_seen_at = NOW() WHERE id = $1
        RETURNING id, user_id, status, created_at, closed_by, customer_seen_at, agent_user_id, agent_name,
-                 offline, summary, rating, rating_comment, customer_typing_at, customer_read_id`, [id]);
+                 offline, summary, rating, rating_comment, customer_typing_at, customer_read_id,
+                 COALESCE(summary_msg_id, 0) < COALESCE((SELECT max(m.id) FROM chat_messages m
+                   WHERE m.conversation_id = chat_conversations.id AND m.sender <> 'system'), 0) AS summary_stale`, [id]);
     if (!conv) return res.status(404).json({ error: 'Conversación no encontrada' });
     const after = parseInt(String(req.query.after || '0'), 10) || 0;
     const [messages, who, orders, garage] = await Promise.all([
@@ -422,13 +428,14 @@ liveChatRouter.get('/admin/chats/:id', async (req: any, res: any) => {
       await pool.query(`UPDATE chat_conversations SET agent_read_id = GREATEST(agent_read_id, $2) WHERE id = $1`,
         [id, messages[messages.length - 1].id]);
     }
-    const { customer_typing_at: typingAt, ...rest } = conv;
+    const { customer_typing_at: typingAt, summary_stale: summaryStale, ...rest } = conv;
     res.json({
       conversation: {
         ...rest,
         customerOnline: Date.now() - new Date(conv.customer_seen_at).getTime() < 45_000,
         customerTyping: !!typingAt && Date.now() - new Date(typingAt).getTime() < 6000,
         customerReadId: Number(conv.customer_read_id) || 0,
+        summaryStale,
         customer: who, orders, garage, chatOrders,
       },
       messages,
