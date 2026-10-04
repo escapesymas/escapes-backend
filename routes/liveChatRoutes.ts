@@ -347,7 +347,7 @@ liveChatRouter.get('/admin/chats', async (req: any, res: any) => {
     await closeStaleConversations();
     const closed = req.query.scope === 'closed';
     const { rows } = await pool.query(
-      `SELECT c.id, c.status, c.created_at, c.updated_at, c.closed_by, c.agent_name,
+      `SELECT c.id, c.status, c.created_at, c.updated_at, c.closed_by, c.agent_name, c.agent_user_id,
               u.id AS user_id, NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS name, u.email,
               (SELECT content FROM chat_messages m WHERE m.conversation_id = c.id AND m.sender IN ('customer','agent')
                 ORDER BY id DESC LIMIT 1) AS last_message,
@@ -416,13 +416,32 @@ const PAID_STATUSES = ['paid', 'processing', 'shipped', 'delivered', 'completed'
  * Asigna la conversación al asesor si aún no la atiende nadie y envía la
  * bienvenida con su nombre. Devuelve la bienvenida (si se ha enviado).
  */
-async function ensureTaken(conversationId: number, adminUserId: number) {
-  const name = await agentNameFor(adminUserId);
+/** Un asesor solo atiende un chat a la vez (el administrador, los que quiera). */
+class AgentBusyError extends Error {
+  constructor() { super('Ya estás atendiendo un chat: ciérralo antes de coger otro.'); }
+}
+
+/**
+ * Asigna la conversación al asesor si aún no la atiende nadie y envía la
+ * bienvenida con su nombre. Devuelve la bienvenida (si se ha enviado). Un
+ * asesor con otro chat abierto no puede cogerla (AgentBusyError); la
+ * comprobación va en la misma sentencia para que no se cuele con dos clics.
+ */
+async function ensureTaken(conversationId: number, agent: AgentAuth) {
+  const name = await agentNameFor(agent.user_id);
   const { rows: [conv] } = await pool.query(
     `UPDATE chat_conversations SET agent_user_id = $2, agent_name = $3, status = 'open', taken_at = COALESCE(taken_at, NOW())
      WHERE id = $1 AND status <> 'closed' AND agent_user_id IS NULL
-     RETURNING id, user_id`, [conversationId, adminUserId, name]);
-  if (!conv) return null;
+       AND ($4 OR NOT EXISTS (SELECT 1 FROM chat_conversations o
+                              WHERE o.agent_user_id = $2 AND o.status <> 'closed' AND o.id <> $1))
+     RETURNING id, user_id`, [conversationId, agent.user_id, name, agent.isAdmin]);
+  if (!conv) {
+    if (!agent.isAdmin) {
+      const { rows: [c] } = await pool.query(`SELECT agent_user_id, status FROM chat_conversations WHERE id = $1`, [conversationId]);
+      if (c && c.agent_user_id == null && c.status !== 'closed') throw new AgentBusyError();
+    }
+    return null;
+  }
   const settings = await getSupportSettings();
   const who = await customerName(conv.user_id);
   const firstName = who.name.includes('@') ? '' : who.name.split(' ')[0];
@@ -452,9 +471,10 @@ async function notifyCustomer(conv: any, agentName: string, preview: string) {
 
 /** Mensaje del asesor de cualquier tipo (texto, producto, imagen o pedido). */
 async function agentSend(
-  conversationId: number, adminUserId: number, kind: ChatMessageKind, content: string, payload: any, preview: string,
+  conversationId: number, agent: AgentAuth, kind: ChatMessageKind, content: string, payload: any, preview: string,
 ) {
-  const welcome = await ensureTaken(conversationId, adminUserId);
+  const adminUserId = agent.user_id;
+  const welcome = await ensureTaken(conversationId, agent);
   const { rows: [conv] } = await pool.query(
     `UPDATE chat_conversations SET admin_seen_at = NOW() WHERE id = $1 AND status <> 'closed'
      RETURNING id, user_id, agent_name, customer_seen_at, last_email_at`, [conversationId]);
@@ -544,7 +564,7 @@ liveChatRouter.post('/admin/chats/:id/take', async (req: any, res: any) => {
   const auth = await agentFor(req, res, id);
   if (!auth) return;
   try {
-    const welcome = await ensureTaken(id, auth.user_id);
+    const welcome = await ensureTaken(id, auth);
     if (welcome) {
       const { rows: [conv] } = await pool.query(
         `SELECT id, user_id, agent_name, customer_seen_at, last_email_at FROM chat_conversations WHERE id = $1`, [id]);
@@ -552,6 +572,7 @@ liveChatRouter.post('/admin/chats/:id/take', async (req: any, res: any) => {
     }
     res.json({ messages: welcome ? [welcome] : [] });
   } catch (err: any) {
+    if (err instanceof AgentBusyError) return res.status(409).json({ error: err.message });
     console.error('[LIVE CHAT] take:', err.message);
     res.status(500).json({ error: 'No se pudo atender la conversación' });
   }
@@ -565,10 +586,11 @@ liveChatRouter.post('/admin/chats/:id/message', async (req: any, res: any) => {
   const content = clean(req.body?.content, 2000);
   if (!id || !content) return res.status(400).json({ error: 'Escribe un mensaje.' });
   try {
-    const out = await agentSend(id, auth.user_id, 'text', content, null, content);
+    const out = await agentSend(id, auth, 'text', content, null, content);
     if (!out) return res.status(409).json({ error: 'La conversación está cerrada.' });
     res.json(out);
   } catch (err: any) {
+    if (err instanceof AgentBusyError) return res.status(409).json({ error: err.message });
     console.error('[LIVE CHAT] admin message:', err.message);
     res.status(500).json({ error: 'No se pudo enviar el mensaje' });
   }
@@ -584,10 +606,11 @@ liveChatRouter.post('/admin/chats/:id/product', async (req: any, res: any) => {
   try {
     const card = await productCard(productId);
     if (!card) return res.status(404).json({ error: 'Producto no disponible' });
-    const out = await agentSend(id, auth.user_id, 'product', card.name, card, `Te ha enviado un producto: ${card.name}`);
+    const out = await agentSend(id, auth, 'product', card.name, card, `Te ha enviado un producto: ${card.name}`);
     if (!out) return res.status(409).json({ error: 'La conversación está cerrada.' });
     res.json(out);
   } catch (err: any) {
+    if (err instanceof AgentBusyError) return res.status(409).json({ error: err.message });
     console.error('[LIVE CHAT] product:', err.message);
     res.status(500).json({ error: 'No se pudo enviar el producto' });
   }
@@ -610,6 +633,7 @@ liveChatRouter.post('/admin/chats/:id/image', async (req: any, res: any, next: a
   const id = parseId(req.params.id);
   if (!id || !req.file) return res.status(400).json({ error: 'Falta la imagen (JPG, PNG, WEBP o GIF de hasta 12 MB)' });
   try {
+    await ensureTaken(id, auth);
     // Se recodifica siempre (quita metadatos como la ubicación y evita ficheros que no sean imagen).
     const image = sharp(req.file.buffer, { failOn: 'error' }).rotate();
     const out = await image.resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).webp({ quality: 82 }).toBuffer({ resolveWithObject: true });
@@ -618,10 +642,11 @@ liveChatRouter.post('/admin/chats/:id/image', async (req: any, res: any, next: a
     await fs.promises.writeFile(path.join(CHAT_UPLOAD_DIR, name), out.data);
     const payload = { url: `/uploads/chat/${name}`, width: out.info.width, height: out.info.height };
     const caption = clean(req.body?.caption, 300);
-    const sent = await agentSend(id, auth.user_id, 'image', caption, payload, caption ? `📷 ${caption}` : 'Te ha enviado una imagen');
+    const sent = await agentSend(id, auth, 'image', caption, payload, caption ? `📷 ${caption}` : 'Te ha enviado una imagen');
     if (!sent) return res.status(409).json({ error: 'La conversación está cerrada.' });
     res.json(sent);
   } catch (err: any) {
+    if (err instanceof AgentBusyError) return res.status(409).json({ error: err.message });
     console.error('[LIVE CHAT] image:', err.message);
     res.status(400).json({ error: 'No se pudo procesar la imagen' });
   }
@@ -700,6 +725,8 @@ liveChatRouter.post('/admin/chats/:id/order', async (req: any, res: any) => {
   try {
     const { rows: [conv] } = await pool.query(`SELECT id, user_id, status FROM chat_conversations WHERE id = $1`, [id]);
     if (!conv || conv.status === 'closed') return res.status(409).json({ error: 'La conversación está cerrada.' });
+    // Antes de guardar nada: si es un chat nuevo, se asigna (o falla si el asesor está ocupado).
+    await ensureTaken(id, auth);
     const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], true);
     if (p.errors.length) return res.status(400).json({ error: p.errors.join(' · ') });
     if (!p.lines.length || !p.quote) return res.status(400).json({ error: 'Añade al menos un producto' });
@@ -724,10 +751,11 @@ liveChatRouter.post('/admin/chats/:id/order', async (req: any, res: any) => {
       tax: p.quote.taxCents, total: p.quote.totalCents, note: note || null,
     };
     const n = p.lines.reduce((a, l) => a + l.quantity, 0);
-    const out = await agentSend(id, auth.user_id, 'order', note || `Pedido preparado por ${agentName}`, payload,
+    const out = await agentSend(id, auth, 'order', note || `Pedido preparado por ${agentName}`, payload,
       `Te ha preparado un pedido (${n} producto${n === 1 ? '' : 's'}). Pulsa para revisar el envío y pagar.`);
     res.json({ ...out, chatOrderId: co.id });
   } catch (err: any) {
+    if (err instanceof AgentBusyError) return res.status(409).json({ error: err.message });
     console.error('[LIVE CHAT] order:', err.message);
     res.status(500).json({ error: 'No se pudo preparar el pedido' });
   }
@@ -936,6 +964,7 @@ liveChatRouter.get('/admin/support-settings', async (req: any, res: any) => {
     myAgentName: await agentNameFor(auth.user_id),
     myOnline: await isAgentOnline(auth.user_id),
     isAdmin: auth.isAdmin,
+    myUserId: auth.user_id,
   });
 });
 
