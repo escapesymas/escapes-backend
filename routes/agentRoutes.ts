@@ -86,7 +86,8 @@ agentRouter.post('/admin/agents/invite', async (req: any, res: any) => {
         `Desde el panel de asesores podrás responder a los clientes, enviarles productos, preparar pedidos con descuento y ver tus comisiones.\n\n` +
         (existing ? 'Ya tienes cuenta en la tienda: entra con tu email y contraseña para aceptar.\n\n' : 'Crea tu contraseña desde el enlace para empezar.\n\n') +
         `El enlace caduca en ${INVITE_DAYS} días.`,
-      cta: { label: existing ? 'Aceptar la invitación' : 'Crear mi acceso', url: `${ASESORES_URL}/?invitacion=${token}` },
+      // Enlace como ruta (no ?parámetro): algunas apps de correo pierden los parámetros.
+      cta: { label: existing ? 'Aceptar la invitación' : 'Crear mi acceso', url: `${ASESORES_URL}/invitacion/${token}` },
     });
     res.json({ invitation: inv, emailStatus: sent.status });
   } catch (err: any) {
