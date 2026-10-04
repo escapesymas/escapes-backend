@@ -7,6 +7,7 @@
 import { pool } from '../db.js';
 import { generateCopy, generateImages, productBySku, pickProduct } from './socialContentAI.js';
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
+import { composeAll, composePromo } from './socialPromo.js';
 
 export interface ContentSlot {
   id: number;
@@ -86,8 +87,56 @@ export async function updateSlot(id: number, fields: Partial<Pick<ContentSlot, '
   await pool.query(`UPDATE social_content_calendar SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`, params);
 }
 
+const missingLogoNote = (brand?: string | null) =>
+  `Falta el logo de ${brand || 'la marca'}: súbelo en «Logos de marcas» y pulsa «Rehacer con logos».`;
+
+/** Marca del producto de una publicación (para su logo). */
+async function slotBrand(productSku: string | null): Promise<string | null> {
+  return productSku ? (await productBySku(productSku))?.brand || null : null;
+}
+
+/**
+ * Vuelve a poner los logos sobre las imágenes base (p. ej. tras subir el logo
+ * de la marca), sin generar nada con IA. También a las imágenes finales subidas.
+ */
+export async function recomposeSlot(id: number): Promise<{ missingBrandLogo: boolean } | null> {
+  const { rows: [slot] } = await pool.query('SELECT * FROM social_content_calendar WHERE id = $1', [id]);
+  if (!slot) return null;
+  const brand = await slotBrand(slot.product_sku);
+  // Publicaciones de antes de las promos: sus imágenes actuales son las base.
+  const base: string[] = slot.base_media?.length ? slot.base_media : slot.media_urls || [];
+  const promo = await composeAll(base, brand);
+  const finals = [];
+  let missing = promo.missingBrandLogo;
+  for (const m of slot.final_media || []) {
+    if (m.type !== 'image') { finals.push(m); continue; }
+    try {
+      const r = await composePromo(m.original || m.url, brand);
+      missing = missing || r.missingBrandLogo;
+      finals.push({ ...m, url: r.url, original: m.original || m.url });
+    } catch { finals.push(m); }
+  }
+  const error = String(slot.error || '').replace(/\s*Falta el logo de [^:]*: súbelo en «Logos de marcas» y pulsa «Rehacer con logos»\./g, '').trim();
+  await pool.query(
+    `UPDATE social_content_calendar SET media_urls = $2::jsonb, base_media = $3::jsonb, final_media = $4::jsonb, error = $5, updated_at = NOW() WHERE id = $1`,
+    [id, JSON.stringify(promo.urls), JSON.stringify(base), JSON.stringify(finals),
+      [error, missing ? missingLogoNote(brand) : ''].filter(Boolean).join(' ') || null]);
+  return { missingBrandLogo: missing };
+}
+
+/** Versión promocional (con logos) de una imagen final subida a mano; si no se puede, la original. */
+export async function promoForUpload(id: number, url: string): Promise<string> {
+  const { rows: [slot] } = await pool.query('SELECT product_sku FROM social_content_calendar WHERE id = $1', [id]);
+  try {
+    return (await composePromo(url, await slotBrand(slot?.product_sku || null))).url;
+  } catch (err: any) {
+    console.warn('[SOCIAL PROMO] imagen subida sin logos:', err.message);
+    return url;
+  }
+}
+
 /** Añade la imagen o el vídeo final (hecho a mano en Gemini/Flow) a la publicación. */
-export async function addFinalMedia(id: number, item: { url: string; type: 'image' | 'video'; name: string }) {
+export async function addFinalMedia(id: number, item: { url: string; type: 'image' | 'video'; name: string; original?: string }) {
   const { rowCount } = await pool.query(
     `UPDATE social_content_calendar
        SET final_media = final_media || $2::jsonb,
@@ -96,15 +145,17 @@ export async function addFinalMedia(id: number, item: { url: string; type: 'imag
   return rowCount > 0;
 }
 
-/** Quita un fichero final de la publicación; devuelve si estaba. */
-export async function removeFinalMedia(id: number, url: string) {
+/** Quita un fichero final de la publicación; devuelve sus ficheros (promo y original) o null si no estaba. */
+export async function removeFinalMedia(id: number, url: string): Promise<string[] | null> {
+  const { rows: [item] } = await pool.query(
+    `SELECT e AS item FROM social_content_calendar c, jsonb_array_elements(c.final_media) e WHERE c.id = $1 AND e->>'url' = $2 LIMIT 1`, [id, url]);
   const { rows: [r] } = await pool.query(
     `UPDATE social_content_calendar c
        SET final_media = COALESCE((SELECT jsonb_agg(e) FROM jsonb_array_elements(c.final_media) e WHERE e->>'url' <> $2), '[]'::jsonb),
            updated_at = NOW()
      WHERE id = $1 AND final_media @> jsonb_build_array(jsonb_build_object('url', $2::text))
      RETURNING id`, [id, url]);
-  return !!r;
+  return r ? [url, item?.item?.original].filter(Boolean) : null;
 }
 
 export async function markPublished(id: number) {
@@ -143,13 +194,17 @@ async function generateSlotContent(id: number) {
 
     const copy = await generateCopy({ format: slot.format, topic: slot.topic, product });
     const { urls, notes } = await generateImages({ format: slot.format, topic: slot.topic, script: copy.script, product });
+    // Imágenes promocionales: logo de escapesymas.com y de la marca encima de cada una.
+    const promo = await composeAll(urls, product?.brand);
+    if (promo.missingBrandLogo) notes.push(missingLogoNote(product?.brand));
     await pool.query(
       `UPDATE social_content_calendar
          SET copy = $1, hashtags = $2, script = $3, media_urls = $4::jsonb, product_sku = $5,
-             status = 'ready', error = $6, image_prompt = $7, video_prompt = $8, updated_at = NOW()
-       WHERE id = $9`,
-      [[copy.hook, copy.copy].filter(Boolean).join('\n\n'), copy.hashtags, copy.script, JSON.stringify(urls),
-        product?.sku || null, notes.length ? notes.join(' ') : null, copy.imagePrompt || null, copy.videoPrompt || null, id]);
+             status = 'ready', error = $6, image_prompt = $7, video_prompt = $8, base_media = $9::jsonb, updated_at = NOW()
+       WHERE id = $10`,
+      [[copy.hook, copy.copy].filter(Boolean).join('\n\n'), copy.hashtags, copy.script, JSON.stringify(promo.urls),
+        product?.sku || null, notes.length ? notes.join(' ') : null, copy.imagePrompt || null, copy.videoPrompt || null,
+        JSON.stringify(urls), id]);
   } catch (err: any) {
     await pool.query(
       `UPDATE social_content_calendar SET status = 'draft', error = $1, updated_at = NOW() WHERE id = $2`,

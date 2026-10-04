@@ -237,7 +237,10 @@ async function geminiGenerateImage(prompt: string, reference: { data: string; mi
   const res = await fetch(`${GEMINI_BASE}/models/gemini-3-pro-image:generateContent?key=${GEMINI_API_KEY}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts }] }),
+    body: JSON.stringify({
+      contents: [{ parts }],
+      generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '9:16' } },
+    }),
     signal: AbortSignal.timeout(90_000),
   });
   if (!res.ok) throw new Error(`Gemini imagen ${res.status}`);
@@ -273,7 +276,8 @@ export async function generateImages(opts: { format: string; topic?: string | nu
   const notes: string[] = [];
   const p = opts.product;
   const scene = `Fotografía publicitaria realista en vertical (9:16) para TikTok, fondo de garaje/taller o carretera de
-montaña, buena luz, sin texto superpuesto. ${opts.topic ? `Enfoque: ${opts.topic}.` : ''}`;
+montaña, buena luz, sin texto superpuesto. Deja la franja superior de la imagen despejada (cielo, pared o fondo
+desenfocado): ahí irán los logotipos. ${opts.topic ? `Enfoque: ${opts.topic}.` : ''}`;
 
   if (p && p.images.length) {
     const real = p.images.slice(0, opts.format === 'carousel' ? 4 : 1);

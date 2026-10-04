@@ -1,0 +1,155 @@
+/**
+ * Imágenes promocionales para TikTok: compone sobre la imagen (escena de la IA,
+ * foto real del producto o imagen subida a mano) el logo de escapesymas.com y
+ * el de la marca del producto. Los logos se ponen aquí y no con la IA porque
+ * los modelos de imagen dibujan mal los logotipos.
+ *
+ * Formato 1080x1920 (9:16). Los logos van arriba, por debajo de la franja de
+ * pestañas de TikTok (~150 px) y lejos de los botones de la derecha y del
+ * texto de abajo.
+ */
+import fs from 'fs';
+import path from 'path';
+import sharp from 'sharp';
+import { pool } from '../db.js';
+
+const W = 1080;
+const H = 1920;
+const TOP = 170;          // por debajo de «Siguiendo | Para ti»
+const SIDE = 60;
+const STORE_LOGO_W = 500;
+const BRAND_BOX = { w: 340, h: 120 };
+
+const UPLOADS = path.join(process.cwd(), 'uploads');
+const PROMO_DIR = path.join(UPLOADS, 'social-content', 'promo');
+export const BRAND_DIR = path.join(UPLOADS, 'social-content', 'brands');
+const TEMPLATES = path.join(process.cwd(), 'templates', 'social');
+
+const storeLogoCache: Record<string, Buffer> = {};
+
+/** Logo de la tienda: blanco para fondos oscuros, negro para fondos claros. */
+async function storeLogo(variant: 'blanco' | 'negro'): Promise<Buffer> {
+  if (!storeLogoCache[variant]) {
+    storeLogoCache[variant] = await sharp(path.join(TEMPLATES, `logo-escapesymas-${variant}.svg`), { density: 400 })
+      .resize({ width: STORE_LOGO_W }).png().toBuffer();
+  }
+  return storeLogoCache[variant];
+}
+
+/** Lee una imagen de /uploads (ruta local) o de una URL. */
+export async function readImage(src: string): Promise<Buffer> {
+  if (src.startsWith('/uploads/')) {
+    const file = path.join(process.cwd(), src.replace(/^\/+/, ''));
+    if (!file.startsWith(UPLOADS)) throw new Error('Ruta no permitida');
+    return fs.promises.readFile(file);
+  }
+  if (/^https?:\/\//.test(src)) {
+    const r = await fetch(src, { signal: AbortSignal.timeout(20_000) });
+    if (!r.ok) throw new Error(`No se pudo descargar la imagen (${r.status})`);
+    return Buffer.from(await r.arrayBuffer());
+  }
+  throw new Error('Imagen no válida');
+}
+
+/** Ruta del logo de una marca si el administrador lo ha subido. */
+export async function brandLogoPath(brand: string | null | undefined): Promise<string | null> {
+  if (!brand) return null;
+  const { rows: [r] } = await pool.query(`SELECT url FROM brand_logos WHERE brand = upper($1)`, [brand.trim()]);
+  if (!r) return null;
+  const file = path.join(process.cwd(), String(r.url).replace(/^\/+/, ''));
+  return file.startsWith(UPLOADS) && fs.existsSync(file) ? file : null;
+}
+
+/** Guarda un logo de marca subido: recortado, en PNG y con un tamaño manejable. */
+export async function saveBrandLogo(brand: string, input: Buffer): Promise<string> {
+  const key = brand.trim().toUpperCase();
+  const slug = key.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'marca';
+  await fs.promises.mkdir(BRAND_DIR, { recursive: true });
+  const filename = `${slug}-${Date.now()}.png`;
+  await sharp(input, { density: 400 }).trim().resize({ width: 1000, height: 400, fit: 'inside', withoutEnlargement: true })
+    .png().toFile(path.join(BRAND_DIR, filename));
+  const url = `/uploads/social-content/brands/${filename}`;
+  const { rows: [old] } = await pool.query(`SELECT url FROM brand_logos WHERE brand = $1`, [key]);
+  await pool.query(
+    `INSERT INTO brand_logos (brand, url, updated_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (brand) DO UPDATE SET url = EXCLUDED.url, updated_at = NOW()`, [key, url]);
+  if (old?.url) fs.unlink(path.join(process.cwd(), String(old.url).replace(/^\/+/, '')), () => {});
+  return url;
+}
+
+/** Fondo blanco redondeado detrás del logo de la marca (los logos vienen en cualquier color). */
+function pill(w: number, h: number) {
+  return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
+    <rect width="${w}" height="${h}" rx="${Math.round(h / 2.6)}" fill="#ffffff" fill-opacity="0.94"/></svg>`);
+}
+
+/** Degradado oscuro arriba para que el logo blanco se lea sobre cualquier escena. */
+const topShade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="560">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#000" stop-opacity="0.72"/><stop offset="1" stop-color="#000" stop-opacity="0"/>
+  </linearGradient></defs><rect width="${W}" height="560" fill="url(#g)"/></svg>`);
+
+/**
+ * Compone la imagen promocional y devuelve su ruta en /uploads.
+ * - Escena vertical (de la IA o subida): a pantalla completa, logo blanco y marca en una cápsula blanca.
+ * - Foto de producto (cuadrada, fondo blanco): sobre lienzo blanco, logo negro y marca sin cápsula.
+ */
+export async function composePromo(src: string, brand: string | null | undefined): Promise<{ url: string; missingBrandLogo: boolean }> {
+  const input = await readImage(src);
+  const meta = await sharp(input).metadata();
+  const isProductPhoto = !!meta.width && !!meta.height && meta.width / meta.height > 0.8;
+
+  const layers: sharp.OverlayOptions[] = [];
+  let base: sharp.Sharp;
+  if (isProductPhoto) {
+    const photo = await sharp(input).flatten({ background: '#ffffff' })
+      .resize({ width: 980, height: 1100, fit: 'inside' }).png().toBuffer();
+    const pm = await sharp(photo).metadata();
+    base = sharp({ create: { width: W, height: H, channels: 3, background: '#ffffff' } });
+    layers.push({ input: photo, left: Math.round((W - (pm.width || 980)) / 2), top: Math.round(520 + (1100 - (pm.height || 1100)) / 2) });
+    layers.push({ input: await storeLogo('negro'), left: SIDE, top: TOP });
+  } else {
+    base = sharp(input).resize({ width: W, height: H, fit: 'cover', position: 'attention' });
+    layers.push({ input: topShade, left: 0, top: 0 });
+    layers.push({ input: await storeLogo('blanco'), left: SIDE, top: TOP });
+  }
+
+  const logoFile = await brandLogoPath(brand);
+  if (logoFile) {
+    const logo = await sharp(logoFile).resize({ width: BRAND_BOX.w, height: BRAND_BOX.h, fit: 'inside' }).png().toBuffer();
+    const lm = await sharp(logo).metadata();
+    const lw = lm.width || BRAND_BOX.w;
+    const lh = lm.height || BRAND_BOX.h;
+    if (isProductPhoto) {
+      layers.push({ input: logo, left: W - SIDE - lw, top: TOP + Math.round((97 - lh) / 2) });
+    } else {
+      const pad = 22;
+      const pw = lw + pad * 2;
+      const ph = lh + pad * 2;
+      layers.push({ input: pill(pw, ph), left: W - SIDE - pw, top: TOP - 10 });
+      layers.push({ input: logo, left: W - SIDE - pw + pad, top: TOP - 10 + pad });
+    }
+  }
+
+  await fs.promises.mkdir(PROMO_DIR, { recursive: true });
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+  await base.composite(layers).jpeg({ quality: 90, mozjpeg: true }).toFile(path.join(PROMO_DIR, filename));
+  return { url: `/uploads/social-content/promo/${filename}`, missingBrandLogo: !!brand && !logoFile };
+}
+
+/** Compone todas las imágenes; si alguna falla se queda la original. */
+export async function composeAll(srcs: string[], brand: string | null | undefined): Promise<{ urls: string[]; missingBrandLogo: boolean }> {
+  const urls: string[] = [];
+  let missing = false;
+  for (const src of srcs) {
+    try {
+      const r = await composePromo(src, brand);
+      urls.push(r.url);
+      missing = missing || r.missingBrandLogo;
+    } catch (err: any) {
+      console.warn('[SOCIAL PROMO] no se pudo componer', src, err.message);
+      urls.push(src);
+    }
+  }
+  return { urls, missingBrandLogo: missing };
+}
