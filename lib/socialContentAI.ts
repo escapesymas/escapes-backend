@@ -109,7 +109,7 @@ async function geminiGenerateText(prompt: string): Promise<string> {
 
 async function minimaxGenerateText(prompt: string): Promise<string> {
   const r: any = await minimaxClient.chat.completions.create({
-    model: CHAT_MODEL, max_tokens: 1500, temperature: 0.7,
+    model: CHAT_MODEL, max_tokens: 4000, temperature: 0.7,
     messages: [{ role: 'user', content: prompt }],
     reasoning_split: true,
   } as any);
@@ -119,10 +119,30 @@ async function minimaxGenerateText(prompt: string): Promise<string> {
     .trim();
 }
 
+/** Escapa saltos de línea y tabuladores sueltos dentro de las cadenas (JSON "casi válido" de los modelos). */
+function repairJson(raw: string): string {
+  let out = '';
+  let inString = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString && ch === '\\') { out += ch + (raw[i + 1] ?? ''); i++; continue; }
+    if (ch === '"') inString = !inString;
+    if (inString && ch === '\n') { out += '\\n'; continue; }
+    if (inString && ch === '\r') continue;
+    if (inString && ch === '\t') { out += ' '; continue; }
+    out += ch;
+  }
+  return out;
+}
+
 function parseCopy(text: string): GeneratedCopy {
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('La IA no devolvió JSON');
-  const parsed = JSON.parse(jsonMatch[0]);
+  const jsonMatch = text.replace(/```(?:json)?/gi, '').match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    console.warn('[SOCIAL CONTENT] respuesta sin JSON:', text.slice(0, 200));
+    throw new Error('La IA no devolvió el formato esperado');
+  }
+  let parsed: any;
+  try { parsed = JSON.parse(jsonMatch[0]); } catch { parsed = JSON.parse(repairJson(jsonMatch[0])); }
   const str = (v: any) => (Array.isArray(v) ? v.join('\n') : String(v || '')).trim();
   const copy = { hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: str(parsed.hashtags) };
   if (!copy.copy && !copy.hook) throw new Error('La IA devolvió el contenido vacío');
