@@ -100,6 +100,23 @@ async function overlayLogos(rawFile: string, brand: string | null): Promise<{ fi
   }
 }
 
+/**
+ * Vuelve a poner los logos sobre un vídeo ya generado, a partir de su original
+ * sin logos (p. ej. tras subir el logo de la marca). Devuelve la nueva ruta o null.
+ */
+export async function reoverlayVideo(originalUrl: string, brand: string | null): Promise<string | null> {
+  const m = originalUrl.match(/^\/uploads\/social-content\/video\/([\w.-]+\.mp4)$/);
+  if (!m) return null;
+  const raw = path.join(VIDEO_DIR, m[1]);
+  if (!fs.existsSync(raw)) return null;
+  // Copia con nombre nuevo para que el navegador no muestre el vídeo anterior en caché.
+  const copy = path.join(VIDEO_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`);
+  await fs.promises.copyFile(raw, copy);
+  const { file, logos } = await overlayLogos(copy, brand);
+  fs.unlink(copy, () => {});
+  return logos ? `/uploads/social-content/video/${path.basename(file)}` : null;
+}
+
 let polling = false;
 
 /** Cron: consulta las operaciones de Veo pendientes y guarda los vídeos terminados. */

@@ -24,6 +24,8 @@ const UPLOADS = path.join(process.cwd(), 'uploads');
 const PROMO_DIR = path.join(UPLOADS, 'social-content', 'promo');
 export const BRAND_DIR = path.join(UPLOADS, 'social-content', 'brands');
 const TEMPLATES = path.join(process.cwd(), 'templates', 'social');
+// Noto Sans Black (licencia OFL, ver fonts/OFL-NotoSans.txt) para el nombre de la marca sin logo.
+const BRAND_FONT = path.join(TEMPLATES, 'fonts', 'NotoSans-Black.ttf');
 
 const storeLogoCache: Record<string, Buffer> = {};
 
@@ -89,8 +91,27 @@ const topShade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W
     <stop offset="0" stop-color="#000" stop-opacity="0.72"/><stop offset="1" stop-color="#000" stop-opacity="0"/>
   </linearGradient></defs><rect width="${W}" height="560" fill="url(#g)"/></svg>`);
 
-/** Logo de la marca en su cápsula blanca, para fondos variados (escenas y vídeos). */
-async function brandPillLayers(logoFile: string): Promise<sharp.OverlayOptions[]> {
+const wordmarkCache = new Map<string, Buffer>();
+
+/**
+ * Marca sin logo subido: su nombre escrito en negrita (en el sitio del logo).
+ * Así cualquiera de las 200+ marcas del catálogo sale identificada.
+ */
+async function brandWordmark(brand: string): Promise<Buffer> {
+  const key = brand.trim().toUpperCase();
+  if (!wordmarkCache.has(key)) {
+    const safe = key.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const text = await sharp({
+      text: { text: `<span foreground="#111111">${safe}</span>`, font: 'Noto Sans Black', fontfile: BRAND_FONT, rgba: true, dpi: 900 },
+    }).png().toBuffer();
+    wordmarkCache.set(key, await sharp(text).trim().resize({ width: BRAND_BOX.w, height: 64, fit: 'inside' }).png().toBuffer());
+    if (wordmarkCache.size > 300) wordmarkCache.delete(wordmarkCache.keys().next().value as string);
+  }
+  return wordmarkCache.get(key)!;
+}
+
+/** Logo de la marca (o su nombre si no hay logo) en su cápsula blanca, para escenas y vídeos. */
+async function brandPillLayers(logoFile: string | Buffer): Promise<sharp.OverlayOptions[]> {
   const logo = await sharp(logoFile).resize({ width: BRAND_BOX.w, height: BRAND_BOX.h, fit: 'inside' }).png().toBuffer();
   const lm = await sharp(logo).metadata();
   const pad = 22;
@@ -109,7 +130,8 @@ async function brandPillLayers(logoFile: string): Promise<sharp.OverlayOptions[]
 export async function logoOverlayFile(brand: string | null | undefined): Promise<{ file: string; missingBrandLogo: boolean }> {
   const layers: sharp.OverlayOptions[] = [{ input: topShade, left: 0, top: 0 }, { input: await storeLogo('blanco'), left: SIDE, top: TOP }];
   const logoFile = await brandLogoPath(brand);
-  if (logoFile) layers.push(...(await brandPillLayers(logoFile)));
+  const mark = logoFile || (brand ? await brandWordmark(brand).catch(() => null) : null);
+  if (mark) layers.push(...(await brandPillLayers(mark)));
   await fs.promises.mkdir(PROMO_DIR, { recursive: true });
   const file = path.join(PROMO_DIR, `overlay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`);
   await sharp({ create: { width: W, height: H, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
@@ -143,15 +165,16 @@ export async function composePromo(src: string, brand: string | null | undefined
   }
 
   const logoFile = await brandLogoPath(brand);
-  if (logoFile) {
-    const logo = await sharp(logoFile).resize({ width: BRAND_BOX.w, height: BRAND_BOX.h, fit: 'inside' }).png().toBuffer();
+  const mark = logoFile || (brand ? await brandWordmark(brand).catch(() => null) : null);
+  if (mark) {
+    const logo = await sharp(mark).resize({ width: BRAND_BOX.w, height: BRAND_BOX.h, fit: 'inside' }).png().toBuffer();
     const lm = await sharp(logo).metadata();
     const lw = lm.width || BRAND_BOX.w;
     const lh = lm.height || BRAND_BOX.h;
     if (isProductPhoto) {
       layers.push({ input: logo, left: W - SIDE - lw, top: TOP + Math.round((97 - lh) / 2) });
     } else {
-      layers.push(...(await brandPillLayers(logoFile)));
+      layers.push(...(await brandPillLayers(mark)));
     }
   }
 

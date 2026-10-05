@@ -4,10 +4,13 @@
  * publicar. No publica solo en TikTok (no hay API pública para eso); el
  * administrador copia el contenido ya preparado y lo sube a mano.
  */
+import fs from 'fs';
+import path from 'path';
 import { pool } from '../db.js';
 import { generateCopy, generateImages, productBySku, pickProduct } from './socialContentAI.js';
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
 import { composeAll, composePromo } from './socialPromo.js';
+import { reoverlayVideo } from './socialVideo.js';
 
 export interface ContentSlot {
   id: number;
@@ -88,7 +91,7 @@ export async function updateSlot(id: number, fields: Partial<Pick<ContentSlot, '
 }
 
 const missingLogoNote = (brand?: string | null) =>
-  `Falta el logo de ${brand || 'la marca'}: súbelo en «Logos de marcas» y pulsa «Rehacer con logos».`;
+  `Sin logo de ${brand || 'la marca'}: se ha puesto su nombre. Si subes el logo en «Logos de marcas», pulsa «Rehacer con logos».`;
 
 /** Marca del producto de una publicación (para su logo). */
 async function slotBrand(productSku: string | null): Promise<string | null> {
@@ -108,7 +111,13 @@ export async function recomposeSlot(id: number): Promise<{ missingBrandLogo: boo
   const promo = await composeAll(base, brand);
   const finals = [];
   let missing = promo.missingBrandLogo;
+  const oldFiles: string[] = [];
   for (const m of slot.final_media || []) {
+    if (m.type === 'video') {
+      const url = m.original ? await reoverlayVideo(m.original, brand).catch(() => null) : null;
+      if (url) { oldFiles.push(m.url); finals.push({ ...m, url }); } else finals.push(m);
+      continue;
+    }
     if (m.type !== 'image') { finals.push(m); continue; }
     try {
       const r = await composePromo(m.original || m.url, brand);
@@ -116,11 +125,19 @@ export async function recomposeSlot(id: number): Promise<{ missingBrandLogo: boo
       finals.push({ ...m, url: r.url, original: m.original || m.url });
     } catch { finals.push(m); }
   }
-  const error = String(slot.error || '').replace(/\s*Falta el logo de [^:]*: súbelo en «Logos de marcas» y pulsa «Rehacer con logos»\./g, '').trim();
+  const error = String(slot.error || '')
+    .replace(/\s*Falta el logo de [^:]*: súbelo en «Logos de marcas» y pulsa «Rehacer con logos»\./g, '')
+    .replace(/\s*Sin logo de [^:]*: se ha puesto su nombre\. Si subes el logo en «Logos de marcas», pulsa «Rehacer con logos»\./g, '')
+    .trim();
   await pool.query(
     `UPDATE social_content_calendar SET media_urls = $2::jsonb, base_media = $3::jsonb, final_media = $4::jsonb, error = $5, updated_at = NOW() WHERE id = $1`,
     [id, JSON.stringify(promo.urls), JSON.stringify(base), JSON.stringify(finals),
       [error, missing ? missingLogoNote(brand) : ''].filter(Boolean).join(' ') || null]);
+  // Vídeos con los logos antiguos: ya sustituidos.
+  for (const f of oldFiles) {
+    const local = path.join(process.cwd(), f.replace(/^\/+/, ''));
+    if (/\/uploads\/social-content\/video\/[\w.-]+-logos\.mp4$/.test(f)) fs.unlink(local, () => {});
+  }
   return { missingBrandLogo: missing };
 }
 
