@@ -1,4 +1,5 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
@@ -265,6 +266,54 @@ socialContentRouter.post('/social-content/brand-logos', async (req, res, next) =
     console.error('[SOCIAL CONTENT LOGO SAVE ERROR]:', err.message);
     return res.status(400).json({ error: 'No se pudo leer la imagen del logo' });
   }
+});
+
+/**
+ * Importación de los logos de marcas de Bihr. Su listado de marcas solo se
+ * puede leer desde un navegador (Cloudflare bloquea al servidor), así que el
+ * navegador del administrador envía aquí la lista {marca, url} con un código
+ * de un solo uso (app_settings.brand_logo_import, caduca a los 30 min) y el
+ * servidor descarga cada logo de api.mybihr.com/medias. No sustituye los logos
+ * subidos a mano. Va en texto plano para que el navegador lo pueda enviar
+ * desde mybihr.com sin pedir permiso CORS.
+ */
+socialContentRouter.post('/social-content/brand-logos/import', express.text({ type: 'text/plain', limit: '2mb' }), async (req: any, res) => {
+  let body: any;
+  try { body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body; } catch { return res.status(400).json({ error: 'JSON inválido' }); }
+  const { rows: [cfg] } = await pool.query(`SELECT value FROM app_settings WHERE key = 'brand_logo_import'`);
+  const token = String(cfg?.value?.token || '');
+  const given = String(body?.token || '');
+  const valid = token.length >= 32 && given.length === token.length
+    && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(token))
+    && Date.now() < Number(cfg?.value?.expires || 0);
+  if (!valid) return res.status(403).json({ error: 'Código no válido o caducado' });
+  const items = (Array.isArray(body?.items) ? body.items : []).slice(0, 500)
+    .map((it: any) => ({ brand: String(it?.brand || '').trim().slice(0, 60), url: String(it?.url || '') }))
+    .filter((it: any) => it.brand && it.url.startsWith('https://api.mybihr.com/medias/'));
+  res.status(202).json({ received: items.length });
+
+  (async () => {
+    const result = { imported: [] as string[], skipped: [] as string[], failed: [] as string[] };
+    const { rows: existing } = await pool.query(`SELECT brand FROM brand_logos`);
+    const have = new Set(existing.map((r: any) => r.brand));
+    for (const it of items) {
+      const key = it.brand.toUpperCase();
+      if (have.has(key)) { result.skipped.push(key); continue; }
+      try {
+        const r = await fetch(it.url, { headers: { 'User-Agent': 'Mozilla/5.0 (escapesymas.com)' }, signal: AbortSignal.timeout(20_000) });
+        if (!r.ok || !String(r.headers.get('content-type') || '').startsWith('image/')) throw new Error(`HTTP ${r.status}`);
+        await saveBrandLogo(key, Buffer.from(await r.arrayBuffer()));
+        have.add(key);
+        result.imported.push(key);
+      } catch (err: any) {
+        result.failed.push(`${key}: ${err.message}`);
+      }
+    }
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('brand_logo_import_result', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`, [JSON.stringify(result)]);
+    console.log(`[SOCIAL CONTENT] logos de Bihr: ${result.imported.length} importados, ${result.skipped.length} ya estaban, ${result.failed.length} fallidos`);
+  })().catch((err) => console.error('[SOCIAL CONTENT] importación de logos:', err.message));
 });
 
 // DELETE /api/social-content/brand-logos/:brand
