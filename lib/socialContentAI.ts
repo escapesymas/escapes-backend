@@ -19,12 +19,12 @@ const GEMINI_TIMEOUT_MS = 45_000;
 const uploadDir = path.join(process.cwd(), 'uploads', 'social-content');
 fs.mkdirSync(uploadDir, { recursive: true });
 
-/** Marcas que se promocionan cuando el hueco no tiene producto elegido. */
-export const FEATURED_BRANDS = ['IXIL', 'BELL', 'RST'];
+/** Precio mínimo (céntimos) de un producto elegido automáticamente: nada de tornillería suelta. */
+export const AUTO_MIN_PRICE = 3000;
 
-export const NICHE_CONTEXT = `Escapes y Más (escapesymas.com) vende recambios y equipamiento de moto de
-alto rendimiento: escapes/silenciadores IXIL, cascos BELL, ropa y equipamiento
-técnico RST (cazadoras, pantalones, guantes). Público: moteros en España,
+export const NICHE_CONTEXT = `Escapes y Más (escapesymas.com) vende recambios, accesorios y equipamiento de
+moto de más de 200 marcas: escapes, cascos, ropa técnica, transmisión, frenos,
+suspensión, protecciones y mantenimiento. Público: moteros en España,
 tono cercano y experto, nada de humo de marketing. El contenido debe generar
 deseo por el producto con argumentos reales (sonido y estética del escape,
 protección y comodidad del equipamiento, precio).`;
@@ -77,18 +77,36 @@ export async function productBySku(sku: string): Promise<SlotProduct | null> {
 }
 
 /**
- * Elige un producto para un hueco sin producto: de las marcas destacadas, con
- * stock y fotos, y que no se haya usado en el calendario en los últimos 60 días.
+ * Elige un producto para un hueco sin producto, de cualquier marca, con stock,
+ * fotos y precio de al menos 30 €. Para que no se repitan:
+ * - primero se sortea la MARCA (todas con la misma probabilidad; si no, las
+ *   marcas con miles de referencias salen siempre) y se evitan las marcas de
+ *   las últimas 10 publicaciones;
+ * - después un producto de esa marca cuya familia (mismo modelo en otras tallas
+ *   o colores) no se haya publicado en los últimos 120 días.
  */
 export async function pickProduct(): Promise<SlotProduct | null> {
-  const { rows: [p] } = await pool.query(
-    `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, description, images
-     FROM products p
-     WHERE p.status = 'published' AND p.price > 0 AND p.stock > 0 AND p.duplicate_of IS NULL
-       AND upper(p.brand) = ANY($1) AND jsonb_array_length(COALESCE(p.images, '[]'::jsonb)) > 0
-       AND NOT EXISTS (SELECT 1 FROM social_content_calendar c
-                       WHERE upper(c.product_sku) = upper(p.sku) AND c.created_at > NOW() - INTERVAL '60 days')
-     ORDER BY random() LIMIT 1`, [FEATURED_BRANDS]);
+  const query = (avoidRecentBrands: boolean) => pool.query(
+    `WITH used AS (
+       SELECT p.sku, p.family_code, upper(p.brand) AS brand, c.scheduled_at, c.created_at
+       FROM social_content_calendar c
+       JOIN products p ON upper(p.sku) = upper(c.product_sku)
+       WHERE c.product_sku IS NOT NULL),
+     recent_brands AS (
+       SELECT brand FROM (SELECT brand FROM used ORDER BY scheduled_at DESC LIMIT 10) r),
+     eligible AS (
+       SELECT p.id, p.sku, p.name, p.brand, p.price, p.sale_price, p.promo_price, p.stock, p.description, p.images
+       FROM products p
+       WHERE p.status = 'published' AND p.price >= $1 AND p.stock > 0 AND p.duplicate_of IS NULL
+         AND COALESCE(p.brand, '') <> '' AND jsonb_array_length(COALESCE(p.images, '[]'::jsonb)) > 0
+         AND ($2 = false OR upper(p.brand) NOT IN (SELECT brand FROM recent_brands))
+         AND NOT EXISTS (SELECT 1 FROM used u WHERE u.created_at > NOW() - INTERVAL '120 days'
+                         AND (upper(u.sku) = upper(p.sku) OR (p.family_code IS NOT NULL AND u.family_code = p.family_code)))),
+     brand AS (SELECT upper(brand) AS b FROM eligible GROUP BY 1 ORDER BY random() LIMIT 1)
+     SELECT * FROM eligible WHERE upper(brand) = (SELECT b FROM brand) ORDER BY random() LIMIT 1`,
+    [AUTO_MIN_PRICE, avoidRecentBrands]);
+  let { rows: [p] } = await query(true);
+  if (!p) ({ rows: [p] } = await query(false));
   return p ? rowToProduct(p) : null;
 }
 

@@ -11,7 +11,6 @@ import {
 import { saveBrandLogo } from '../lib/socialPromo.js';
 import { startVideo, VIDEO_MODELS } from '../lib/socialVideo.js';
 import { pool } from '../db.js';
-import { FEATURED_BRANDS } from '../lib/socialContentAI.js';
 import { productBySku } from '../lib/socialContentAI.js';
 
 export const socialContentRouter = Router();
@@ -237,7 +236,8 @@ socialContentRouter.get('/social-content/brand-logos', async (req, res) => {
     const { rows: used } = await pool.query(
       `SELECT DISTINCT upper(p.brand) AS brand FROM social_content_calendar c
        JOIN products p ON upper(p.sku) = upper(c.product_sku) WHERE p.brand IS NOT NULL AND p.brand <> ''`);
-    const brands = Array.from(new Set([...FEATURED_BRANDS, ...used.map((u: any) => u.brand), ...logos.map((l: any) => l.brand)])).sort();
+    // Las marcas de las publicaciones del calendario y las que ya tienen logo.
+    const brands = Array.from(new Set([...used.map((u: any) => u.brand), ...logos.map((l: any) => l.brand)])).sort();
     return res.json({ brands: brands.map((b) => ({ brand: b, url: logos.find((l: any) => l.brand === b)?.url || null })) });
   } catch (err: any) {
     console.error('[SOCIAL CONTENT LOGOS ERROR]:', err.message);
