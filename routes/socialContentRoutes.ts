@@ -11,6 +11,7 @@ import {
 } from '../lib/socialContentCalendar.js';
 import { saveBrandLogo } from '../lib/socialPromo.js';
 import { startVideo, VIDEO_MODELS } from '../lib/socialVideo.js';
+import { startInstagramVersion, recomposeInstagram } from '../lib/socialInstagram.js';
 import { pool } from '../db.js';
 import { productBySku } from '../lib/socialContentAI.js';
 
@@ -106,7 +107,7 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ error: 'ID inválido' });
   try {
-    const { copy, hashtags, script, status, scheduledAt, topic, productSku, format, slides } = req.body || {};
+    const { copy, hashtags, script, status, scheduledAt, topic, productSku, format, slides, igCopy, igHashtags } = req.body || {};
     // Diapositivas de una publicación de marca: título y texto editables (la escena no).
     let slidesJson: string | undefined;
     if (slides !== undefined) {
@@ -131,6 +132,8 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
       ...(productSku !== undefined && { product_sku: text(productSku, 80) || null }),
       ...(format !== undefined && { format }),
       ...(slidesJson !== undefined && { slides: slidesJson }),
+      ...(igCopy !== undefined && { ig_copy: text(igCopy, 2200) }),
+      ...(igHashtags !== undefined && { ig_hashtags: text(igHashtags, 600) }),
     } as any);
     return res.json({ success: true });
   } catch (err: any) {
@@ -218,6 +221,20 @@ socialContentRouter.post('/social-content/:id/video', async (req, res) => {
   }
 });
 
+// POST /api/social-content/:id/instagram  { caption?: boolean } — versión 4:5 para Instagram (segundo plano).
+socialContentRouter.post('/social-content/:id/instagram', async (req, res) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const id = parseId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
+  try {
+    if (!(await startInstagramVersion(id, req.body?.caption !== false))) return res.status(400).json({ error: 'Genera primero el contenido de la publicación' });
+    return res.status(202).json({ status: 'generating' });
+  } catch (err: any) {
+    console.error('[SOCIAL CONTENT IG ERROR]:', err.message);
+    return res.status(500).json({ error: 'No se pudo crear la versión de Instagram' });
+  }
+});
+
 // POST /api/social-content/:id/recompose — vuelve a poner los logos (sin IA).
 socialContentRouter.post('/social-content/:id/recompose', async (req, res) => {
   if (!(await requireAdminRole(req, res))) return;
@@ -226,6 +243,7 @@ socialContentRouter.post('/social-content/:id/recompose', async (req, res) => {
   try {
     const r = await recomposeSlot(id);
     if (!r) return res.status(404).json({ error: 'Publicación no encontrada' });
+    await recomposeInstagram(id).catch((err) => console.warn('[SOCIAL IG] recompose:', err.message));
     return res.json(r);
   } catch (err: any) {
     console.error('[SOCIAL CONTENT RECOMPOSE ERROR]:', err.message);

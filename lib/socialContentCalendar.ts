@@ -287,6 +287,10 @@ export async function resetInterruptedGenerations() {
     `UPDATE social_content_calendar
        SET status = 'draft', error = 'La generación se interrumpió (reinicio del servidor). Vuelve a pulsar Generar.', updated_at = NOW()
      WHERE status = 'generating'`);
+  await pool.query(
+    `UPDATE social_content_calendar
+       SET ig_status = 'error', ig_error = 'Se interrumpió (reinicio del servidor). Vuelve a pulsar «Crear versión Instagram».'
+     WHERE ig_status = 'generating'`);
 }
 
 /** Fecha de hoy en Madrid (año, mes 0-11, día). */

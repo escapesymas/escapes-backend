@@ -1,24 +1,50 @@
 /**
- * Imágenes promocionales para TikTok: compone sobre la imagen (escena de la IA,
- * foto real del producto o imagen subida a mano) el logo de escapesymas.com y
- * el de la marca del producto. Los logos se ponen aquí y no con la IA porque
- * los modelos de imagen dibujan mal los logotipos.
+ * Imágenes promocionales para TikTok e Instagram: compone sobre la imagen
+ * (escena de la IA, foto real del producto o imagen subida a mano) el logo de
+ * escapesymas.com y el de la marca del producto. Los logos se ponen aquí y no
+ * con la IA porque los modelos de imagen dibujan mal los logotipos.
  *
- * Formato 1080x1920 (9:16). Los logos van arriba, por debajo de la franja de
- * pestañas de TikTok (~150 px) y lejos de los botones de la derecha y del
- * texto de abajo.
+ * - TikTok: 1080x1920 (9:16). Logos por debajo de la franja de pestañas
+ *   (~150 px) y texto por encima de la descripción y lejos de los botones.
+ * - Instagram: 1080x1350 (4:5, lo que más ocupa en el feed). Sin interfaz
+ *   encima: márgenes normales.
  */
 import fs from 'fs';
 import path from 'path';
 import sharp from 'sharp';
 import { pool } from '../db.js';
 
-const W = 1080;
-const H = 1920;
-const TOP = 170;          // por debajo de «Siguiendo | Para ti»
-const SIDE = 60;
-const STORE_LOGO_W = 500;
-const BRAND_BOX = { w: 340, h: 120 };
+export type Platform = 'tiktok' | 'instagram';
+
+interface Layout {
+  w: number; h: number;
+  top: number; side: number;          // posición de los logos
+  logoW: number;                       // ancho del logo de la tienda
+  brand: { w: number; h: number };     // caja del logo de la marca
+  photo: { w: number; h: number; top: number }; // foto de producto sobre blanco
+  shadeTop: number; shadeBottom: number;
+  textTopMin: number; textBottom: number; titlePx: number; bodyPx: number;
+}
+
+const LAYOUTS: Record<Platform, Layout> = {
+  tiktok: {
+    w: 1080, h: 1920, top: 170, side: 60, logoW: 500, brand: { w: 340, h: 120 },
+    photo: { w: 980, h: 1100, top: 520 }, shadeTop: 560, shadeBottom: 1160,
+    textTopMin: 760, textBottom: 1500, titlePx: 86, bodyPx: 44,
+  },
+  instagram: {
+    w: 1080, h: 1350, top: 60, side: 60, logoW: 420, brand: { w: 290, h: 100 },
+    photo: { w: 940, h: 940, top: 280 }, shadeTop: 380, shadeBottom: 780,
+    textTopMin: 560, textBottom: 1270, titlePx: 80, bodyPx: 40,
+  },
+};
+
+// TikTok por defecto (vídeos y el resto del código).
+const W = LAYOUTS.tiktok.w;
+const H = LAYOUTS.tiktok.h;
+const TOP = LAYOUTS.tiktok.top;
+const SIDE = LAYOUTS.tiktok.side;
+const BRAND_BOX = LAYOUTS.tiktok.brand;
 
 const UPLOADS = path.join(process.cwd(), 'uploads');
 const PROMO_DIR = path.join(UPLOADS, 'social-content', 'promo');
@@ -30,12 +56,13 @@ const BRAND_FONT = path.join(TEMPLATES, 'fonts', 'NotoSans-Black.ttf');
 const storeLogoCache: Record<string, Buffer> = {};
 
 /** Logo de la tienda: blanco para fondos oscuros, negro para fondos claros. */
-async function storeLogo(variant: 'blanco' | 'negro'): Promise<Buffer> {
-  if (!storeLogoCache[variant]) {
-    storeLogoCache[variant] = await sharp(path.join(TEMPLATES, `logo-escapesymas-${variant}.svg`), { density: 400 })
-      .resize({ width: STORE_LOGO_W }).png().toBuffer();
+async function storeLogo(variant: 'blanco' | 'negro', width = LAYOUTS.tiktok.logoW): Promise<Buffer> {
+  const key = `${variant}-${width}`;
+  if (!storeLogoCache[key]) {
+    storeLogoCache[key] = await sharp(path.join(TEMPLATES, `logo-escapesymas-${variant}.svg`), { density: 400 })
+      .resize({ width }).png().toBuffer();
   }
-  return storeLogoCache[variant];
+  return storeLogoCache[key];
 }
 
 /** Lee una imagen de /uploads (ruta local) o de una URL. */
@@ -86,10 +113,11 @@ function pill(w: number, h: number) {
 }
 
 /** Degradado oscuro arriba para que el logo blanco se lea sobre cualquier escena. */
-const topShade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="560">
+const shadeTop = (w: number, h: number) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
   <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
     <stop offset="0" stop-color="#000" stop-opacity="0.72"/><stop offset="1" stop-color="#000" stop-opacity="0"/>
-  </linearGradient></defs><rect width="${W}" height="560" fill="url(#g)"/></svg>`);
+  </linearGradient></defs><rect width="${w}" height="${h}" fill="url(#g)"/></svg>`);
+const topShade = shadeTop(W, LAYOUTS.tiktok.shadeTop);
 
 const wordmarkCache = new Map<string, Buffer>();
 
@@ -111,15 +139,15 @@ async function brandWordmark(brand: string): Promise<Buffer> {
 }
 
 /** Logo de la marca (o su nombre si no hay logo) en su cápsula blanca, para escenas y vídeos. */
-async function brandPillLayers(logoFile: string | Buffer): Promise<sharp.OverlayOptions[]> {
-  const logo = await sharp(logoFile).resize({ width: BRAND_BOX.w, height: BRAND_BOX.h, fit: 'inside' }).png().toBuffer();
+async function brandPillLayers(logoFile: string | Buffer, L: Layout = LAYOUTS.tiktok): Promise<sharp.OverlayOptions[]> {
+  const logo = await sharp(logoFile).resize({ width: L.brand.w, height: L.brand.h, fit: 'inside' }).png().toBuffer();
   const lm = await sharp(logo).metadata();
   const pad = 22;
-  const pw = (lm.width || BRAND_BOX.w) + pad * 2;
-  const ph = (lm.height || BRAND_BOX.h) + pad * 2;
+  const pw = (lm.width || L.brand.w) + pad * 2;
+  const ph = (lm.height || L.brand.h) + pad * 2;
   return [
-    { input: pill(pw, ph), left: W - SIDE - pw, top: TOP - 10 },
-    { input: logo, left: W - SIDE - pw + pad, top: TOP - 10 + pad },
+    { input: pill(pw, ph), left: L.w - L.side - pw, top: L.top - 10 },
+    { input: logo, left: L.w - L.side - pw + pad, top: L.top - 10 + pad },
   ];
 }
 
@@ -144,7 +172,8 @@ export async function logoOverlayFile(brand: string | null | undefined): Promise
  * - Escena vertical (de la IA o subida): a pantalla completa, logo blanco y marca en una cápsula blanca.
  * - Foto de producto (cuadrada, fondo blanco): sobre lienzo blanco, logo negro y marca sin cápsula.
  */
-export async function composePromo(src: string, brand: string | null | undefined): Promise<{ url: string; missingBrandLogo: boolean }> {
+export async function composePromo(src: string, brand: string | null | undefined, platform: Platform = 'tiktok'): Promise<{ url: string; missingBrandLogo: boolean }> {
+  const L = LAYOUTS[platform];
   const input = await readImage(src);
   const meta = await sharp(input).metadata();
   const isProductPhoto = !!meta.width && !!meta.height && meta.width / meta.height > 0.8;
@@ -153,28 +182,27 @@ export async function composePromo(src: string, brand: string | null | undefined
   let base: sharp.Sharp;
   if (isProductPhoto) {
     const photo = await sharp(input).flatten({ background: '#ffffff' })
-      .resize({ width: 980, height: 1100, fit: 'inside' }).png().toBuffer();
+      .resize({ width: L.photo.w, height: L.photo.h, fit: 'inside' }).png().toBuffer();
     const pm = await sharp(photo).metadata();
-    base = sharp({ create: { width: W, height: H, channels: 3, background: '#ffffff' } });
-    layers.push({ input: photo, left: Math.round((W - (pm.width || 980)) / 2), top: Math.round(520 + (1100 - (pm.height || 1100)) / 2) });
-    layers.push({ input: await storeLogo('negro'), left: SIDE, top: TOP });
+    base = sharp({ create: { width: L.w, height: L.h, channels: 3, background: '#ffffff' } });
+    layers.push({ input: photo, left: Math.round((L.w - (pm.width || L.photo.w)) / 2), top: Math.round(L.photo.top + (L.photo.h - (pm.height || L.photo.h)) / 2) });
+    layers.push({ input: await storeLogo('negro', L.logoW), left: L.side, top: L.top });
   } else {
-    base = sharp(input).resize({ width: W, height: H, fit: 'cover', position: 'attention' });
-    layers.push({ input: topShade, left: 0, top: 0 });
-    layers.push({ input: await storeLogo('blanco'), left: SIDE, top: TOP });
+    base = sharp(input).resize({ width: L.w, height: L.h, fit: 'cover', position: 'attention' });
+    layers.push({ input: shadeTop(L.w, L.shadeTop), left: 0, top: 0 });
+    layers.push({ input: await storeLogo('blanco', L.logoW), left: L.side, top: L.top });
   }
 
   const logoFile = await brandLogoPath(brand);
   const mark = logoFile || (brand ? await brandWordmark(brand).catch(() => null) : null);
   if (mark) {
-    const logo = await sharp(mark).resize({ width: BRAND_BOX.w, height: BRAND_BOX.h, fit: 'inside' }).png().toBuffer();
-    const lm = await sharp(logo).metadata();
-    const lw = lm.width || BRAND_BOX.w;
-    const lh = lm.height || BRAND_BOX.h;
     if (isProductPhoto) {
-      layers.push({ input: logo, left: W - SIDE - lw, top: TOP + Math.round((97 - lh) / 2) });
+      const logo = await sharp(mark).resize({ width: L.brand.w, height: L.brand.h, fit: 'inside' }).png().toBuffer();
+      const lm = await sharp(logo).metadata();
+      const storeH = Math.round(L.logoW * 116 / 600); // alto del logo de la tienda (proporción del SVG)
+      layers.push({ input: logo, left: L.w - L.side - (lm.width || L.brand.w), top: L.top + Math.round((storeH - (lm.height || L.brand.h)) / 2) });
     } else {
-      layers.push(...(await brandPillLayers(mark)));
+      layers.push(...(await brandPillLayers(mark, L)));
     }
   }
 
@@ -185,12 +213,12 @@ export async function composePromo(src: string, brand: string | null | undefined
 }
 
 /** Compone todas las imágenes; si alguna falla se queda la original. */
-export async function composeAll(srcs: string[], brand: string | null | undefined): Promise<{ urls: string[]; missingBrandLogo: boolean }> {
+export async function composeAll(srcs: string[], brand: string | null | undefined, platform: Platform = 'tiktok'): Promise<{ urls: string[]; missingBrandLogo: boolean }> {
   const urls: string[] = [];
   let missing = false;
   for (const src of srcs) {
     try {
-      const r = await composePromo(src, brand);
+      const r = await composePromo(src, brand, platform);
       urls.push(r.url);
       missing = missing || r.missingBrandLogo;
     } catch (err: any) {
@@ -205,51 +233,51 @@ export async function composeAll(srcs: string[], brand: string | null | undefine
 
 const BODY_FONT = path.join(TEMPLATES, 'fonts', 'NotoSans-Bold.ttf');
 const ACCENT = '#FACC15'; // el amarillo del «+» del logo
-const TEXT_W = 900;
-const TEXT_BOTTOM = 1500;   // por encima del texto y los botones de TikTok
 
 const escapeMarkup = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /** Texto en varias líneas (Pango) con la tipografía de la tienda. */
-async function renderText(text: string, fontfile: string, family: string, sizePx: number, color: string): Promise<Buffer> {
+async function renderText(text: string, fontfile: string, family: string, sizePx: number, color: string, width: number): Promise<Buffer> {
   return sharp({
     text: {
       text: `<span foreground="${color}">${escapeMarkup(text)}</span>`,
-      font: `${family} ${sizePx}`, fontfile, width: TEXT_W, dpi: 72, rgba: true, wrap: 'word', spacing: Math.round(sizePx * 0.15),
+      font: `${family} ${sizePx}`, fontfile, width, dpi: 72, rgba: true, wrap: 'word', spacing: Math.round(sizePx * 0.15),
     },
   }).png().toBuffer();
 }
 
-/** Degradado oscuro en la mitad inferior para que el texto blanco se lea sobre cualquier escena. */
-const bottomShade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="1160">
+/** Degradado oscuro en la parte inferior para que el texto blanco se lea sobre cualquier escena. */
+const shadeBottom = (w: number, h: number) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
   <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
     <stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="0.45" stop-color="#000" stop-opacity="0.62"/>
     <stop offset="1" stop-color="#000" stop-opacity="0.85"/>
-  </linearGradient></defs><rect width="${W}" height="1160" fill="url(#g)"/></svg>`);
+  </linearGradient></defs><rect width="${w}" height="${h}" fill="url(#g)"/></svg>`);
 
 /**
  * Diapositiva de una publicación de marca: escena a pantalla completa, logo de
  * escapesymas.com arriba, y título (amarillo en la última, la llamada a la acción)
- * con su texto en la mitad inferior. Devuelve la ruta en /uploads.
+ * con su texto en la parte inferior. Devuelve la ruta en /uploads.
  */
-export async function composeSlide(scene: string, slide: { title: string; text: string }, isLast: boolean): Promise<string> {
+export async function composeSlide(scene: string, slide: { title: string; text: string }, isLast: boolean, platform: Platform = 'tiktok'): Promise<string> {
+  const L = LAYOUTS[platform];
+  const textW = L.w - L.side * 2 - 60;
   const input = await readImage(scene);
-  const base = sharp(input).resize({ width: W, height: H, fit: 'cover', position: 'attention' });
-  const title = await renderText(slide.title.toUpperCase(), BRAND_FONT, 'Noto Sans Black', 86, isLast ? ACCENT : '#FFFFFF');
-  const body = slide.text ? await renderText(slide.text, BODY_FONT, 'Noto Sans Bold', 44, '#F4F4F5') : null;
+  const base = sharp(input).resize({ width: L.w, height: L.h, fit: 'cover', position: 'attention' });
+  const title = await renderText(slide.title.toUpperCase(), BRAND_FONT, 'Noto Sans Black', L.titlePx, isLast ? ACCENT : '#FFFFFF', textW);
+  const body = slide.text ? await renderText(slide.text, BODY_FONT, 'Noto Sans Bold', L.bodyPx, '#F4F4F5', textW) : null;
   const th = (await sharp(title).metadata()).height || 0;
   const bh = body ? (await sharp(body).metadata()).height || 0 : 0;
   const gap = body ? 30 : 0;
-  const top = Math.max(760, TEXT_BOTTOM - th - gap - bh);
+  const top = Math.max(L.textTopMin, L.textBottom - th - gap - bh);
   const bar = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="120" height="12"><rect width="120" height="12" rx="6" fill="${ACCENT}"/></svg>`);
   const layers: sharp.OverlayOptions[] = [
-    { input: topShade, left: 0, top: 0 },
-    { input: bottomShade, left: 0, top: H - 1160 },
-    { input: await storeLogo('blanco'), left: SIDE, top: TOP },
-    { input: bar, left: SIDE, top: top - 40 },
-    { input: title, left: SIDE, top },
+    { input: shadeTop(L.w, L.shadeTop), left: 0, top: 0 },
+    { input: shadeBottom(L.w, L.shadeBottom), left: 0, top: L.h - L.shadeBottom },
+    { input: await storeLogo('blanco', L.logoW), left: L.side, top: L.top },
+    { input: bar, left: L.side, top: top - 40 },
+    { input: title, left: L.side, top },
   ];
-  if (body) layers.push({ input: body, left: SIDE, top: top + th + gap });
+  if (body) layers.push({ input: body, left: L.side, top: top + th + gap });
   await fs.promises.mkdir(PROMO_DIR, { recursive: true });
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
   await base.composite(layers).jpeg({ quality: 90, mozjpeg: true }).toFile(path.join(PROMO_DIR, filename));
