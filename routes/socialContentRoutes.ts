@@ -53,14 +53,17 @@ socialContentRouter.get('/social-content', async (req, res) => {
 socialContentRouter.post('/social-content', async (req, res) => {
   if (!(await requireAdminRole(req, res))) return;
   try {
-    const { scheduledAt, format, topic, productSku } = req.body || {};
+    const { scheduledAt, format, topic, productSku, campaign } = req.body || {};
     if (!validDate(scheduledAt) || !FORMATS.includes(format)) {
       return res.status(400).json({ error: 'Indica una fecha válida y el formato (vídeo, foto o carrusel)' });
+    }
+    if (campaign && !String(topic || '').trim()) {
+      return res.status(400).json({ error: 'Escribe de qué trata la publicación de marca' });
     }
     if (productSku && !(await productBySku(String(productSku)))) {
       return res.status(400).json({ error: 'Ese producto no existe o no está publicado' });
     }
-    const slot = await createSlot({ scheduledAt, format, topic: text(topic, 500) || undefined, productSku: text(productSku, 80) || undefined });
+    const slot = await createSlot({ scheduledAt, format, topic: text(topic, 500) || undefined, productSku: text(productSku, 80) || undefined, campaign: !!campaign });
     return res.json({ slot });
   } catch (err: any) {
     console.error('[SOCIAL CONTENT CREATE ERROR]:', err.message);
@@ -103,7 +106,15 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ error: 'ID inválido' });
   try {
-    const { copy, hashtags, script, status, scheduledAt, topic, productSku, format } = req.body || {};
+    const { copy, hashtags, script, status, scheduledAt, topic, productSku, format, slides } = req.body || {};
+    // Diapositivas de una publicación de marca: título y texto editables (la escena no).
+    let slidesJson: string | undefined;
+    if (slides !== undefined) {
+      if (!Array.isArray(slides) || slides.length > 6) return res.status(400).json({ error: 'Diapositivas no válidas' });
+      slidesJson = JSON.stringify(slides.map((x: any) => ({
+        title: String(x?.title || '').slice(0, 80), text: String(x?.text || '').slice(0, 220), scene: String(x?.scene || '').slice(0, 600),
+      })));
+    }
     if (status !== undefined && !STATUSES.includes(status)) return res.status(400).json({ error: 'Estado no válido' });
     if (scheduledAt !== undefined && !validDate(scheduledAt)) return res.status(400).json({ error: 'Fecha no válida' });
     if (format !== undefined && !FORMATS.includes(format)) return res.status(400).json({ error: 'Formato no válido' });
@@ -119,6 +130,7 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
       ...(topic !== undefined && { topic: text(topic, 500) || null }),
       ...(productSku !== undefined && { product_sku: text(productSku, 80) || null }),
       ...(format !== undefined && { format }),
+      ...(slidesJson !== undefined && { slides: slidesJson }),
     } as any);
     return res.json({ success: true });
   } catch (err: any) {

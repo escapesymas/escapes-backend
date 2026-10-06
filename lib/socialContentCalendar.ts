@@ -9,7 +9,8 @@ import path from 'path';
 import { pool } from '../db.js';
 import { generateCopy, generateImages, productBySku, pickProduct } from './socialContentAI.js';
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
-import { composeAll, composePromo } from './socialPromo.js';
+import { composeAll, composePromo, composeSlide } from './socialPromo.js';
+import { generateCampaignCopy, generateScene, Slide } from './socialCampaign.js';
 import { reoverlayVideo } from './socialVideo.js';
 
 export interface ContentSlot {
@@ -64,11 +65,11 @@ export async function listSlots(opts: { from?: string; to?: string } = {}): Prom
   return r.rows;
 }
 
-export async function createSlot(input: { scheduledAt: string; format: string; topic?: string; productSku?: string }) {
+export async function createSlot(input: { scheduledAt: string; format: string; topic?: string; productSku?: string; campaign?: boolean }) {
   const r = await pool.query(
-    `INSERT INTO social_content_calendar (scheduled_at, format, topic, product_sku)
-     VALUES ($1, $2, $3, $4) RETURNING *`,
-    [input.scheduledAt, input.format, input.topic || null, input.productSku || null]);
+    `INSERT INTO social_content_calendar (scheduled_at, format, topic, product_sku, campaign)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [input.scheduledAt, input.format, input.topic || null, input.campaign ? null : input.productSku || null, !!input.campaign]);
   return r.rows[0];
 }
 
@@ -76,7 +77,7 @@ export async function deleteSlot(id: number) {
   await pool.query('DELETE FROM social_content_calendar WHERE id = $1', [id]);
 }
 
-export async function updateSlot(id: number, fields: Partial<Pick<ContentSlot, 'copy' | 'hashtags' | 'script' | 'status' | 'scheduled_at' | 'topic' | 'product_sku' | 'format'>>) {
+export async function updateSlot(id: number, fields: Partial<Pick<ContentSlot, 'copy' | 'hashtags' | 'script' | 'status' | 'scheduled_at' | 'topic' | 'product_sku' | 'format'>> & { slides?: string }) {
   const sets: string[] = [];
   const params: any[] = [];
   for (const [k, v] of Object.entries(fields)) {
@@ -105,6 +106,12 @@ async function slotBrand(productSku: string | null): Promise<string | null> {
 export async function recomposeSlot(id: number): Promise<{ missingBrandLogo: boolean } | null> {
   const { rows: [slot] } = await pool.query('SELECT * FROM social_content_calendar WHERE id = $1', [id]);
   if (!slot) return null;
+  if (slot.campaign) {
+    // Publicación de marca: se vuelven a poner los textos (p. ej. tras editarlos) sobre las escenas.
+    const media = await composeSlides(slot.base_media || [], slot.slides || []);
+    await pool.query(`UPDATE social_content_calendar SET media_urls = $2::jsonb, updated_at = NOW() WHERE id = $1`, [id, JSON.stringify(media)]);
+    return { missingBrandLogo: false };
+  }
   const brand = await slotBrand(slot.product_sku);
   // Publicaciones de antes de las promos: sus imágenes actuales son las base.
   const base: string[] = slot.base_media?.length ? slot.base_media : slot.media_urls || [];
@@ -203,6 +210,7 @@ export async function startSlotGeneration(id: number): Promise<boolean> {
 async function generateSlotContent(id: number) {
   const { rows: [slot] } = await pool.query('SELECT * FROM social_content_calendar WHERE id = $1', [id]);
   if (!slot) return;
+  if (slot.campaign) return generateCampaignContent(slot);
   try {
     // Siempre sobre un producto real: el elegido o uno de las marcas destacadas.
     let product = slot.product_sku ? await productBySku(slot.product_sku) : null;
@@ -228,6 +236,49 @@ async function generateSlotContent(id: number) {
       [`No se pudo generar: ${err.message}. Vuelve a intentarlo en unos minutos.`, id]);
     throw err;
   }
+}
+
+/** Publicación de marca: texto por diapositiva, escenas con IA y composición con el texto encima. */
+async function generateCampaignContent(slot: any) {
+  try {
+    if (!slot.topic) throw new Error('Escribe el tema de la publicación (p. ej. «nuestro chat con asesores expertos»)');
+    const copy = await generateCampaignCopy({ format: slot.format, topic: slot.topic });
+    const scenes: string[] = [];
+    const engines = new Set<string>();
+    for (const sl of copy.slides) {
+      const r = await generateScene(sl.scene);
+      scenes.push(r.url);
+      engines.add(r.engine);
+    }
+    const media = await composeSlides(scenes, copy.slides);
+    await pool.query(
+      `UPDATE social_content_calendar
+         SET copy = $1, hashtags = $2, script = $3, media_urls = $4::jsonb, base_media = $5::jsonb, slides = $6::jsonb,
+             video_prompt = $7, status = 'ready', error = $8, updated_at = NOW()
+       WHERE id = $9`,
+      [[copy.hook, copy.copy].filter(Boolean).join('\n\n'), copy.hashtags, copy.script, JSON.stringify(media),
+        JSON.stringify(scenes), JSON.stringify(copy.slides), copy.videoPrompt || null,
+        engines.has('minimax') ? 'Alguna escena se hizo con MiniMax porque Gemini no respondió.' : null, slot.id]);
+  } catch (err: any) {
+    await pool.query(
+      `UPDATE social_content_calendar SET status = 'draft', error = $1, updated_at = NOW() WHERE id = $2`,
+      [`No se pudo generar: ${err.message}. Vuelve a intentarlo en unos minutos.`, slot.id]);
+    throw err;
+  }
+}
+
+/** Compone cada diapositiva (escena + título + texto); si una falla, queda la escena sola. */
+async function composeSlides(scenes: string[], slides: Slide[]): Promise<string[]> {
+  const out: string[] = [];
+  for (let i = 0; i < scenes.length; i++) {
+    try {
+      out.push(await composeSlide(scenes[i], slides[i] || { title: '', text: '' }, i === scenes.length - 1 && scenes.length > 1));
+    } catch (err: any) {
+      console.warn('[SOCIAL CAMPAIGN] diapositiva', i, err.message);
+      out.push(scenes[i]);
+    }
+  }
+  return out;
 }
 
 /** Al arrancar: lo que se quedó "generando" por un reinicio vuelve a borrador. */

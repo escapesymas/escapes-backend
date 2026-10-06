@@ -112,7 +112,7 @@ export async function pickProduct(): Promise<SlotProduct | null> {
 
 // ---------------------------------------------------------------- texto
 
-async function geminiGenerateText(prompt: string): Promise<string> {
+export async function geminiGenerateText(prompt: string): Promise<string> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada');
   const res = await fetch(`${GEMINI_BASE}/models/gemini-flash-latest:generateContent?key=${GEMINI_API_KEY}`, {
     method: 'POST',
@@ -127,7 +127,7 @@ async function geminiGenerateText(prompt: string): Promise<string> {
   return text;
 }
 
-async function minimaxGenerateText(prompt: string): Promise<string> {
+export async function minimaxGenerateText(prompt: string): Promise<string> {
   // El razonamiento de MiniMax cuenta en max_tokens: con poco margen la respuesta llega vacía.
   for (let attempt = 0; attempt < 2; attempt++) {
     const r: any = await minimaxClient.chat.completions.create({
@@ -146,7 +146,7 @@ async function minimaxGenerateText(prompt: string): Promise<string> {
 }
 
 /** Escapa saltos de línea y tabuladores sueltos dentro de las cadenas (JSON "casi válido" de los modelos). */
-function repairJson(raw: string): string {
+export function repairJson(raw: string): string {
   let out = '';
   let inString = false;
   for (let i = 0; i < raw.length; i++) {
@@ -248,7 +248,7 @@ async function loadImage(src: string): Promise<{ data: string; mime: string } | 
 }
 
 /** Imagen con Gemini, con la foto real del producto como referencia si la hay. */
-async function geminiGenerateImage(prompt: string, reference: { data: string; mime: string } | null): Promise<string> {
+export async function geminiGenerateImage(prompt: string, reference: { data: string; mime: string } | null): Promise<string> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada');
   const parts: any[] = [{ text: prompt }];
   if (reference) parts.push({ inlineData: { mimeType: reference.mime, data: reference.data } });
@@ -269,7 +269,7 @@ async function geminiGenerateImage(prompt: string, reference: { data: string; mi
 }
 
 /** Imagen solo a partir de texto con MiniMax (sin producto: escena genérica sin marcas). */
-async function minimaxGenerateImage(prompt: string): Promise<string> {
+export async function minimaxGenerateImage(prompt: string): Promise<string> {
   if (!process.env.MINIMAX_API_KEY) throw new Error('MINIMAX_API_KEY no configurada');
   const res = await fetch('https://api.minimax.io/v1/image_generation', {
     method: 'POST',

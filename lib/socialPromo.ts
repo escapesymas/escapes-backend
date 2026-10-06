@@ -200,3 +200,58 @@ export async function composeAll(srcs: string[], brand: string | null | undefine
   }
   return { urls, missingBrandLogo: missing };
 }
+
+// ---------------------------------------------------------------- diapositivas de marca
+
+const BODY_FONT = path.join(TEMPLATES, 'fonts', 'NotoSans-Bold.ttf');
+const ACCENT = '#FACC15'; // el amarillo del «+» del logo
+const TEXT_W = 900;
+const TEXT_BOTTOM = 1500;   // por encima del texto y los botones de TikTok
+
+const escapeMarkup = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/** Texto en varias líneas (Pango) con la tipografía de la tienda. */
+async function renderText(text: string, fontfile: string, family: string, sizePx: number, color: string): Promise<Buffer> {
+  return sharp({
+    text: {
+      text: `<span foreground="${color}">${escapeMarkup(text)}</span>`,
+      font: `${family} ${sizePx}`, fontfile, width: TEXT_W, dpi: 72, rgba: true, wrap: 'word', spacing: Math.round(sizePx * 0.15),
+    },
+  }).png().toBuffer();
+}
+
+/** Degradado oscuro en la mitad inferior para que el texto blanco se lea sobre cualquier escena. */
+const bottomShade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="1160">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="0.45" stop-color="#000" stop-opacity="0.62"/>
+    <stop offset="1" stop-color="#000" stop-opacity="0.85"/>
+  </linearGradient></defs><rect width="${W}" height="1160" fill="url(#g)"/></svg>`);
+
+/**
+ * Diapositiva de una publicación de marca: escena a pantalla completa, logo de
+ * escapesymas.com arriba, y título (amarillo en la última, la llamada a la acción)
+ * con su texto en la mitad inferior. Devuelve la ruta en /uploads.
+ */
+export async function composeSlide(scene: string, slide: { title: string; text: string }, isLast: boolean): Promise<string> {
+  const input = await readImage(scene);
+  const base = sharp(input).resize({ width: W, height: H, fit: 'cover', position: 'attention' });
+  const title = await renderText(slide.title.toUpperCase(), BRAND_FONT, 'Noto Sans Black', 86, isLast ? ACCENT : '#FFFFFF');
+  const body = slide.text ? await renderText(slide.text, BODY_FONT, 'Noto Sans Bold', 44, '#F4F4F5') : null;
+  const th = (await sharp(title).metadata()).height || 0;
+  const bh = body ? (await sharp(body).metadata()).height || 0 : 0;
+  const gap = body ? 30 : 0;
+  const top = Math.max(760, TEXT_BOTTOM - th - gap - bh);
+  const bar = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="120" height="12"><rect width="120" height="12" rx="6" fill="${ACCENT}"/></svg>`);
+  const layers: sharp.OverlayOptions[] = [
+    { input: topShade, left: 0, top: 0 },
+    { input: bottomShade, left: 0, top: H - 1160 },
+    { input: await storeLogo('blanco'), left: SIDE, top: TOP },
+    { input: bar, left: SIDE, top: top - 40 },
+    { input: title, left: SIDE, top },
+  ];
+  if (body) layers.push({ input: body, left: SIDE, top: top + th + gap });
+  await fs.promises.mkdir(PROMO_DIR, { recursive: true });
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+  await base.composite(layers).jpeg({ quality: 90, mozjpeg: true }).toFile(path.join(PROMO_DIR, filename));
+  return `/uploads/social-content/promo/${filename}`;
+}
