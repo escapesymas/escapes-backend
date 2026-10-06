@@ -79,7 +79,8 @@ Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
 /** Escena de fondo de una diapositiva (vertical, sin texto). Gemini y, si falla, MiniMax. */
 export async function generateScene(scene: string): Promise<{ url: string; engine: string }> {
   const prompt = `Fotografía realista vertical 9:16 para TikTok, estilo publicitario cuidado, buena luz. ${scene}
-Sin ningún texto, letra, logotipo ni marca visible. Deja la franja superior despejada y la mitad inferior con zonas tranquilas (ahí irá texto encima).`;
+Sin ningún texto, letra, logotipo ni marca visible. La foto ocupa todo el encuadre de borde a borde (nunca franjas,
+marcos ni zonas de color liso); arriba, fondo sencillo (pared, cielo o desenfoque) y la mitad inferior con zonas tranquilas, porque ahí irá texto encima.`;
   try {
     return { url: await geminiGenerateImage(prompt, null), engine: 'gemini' };
   } catch (err: any) {

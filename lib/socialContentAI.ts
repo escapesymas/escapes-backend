@@ -294,8 +294,8 @@ export async function generateImages(opts: { format: string; topic?: string | nu
   const notes: string[] = [];
   const p = opts.product;
   const scene = `Fotografía publicitaria realista en vertical (9:16) para TikTok, fondo de garaje/taller o carretera de
-montaña, buena luz, sin texto superpuesto. Deja la franja superior de la imagen despejada (cielo, pared o fondo
-desenfocado): ahí irán los logotipos. ${opts.topic ? `Enfoque: ${opts.topic}.` : ''}`;
+montaña, buena luz, sin texto superpuesto. La foto ocupa todo el encuadre de borde a borde (sin franjas ni marcos);
+en la parte superior, fondo sencillo (cielo, pared o desenfoque) porque ahí irán los logotipos. ${opts.topic ? `Enfoque: ${opts.topic}.` : ''}`;
 
   if (p && p.images.length) {
     const real = p.images.slice(0, opts.format === 'carousel' ? 4 : 1);
