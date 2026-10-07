@@ -7,9 +7,11 @@
 import { pool } from '../db.js';
 import { composeAll, composePromo, composeSlide } from './socialPromo.js';
 import { productBySku, NICHE_CONTEXT, geminiGenerateText, minimaxGenerateText, repairJson } from './socialContentAI.js';
+import { composeProductCarousel, isProductCarousel } from './socialProductCarousel.js';
 
 /** Imágenes 4:5: diapositivas de marca, o promos de producto desde las imágenes base y las finales subidas. */
 async function instagramImages(slot: any): Promise<string[]> {
+  if (isProductCarousel(slot.slides)) return composeProductCarousel(slot.slides, slot.product_sku, 'instagram');
   if (slot.campaign) {
     const scenes: string[] = slot.base_media || [];
     const slides = slot.slides || [];

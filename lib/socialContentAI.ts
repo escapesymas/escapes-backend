@@ -48,6 +48,7 @@ export interface GeneratedCopy {
   hashtags: string;
   imagePrompt: string;   // para la app de Gemini (Nano Banana Pro) con la foto real adjunta
   videoPrompt: string;   // para Flow/Veo: vídeo vertical de 8 s
+  slides?: { title: string; text: string }[];  // carrusel de producto: gancho, producto, precio, llamada a la acción
 }
 
 const euros = (cents: number) => (cents / 100).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -173,6 +174,9 @@ function parseCopy(text: string): GeneratedCopy {
   const copy = {
     hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: str(parsed.hashtags),
     imagePrompt: str(parsed.image_prompt), videoPrompt: str(parsed.video_prompt),
+    slides: Array.isArray(parsed.slides)
+      ? parsed.slides.slice(0, 4).map((x: any) => ({ title: str(x?.title).slice(0, 70), text: str(x?.text).slice(0, 180) }))
+      : undefined,
   };
   if (!copy.copy && !copy.hook) throw new Error('La IA devolvió el contenido vacío');
   return copy;
@@ -210,7 +214,13 @@ Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
  "script": "guion corto plano por escenas para grabar el vídeo o para el carrusel (3-5 pasos)",
  "hashtags": "6-8 hashtags separados por espacio, mezcla de nicho moto y genéricos de España",
  "image_prompt": "instrucciones en español para generar en la app de Gemini una foto vertical 9:16 de ambiente con la FOTO REAL DEL PRODUCTO ADJUNTA: escena, luz, encuadre; pide conservar exactamente forma, colores y logotipos del producto y no añadir texto",
- "video_prompt": "instrucciones en español para generar en Flow (Veo) un vídeo vertical 9:16 de 8 segundos a partir de la foto del producto: planos, movimiento de cámara, ambiente y sonido (p. ej. el escape al acelerar); sin texto en pantalla y sin cambiar el producto"}`;
+ "video_prompt": "instrucciones en español para generar en Flow (Veo) un vídeo vertical 9:16 de 8 segundos a partir de la foto del producto: planos, movimiento de cámara, ambiente y sonido (p. ej. el escape al acelerar); sin texto en pantalla y sin cambiar el producto"${opts.format === 'carousel' && p ? `,
+ "slides": [
+   {"title": "gancho de 3 a 6 palabras (diapositiva 1, sobre la foto de ambiente)", "text": "una frase corta que conecte con el motero"},
+   {"title": "nombre corto del producto (marca y modelo)", "text": "1 o 2 frases con datos reales del nombre o la descripción (medida, uso, material); nada inventado"},
+   {"title": "etiqueta corta para el precio, p. ej. «Precio de oferta» (el precio lo pone el sistema)", "text": "una frase con ventajas reales de compra de los datos de la tienda (descuento por importe, envío gratis desde…)"},
+   {"title": "llamada a la acción con «escapesymas.com», 3 a 6 palabras", "text": "una frase corta (pago seguro, garantía…)"}
+ ]` : ''}}`;
 
   try {
     return { ...parseCopy(await geminiGenerateText(prompt)), engine: 'gemini' };
@@ -290,11 +300,30 @@ export async function minimaxGenerateImage(prompt: string): Promise<string> {
  * 4 para carrusel) y, si Gemini responde, una escena de ambiente al principio
  * hecha a partir de la foto real. Sin producto: escenas genéricas sin marcas.
  */
+/** Escena de ambiente con el producto real como referencia (Gemini). null si Gemini no responde. */
+export async function productScene(p: SlotProduct, focus: string): Promise<string | null> {
+  if (!p.images.length) return null;
+  const reference = await loadImage(p.images[0]);
+  if (!reference) return null;
+  try {
+    return await geminiGenerateImage(
+      `Fotografía publicitaria realista en vertical (9:16) para TikTok, buena luz. ${focus}
+Coloca EXACTAMENTE el producto de la foto adjunta (${p.brand} ${p.name}) en la escena, sin cambiar su forma, colores ni las letras impresas en él.
+Sin ningún texto, cartel, letrero, valla ni logotipo en el escenario. La foto ocupa todo el encuadre de borde a borde;
+arriba, fondo sencillo (cielo, pared o desenfoque) porque ahí irán los logotipos, y la mitad inferior tranquila para poner texto encima.`,
+      reference);
+  } catch (err: any) {
+    console.warn('[SOCIAL CONTENT] escena de producto:', err.message);
+    return null;
+  }
+}
+
 export async function generateImages(opts: { format: string; topic?: string | null; script?: string; product: SlotProduct | null }): Promise<{ urls: string[]; notes: string[] }> {
   const notes: string[] = [];
   const p = opts.product;
   const scene = `Fotografía publicitaria realista en vertical (9:16) para TikTok, fondo de garaje/taller o carretera de
-montaña, buena luz, sin texto superpuesto. La foto ocupa todo el encuadre de borde a borde (sin franjas ni marcos);
+montaña, buena luz. Sin ningún texto, cartel, letrero, valla ni logotipo en el escenario: las únicas letras
+permitidas son las impresas en el propio producto. La foto ocupa todo el encuadre de borde a borde (sin franjas ni marcos);
 en la parte superior, fondo sencillo (cielo, pared o desenfoque) porque ahí irán los logotipos. ${opts.topic ? `Enfoque: ${opts.topic}.` : ''}`;
 
   if (p && p.images.length) {

@@ -112,8 +112,12 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
     let slidesJson: string | undefined;
     if (slides !== undefined) {
       if (!Array.isArray(slides) || slides.length > 6) return res.status(400).json({ error: 'Diapositivas no válidas' });
+      // Carrusel de producto: se conservan el tipo y la imagen de cada diapositiva (solo de la propia web o de Bihr).
+      const okImage = (u: any) => typeof u === 'string' && (/^\/uploads\/[\w./-]+$/.test(u) || u.startsWith('https://api.mybihr.com/medias/'));
       slidesJson = JSON.stringify(slides.map((x: any) => ({
-        title: String(x?.title || '').slice(0, 80), text: String(x?.text || '').slice(0, 220), scene: String(x?.scene || '').slice(0, 600),
+        title: String(x?.title || '').slice(0, 80), text: String(x?.text || '').slice(0, 220),
+        ...(x?.scene && { scene: String(x.scene).slice(0, 600) }),
+        ...(['scene', 'card', 'price'].includes(x?.kind) && okImage(x?.image) && { kind: x.kind, image: x.image }),
       })));
     }
     if (status !== undefined && !STATUSES.includes(status)) return res.status(400).json({ error: 'Estado no válido' });

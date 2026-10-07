@@ -168,6 +168,31 @@ export async function logoOverlayFile(brand: string | null | undefined): Promise
 }
 
 /**
+ * ¿Foto de producto de catálogo (fondo blanco o liso)? Se miran las cuatro
+ * esquinas: claras y uniformes. Antes se decidía por la proporción y una foto
+ * vertical de un neumático se trataba como escena y salía recortada.
+ */
+async function hasPlainBackground(input: Buffer): Promise<boolean> {
+  try {
+    const img = sharp(input).flatten({ background: '#ffffff' }).removeAlpha();
+    const { width = 0, height = 0 } = await img.metadata();
+    if (!width || !height) return false;
+    const s = Math.max(4, Math.round(Math.min(width, height) * 0.04));
+    const corners = [[0, 0], [width - s, 0], [0, height - s], [width - s, height - s]];
+    for (const [left, top] of corners) {
+      const st = await sharp(input).flatten({ background: '#ffffff' }).removeAlpha()
+        .extract({ left, top, width: s, height: s }).stats();
+      const mean = st.channels.reduce((a, c) => a + c.mean, 0) / st.channels.length;
+      const dev = Math.max(...st.channels.map((c) => c.stdev));
+      if (mean < 225 || dev > 12) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Compone la imagen promocional y devuelve su ruta en /uploads.
  * - Escena vertical (de la IA o subida): a pantalla completa, logo blanco y marca en una cápsula blanca.
  * - Foto de producto (cuadrada, fondo blanco): sobre lienzo blanco, logo negro y marca sin cápsula.
@@ -175,8 +200,7 @@ export async function logoOverlayFile(brand: string | null | undefined): Promise
 export async function composePromo(src: string, brand: string | null | undefined, platform: Platform = 'tiktok'): Promise<{ url: string; missingBrandLogo: boolean }> {
   const L = LAYOUTS[platform];
   const input = await readImage(src);
-  const meta = await sharp(input).metadata();
-  const isProductPhoto = !!meta.width && !!meta.height && meta.width / meta.height > 0.8;
+  const isProductPhoto = await hasPlainBackground(input);
 
   const layers: OverlayOptions[] = [];
   let base: Sharp;
@@ -258,7 +282,7 @@ const shadeBottom = (w: number, h: number) => Buffer.from(`<svg xmlns="http://ww
  * escapesymas.com arriba, y título (amarillo en la última, la llamada a la acción)
  * con su texto en la parte inferior. Devuelve la ruta en /uploads.
  */
-export async function composeSlide(scene: string, slide: { title: string; text: string }, isLast: boolean, platform: Platform = 'tiktok'): Promise<string> {
+export async function composeSlide(scene: string, slide: { title: string; text: string }, isLast: boolean, platform: Platform = 'tiktok', brand?: string | null): Promise<string> {
   const L = LAYOUTS[platform];
   const textW = L.w - L.side * 2 - 60;
   const input = await readImage(scene);
@@ -278,8 +302,94 @@ export async function composeSlide(scene: string, slide: { title: string; text: 
     { input: title, left: L.side, top },
   ];
   if (body) layers.push({ input: body, left: L.side, top: top + th + gap });
+  if (brand) {
+    const mark = (await brandLogoPath(brand)) || (await brandWordmark(brand).catch(() => null));
+    if (mark) layers.push(...(await brandPillLayers(mark, L)));
+  }
   await fs.promises.mkdir(PROMO_DIR, { recursive: true });
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
   await base.composite(layers).jpeg({ quality: 90, mozjpeg: true }).toFile(path.join(PROMO_DIR, filename));
+  return `/uploads/social-content/promo/${filename}`;
+}
+
+// ---------------------------------------------------------------- carrusel de producto
+
+const euros = (cents: number) => `${(cents / 100).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
+
+/** Fondo oscuro con un degradado suave (las fichas de producto). */
+const darkBackground = (w: number, h: number) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
+  <defs><radialGradient id="g" cx="50%" cy="38%" r="75%">
+    <stop offset="0" stop-color="#2a2a2e"/><stop offset="1" stop-color="#09090b"/>
+  </radialGradient></defs><rect width="${w}" height="${h}" fill="url(#g)"/></svg>`);
+
+/**
+ * Ficha de producto del carrusel: foto real en una tarjeta blanca sobre fondo
+ * oscuro, logo de la tienda y de la marca arriba, y debajo el título y el texto.
+ * Con `price`, en lugar del título va el precio (y el anterior tachado y el %
+ * de descuento si está en oferta). Devuelve la ruta en /uploads.
+ */
+export async function composeProductCard(
+  src: string,
+  slide: { title: string; text: string },
+  opts: { brand?: string | null; price?: { now: number; before?: number | null }; accent?: boolean },
+  platform: Platform = 'tiktok',
+): Promise<string> {
+  const L = LAYOUTS[platform];
+  const tiktok = platform === 'tiktok';
+  const textW = L.w - L.side * 2 - 60;
+  const card = tiktok ? { top: 330, h: 760 } : { top: 200, h: 600 };
+  const cardW = L.w - L.side * 2;
+
+  // Se recortan los márgenes blancos de la foto del catálogo para que el producto se vea grande.
+  const flat = await sharp(await readImage(src)).flatten({ background: '#ffffff' }).png().toBuffer();
+  const trimmed = await sharp(flat).trim({ threshold: 12 }).png().toBuffer().catch(() => flat);
+  const photo = await sharp(trimmed).resize({ width: cardW - 100, height: card.h - 100, fit: 'inside' }).png().toBuffer();
+  const pm = await sharp(photo).metadata();
+  const cardSvg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${cardW}" height="${card.h}">
+    <rect width="${cardW}" height="${card.h}" rx="36" fill="#ffffff"/></svg>`);
+
+  const layers: OverlayOptions[] = [
+    { input: await storeLogo('blanco', L.logoW), left: L.side, top: L.top },
+    { input: cardSvg, left: L.side, top: card.top },
+    { input: photo, left: L.side + Math.round((cardW - (pm.width || 0)) / 2), top: card.top + Math.round((card.h - (pm.height || 0)) / 2) },
+  ];
+  if (opts.brand) {
+    const mark = (await brandLogoPath(opts.brand)) || (await brandWordmark(opts.brand).catch(() => null));
+    if (mark) layers.push(...(await brandPillLayers(mark, L)));
+  }
+
+  let y = card.top + card.h + (tiktok ? 50 : 40);
+  const push = async (buf: Buffer, gapAfter: number) => {
+    layers.push({ input: buf, left: L.side, top: y });
+    y += ((await sharp(buf).metadata()).height || 0) + gapAfter;
+  };
+
+  if (opts.price) {
+    const { now, before } = opts.price;
+    const off = before && before > now ? Math.round((1 - now / before) * 100) : 0;
+    if (off >= 5) {
+      // Cápsula con el % de descuento sobre la esquina de la tarjeta.
+      const label = await renderText(`-${off} %`, BRAND_FONT, 'Noto Sans Black', tiktok ? 56 : 48, '#09090b', 400);
+      const lm = await sharp(label).trim().toBuffer({ resolveWithObject: true });
+      const bw = lm.info.width + 56; const bh = lm.info.height + 36;
+      layers.push({ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${bw}" height="${bh}"><rect width="${bw}" height="${bh}" rx="${Math.round(bh / 2)}" fill="${ACCENT}"/></svg>`),
+        left: L.side + cardW - bw - 24, top: card.top + 24 });
+      layers.push({ input: lm.data, left: L.side + cardW - bw - 24 + 28, top: card.top + 24 + 18 });
+    }
+    if (slide.title) await push(await renderText(slide.title.toUpperCase(), BODY_FONT, 'Noto Sans Bold', tiktok ? 34 : 30, '#A1A1AA', textW), 6);
+    await push(await renderText(euros(now), BRAND_FONT, 'Noto Sans Black', tiktok ? 128 : 104, ACCENT, textW), 4);
+    if (off >= 5 && before) {
+      layers.push({ input: await sharp({ text: { text: `<span foreground="#A1A1AA"><s>antes ${escapeMarkup(euros(before))}</s></span>`, font: `Noto Sans Bold ${tiktok ? 40 : 34}`, fontfile: BODY_FONT, width: textW, dpi: 72, rgba: true } }).png().toBuffer(), left: L.side, top: y });
+      y += tiktok ? 64 : 54;
+    }
+    if (slide.text) await push(await renderText(slide.text, BODY_FONT, 'Noto Sans Bold', tiktok ? 40 : 34, '#E4E4E7', textW), 0);
+  } else {
+    await push(await renderText(slide.title.toUpperCase(), BRAND_FONT, 'Noto Sans Black', tiktok ? 70 : 60, opts.accent ? ACCENT : '#FFFFFF', textW), 20);
+    if (slide.text) await push(await renderText(slide.text, BODY_FONT, 'Noto Sans Bold', tiktok ? 40 : 34, '#E4E4E7', textW), 0);
+  }
+
+  await fs.promises.mkdir(PROMO_DIR, { recursive: true });
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+  await sharp(darkBackground(L.w, L.h)).composite(layers).jpeg({ quality: 90, mozjpeg: true }).toFile(path.join(PROMO_DIR, filename));
   return `/uploads/social-content/promo/${filename}`;
 }

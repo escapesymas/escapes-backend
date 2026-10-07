@@ -11,6 +11,8 @@ import { generateCopy, generateImages, productBySku, pickProduct } from './socia
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
 import { composeAll, composePromo, composeSlide } from './socialPromo.js';
 import { generateCampaignCopy, generateScene, Slide } from './socialCampaign.js';
+import { productScene } from './socialContentAI.js';
+import { buildProductSlides, composeProductCarousel, isProductCarousel } from './socialProductCarousel.js';
 import { reoverlayVideo } from './socialVideo.js';
 
 export interface ContentSlot {
@@ -110,6 +112,11 @@ export async function recomposeSlot(id: number): Promise<{ missingBrandLogo: boo
     // Publicación de marca: se vuelven a poner los textos (p. ej. tras editarlos) sobre las escenas.
     const media = await composeSlides(slot.base_media || [], slot.slides || []);
     await pool.query(`UPDATE social_content_calendar SET media_urls = $2::jsonb, updated_at = NOW() WHERE id = $1`, [id, JSON.stringify(media)]);
+    return { missingBrandLogo: false };
+  }
+  if (isProductCarousel(slot.slides)) {
+    const media = await composeProductCarousel(slot.slides, slot.product_sku, 'tiktok');
+    if (media.length) await pool.query(`UPDATE social_content_calendar SET media_urls = $2::jsonb, updated_at = NOW() WHERE id = $1`, [id, JSON.stringify(media)]);
     return { missingBrandLogo: false };
   }
   const brand = await slotBrand(slot.product_sku);
@@ -218,6 +225,29 @@ async function generateSlotContent(id: number) {
     if (!product) product = await pickProduct();
 
     const copy = await generateCopy({ format: slot.format, topic: slot.topic, product });
+
+    // Carrusel de producto: 4 diapositivas con texto (gancho, ficha, precio y llamada a la acción).
+    if (slot.format === 'carousel' && product && product.images.length) {
+      const focus = slot.topic ? ` Enfoque: ${slot.topic}.` : '';
+      const [hookScene, ctaScene] = await Promise.all([
+        productScene(product, `Escena de uso real con moteros, en carretera o en el taller, que despierte ganas de tenerlo.${focus}`),
+        productScene(product, `Plano protagonista del producto, de cerca y con mucho detalle, en un ambiente motero cuidado.${focus}`),
+      ]);
+      const slides = buildProductSlides(copy.slides, product, { hook: hookScene, cta: ctaScene }, copy.hook);
+      const media = await composeProductCarousel(slides, product.sku, 'tiktok');
+      if (!media.length) throw new Error('No se pudieron componer las diapositivas');
+      const note = hookScene || ctaScene ? null : 'Sin escenas de ambiente (Gemini no respondió): se usan las fotos reales en todas las diapositivas.';
+      await pool.query(
+        `UPDATE social_content_calendar
+           SET copy = $1, hashtags = $2, script = $3, media_urls = $4::jsonb, product_sku = $5, slides = $6::jsonb,
+               base_media = $7::jsonb, status = 'ready', error = $8, image_prompt = $9, video_prompt = $10,
+               ig_media = '[]'::jsonb, ig_copy = NULL, ig_hashtags = NULL, ig_status = NULL, updated_at = NOW()
+         WHERE id = $11`,
+        [[copy.hook, copy.copy].filter(Boolean).join('\n\n'), copy.hashtags, copy.script, JSON.stringify(media), product.sku,
+          JSON.stringify(slides), JSON.stringify([hookScene, ctaScene].filter(Boolean)), note, copy.imagePrompt || null, copy.videoPrompt || null, id]);
+      return;
+    }
+
     const { urls, notes } = await generateImages({ format: slot.format, topic: slot.topic, script: copy.script, product });
     // Imágenes promocionales: logo de escapesymas.com y de la marca encima de cada una.
     const promo = await composeAll(urls, product?.brand);
