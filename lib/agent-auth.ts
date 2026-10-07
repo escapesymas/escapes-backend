@@ -31,8 +31,16 @@ export function forgetRole(userId: number) {
 }
 
 /** Asesor o administrador; si no, responde 403 y devuelve null. */
+/** Sesión de personal sin el segundo paso: el panel debe pedirlo antes de nada. */
+function mfaPending(auth: any, res: any): boolean {
+  if (!auth?.mfa_pending) return false;
+  res.status(401).json({ error: 'Falta la verificación en dos pasos', code: 'mfa_required' });
+  return true;
+}
+
 export async function requireAgent(req: any, res: any): Promise<AgentAuth | null> {
   const auth = authenticateRequest(req);
+  if (mfaPending(auth, res)) return null;
   if (auth?.user_id) {
     const role = await currentRole(auth.user_id).catch(() => null);
     if (role === 'admin' || role === 'asesor') {
@@ -46,6 +54,7 @@ export async function requireAgent(req: any, res: any): Promise<AgentAuth | null
 /** Solo administradores (comprobado también en la base de datos). */
 export async function requireAdminRole(req: any, res: any): Promise<AgentAuth | null> {
   const auth = authenticateRequest(req);
+  if (mfaPending(auth, res)) return null;
   if (auth?.user_id && (await currentRole(auth.user_id).catch(() => null)) === 'admin') {
     return { user_id: auth.user_id, email: auth.email, role: 'admin', isAdmin: true };
   }

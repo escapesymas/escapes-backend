@@ -11,7 +11,9 @@ import {
   parseIntSafe,
   sanitizeString,
   authenticateRequest,
+  STAFF_ROLES,
 } from '../utils.js';
+import { getMfaMethods } from './mfaRoutes.js';
 
 // ── Verificación del email en el registro ─────────────────────────────────
 const SITE_URL = process.env.PUBLIC_BASE_URL || 'https://escapesymas.com';
@@ -528,15 +530,16 @@ authRouter.post('/auth', async (req, res) => {
         WHERE LOWER(email) = LOWER(${username}) OR LOWER(username) = LOWER(${username})
       `);
 
+      // Mismo mensaje si no existe o si la contraseña no es: no revela qué cuentas existen.
       if (userRes.rows.length === 0) {
-        return res.status(401).json({ error: 'Usuario no encontrado' });
+        return res.status(401).json({ error: 'Email o contraseña incorrectos' });
       }
 
       const user = userRes.rows[0] as any;
 
       const isValid = await verifyPassword(password || '', user.password_hash);
       if (!isValid) {
-        return res.status(401).json({ error: 'Contraseña incorrecta' });
+        return res.status(401).json({ error: 'Email o contraseña incorrectos' });
       }
 
       if (user.password_hash && isLegacyPasswordHash(user.password_hash)) {
@@ -562,8 +565,16 @@ authRouter.post('/auth', async (req, res) => {
       let cart: any[] = [];
       try { cart = typeof user.cart === 'string' ? JSON.parse(user.cart) : user.cart; } catch {}
 
+      // Personal: el panel pide ahora el segundo paso (o configurarlo si aún no tiene).
+      let mfa: any = undefined;
+      if (STAFF_ROLES.has(user.role)) {
+        const methods = await getMfaMethods(user.id);
+        mfa = { required: true, setupRequired: !(methods.passkeys > 0 || methods.totp), methods };
+      }
+
       return res.json({
         token,
+        ...(mfa && { mfa }),
         user: {
           id: user.id,
           username: user.username,

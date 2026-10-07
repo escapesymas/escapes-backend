@@ -34,19 +34,34 @@ export function isLegacyPasswordHash(hash: string): boolean {
   return hash && hash.length === 64 && /^[a-f0-9]{64}$/i.test(hash);
 }
 
-export function generateJWT(user: any): string {
-  const payload = {
+/** Roles del personal: necesitan la verificación en dos pasos para usar el panel. */
+export const STAFF_ROLES = new Set(['admin', 'asesor']);
+
+export function generateJWT(user: any, opts: { mfa?: boolean } = {}): string {
+  const payload: Record<string, unknown> = {
     user_id: user.id,
     email: user.email,
     role: user.role || 'user',
     username: user.username || user.email,
   };
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+  // mfa: el segundo paso (llave de acceso, Authenticator o código de recuperación) está hecho.
+  if (opts.mfa) payload.mfa = true;
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: opts.mfa ? '24h' : '7d' });
 }
 
+/**
+ * Verifica el token. Un token de personal (admin/asesor) SIN el segundo paso
+ * hecho se rebaja a cliente: sirve en la tienda, pero ninguna comprobación de
+ * administrador lo acepta. `staff_role` y `mfa_pending` permiten completar el
+ * segundo paso desde el panel.
+ */
 export function verifyJWT(token: string): any | null {
   try {
-    return jwt.verify(token, JWT_SECRET);
+    const payload: any = jwt.verify(token, JWT_SECRET);
+    if (payload && STAFF_ROLES.has(payload.role) && payload.mfa !== true) {
+      return { ...payload, role: 'customer', staff_role: payload.role, mfa_pending: true };
+    }
+    return payload;
   } catch {
     return null;
   }
