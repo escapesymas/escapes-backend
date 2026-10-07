@@ -629,8 +629,20 @@ function localImageForSku(sku: string | null | undefined, variant: ImageVariant 
   return result;
 }
 
-// Archivos estáticos ANTES del rate limiting
+// Archivos estáticos ANTES del rate limiting.
+// Solo se sirven las imágenes que usa la web: fotos de producto (optimized/),
+// avatares, chat y contenido de redes. En la raíz de uploads también hay
+// ficheros internos (catálogo de Bihr con los precios de compra, zips, logs,
+// CSV): nunca deben ser públicos.
+const PUBLIC_UPLOAD_RE = /^\/(?:(?:optimized|chat|social-content)\/[\w./-]+|avatar-[\w.-]+)\.(?:webp|png|jpe?g|gif|mp4|mov|webm|heic)$/i;
+app.use('/uploads', (req: any, res: any, next: any) => {
+  const p = decodeURIComponent(String(req.path || ''));
+  if (p.includes('..') || !PUBLIC_UPLOAD_RE.test(p)) return res.status(404).end();
+  next();
+});
 app.use('/uploads', express.static(uploadDir, {
+  dotfiles: 'deny',
+  index: false,
   setHeaders: (res) => {
     res.set('X-Robots-Tag', 'noindex, nofollow');
   }
