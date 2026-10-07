@@ -6,7 +6,7 @@
  */
 import { pool } from '../db.js';
 import { composeAll, composePromo, composeSlide } from './socialPromo.js';
-import { productBySku, NICHE_CONTEXT, geminiGenerateText, minimaxGenerateText, repairJson } from './socialContentAI.js';
+import { productBySku, NICHE_CONTEXT, geminiGenerateText, minimaxGenerateText, repairJson, normalizeHashtags } from './socialContentAI.js';
 import { composeProductCarousel, isProductCarousel } from './socialProductCarousel.js';
 
 /** Imágenes 4:5: diapositivas de marca, o promos de producto desde las imágenes base y las finales subidas. */
@@ -57,7 +57,7 @@ Responde EXCLUSIVAMENTE en JSON válido (sin markdown): {"copy": "...", "hashtag
     let d: any;
     try { d = JSON.parse(m[0]); } catch { d = JSON.parse(repairJson(m[0])); }
     if (!d.copy) throw new Error('La IA devolvió el texto vacío');
-    return { copy: String(d.copy).trim().slice(0, 2200), hashtags: String(d.hashtags || '').trim().slice(0, 600) };
+    return { copy: String(d.copy).trim().slice(0, 2200), hashtags: normalizeHashtags(String(d.hashtags || '').trim()).slice(0, 600) };
   };
   try { return parse(await geminiGenerateText(prompt)); }
   catch (err: any) {

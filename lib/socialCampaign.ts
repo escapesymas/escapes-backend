@@ -9,7 +9,7 @@ import { storePolicies } from '../chatbot/index.js';
 import { getSupportSettings, hoursText } from './live-chat.js';
 import {
   NICHE_CONTEXT, GeneratedCopy, geminiGenerateText, minimaxGenerateText, repairJson,
-  geminiGenerateImage, minimaxGenerateImage,
+  geminiGenerateImage, minimaxGenerateImage, normalizeHashtags,
 } from './socialContentAI.js';
 
 export interface Slide { title: string; text: string; scene: string }
@@ -38,7 +38,7 @@ function parseCampaign(text: string): GeneratedCopy & { slides: Slide[] } {
     .slice(0, 6);
   if (!slides.length) throw new Error('La IA no devolvió diapositivas');
   return {
-    hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: str(parsed.hashtags),
+    hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: normalizeHashtags(str(parsed.hashtags)),
     imagePrompt: '', videoPrompt: str(parsed.video_prompt), slides,
   };
 }
@@ -78,7 +78,7 @@ Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
 
 /** Escena de fondo de una diapositiva (vertical, sin texto). Gemini y, si falla, MiniMax. */
 export async function generateScene(scene: string): Promise<{ url: string; engine: string }> {
-  const prompt = `Fotografía realista vertical 9:16 para TikTok, estilo publicitario cuidado, buena luz. ${scene}
+  const prompt = `Fotografía realista vertical 9:16, estilo publicitario cuidado, buena luz, sin marcas de agua ni logotipos de redes sociales. ${scene}
 Sin ningún texto, letra, logotipo ni marca visible. La foto ocupa todo el encuadre de borde a borde (nunca franjas,
 marcos ni zonas de color liso); arriba, fondo sencillo (pared, cielo o desenfoque) y la mitad inferior con zonas tranquilas, porque ahí irá texto encima.`;
   try {

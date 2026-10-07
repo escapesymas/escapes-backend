@@ -162,6 +162,16 @@ export function repairJson(raw: string): string {
   return out;
 }
 
+/** «#neumaticos moto» → «#neumaticosmoto»: los hashtags no pueden llevar espacios. */
+export function normalizeHashtags(text: string): string {
+  const out: string[] = [];
+  for (const w of text.split(/\s+/).filter(Boolean)) {
+    if (w.startsWith('#') || !out.length) out.push(w.startsWith('#') ? w : `#${w}`);
+    else out[out.length - 1] += w.replace(/[^\p{L}\p{N}_]/gu, '');
+  }
+  return out.join(' ');
+}
+
 function parseCopy(text: string): GeneratedCopy {
   const jsonMatch = text.replace(/```(?:json)?/gi, '').match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
@@ -172,7 +182,7 @@ function parseCopy(text: string): GeneratedCopy {
   try { parsed = JSON.parse(jsonMatch[0]); } catch { parsed = JSON.parse(repairJson(jsonMatch[0])); }
   const str = (v: any) => (Array.isArray(v) ? v.join('\n') : String(v || '')).trim();
   const copy = {
-    hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: str(parsed.hashtags),
+    hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: normalizeHashtags(str(parsed.hashtags)),
     imagePrompt: str(parsed.image_prompt), videoPrompt: str(parsed.video_prompt),
     slides: Array.isArray(parsed.slides)
       ? parsed.slides.slice(0, 4).map((x: any) => ({ title: str(x?.title).slice(0, 70), text: str(x?.text).slice(0, 180) }))
@@ -307,7 +317,7 @@ export async function productScene(p: SlotProduct, focus: string): Promise<strin
   if (!reference) return null;
   try {
     return await geminiGenerateImage(
-      `Fotografía publicitaria realista en vertical (9:16) para TikTok, buena luz. ${focus}
+      `Fotografía publicitaria realista en vertical (9:16), buena luz, sin marcas de agua ni logotipos de redes sociales. ${focus}
 Coloca EXACTAMENTE el producto de la foto adjunta (${p.brand} ${p.name}) en la escena, sin cambiar su forma, colores ni las letras impresas en él.
 Sin ningún texto, cartel, letrero, valla ni logotipo en el escenario. La foto ocupa todo el encuadre de borde a borde;
 arriba, fondo sencillo (cielo, pared o desenfoque) porque ahí irán los logotipos, y la mitad inferior tranquila para poner texto encima.`,
@@ -321,7 +331,7 @@ arriba, fondo sencillo (cielo, pared o desenfoque) porque ahí irán los logotip
 export async function generateImages(opts: { format: string; topic?: string | null; script?: string; product: SlotProduct | null }): Promise<{ urls: string[]; notes: string[] }> {
   const notes: string[] = [];
   const p = opts.product;
-  const scene = `Fotografía publicitaria realista en vertical (9:16) para TikTok, fondo de garaje/taller o carretera de
+  const scene = `Fotografía publicitaria realista en vertical (9:16), sin marcas de agua ni logotipos de redes sociales, fondo de garaje/taller o carretera de
 montaña, buena luz. Sin ningún texto, cartel, letrero, valla ni logotipo en el escenario: las únicas letras
 permitidas son las impresas en el propio producto. La foto ocupa todo el encuadre de borde a borde (sin franjas ni marcos);
 en la parte superior, fondo sencillo (cielo, pared o desenfoque) porque ahí irán los logotipos. ${opts.topic ? `Enfoque: ${opts.topic}.` : ''}`;
