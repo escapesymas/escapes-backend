@@ -518,6 +518,17 @@ app.use((req: any, _res: any, next: any) => {
   next();
 });
 const clientKey = (req: any) => ipKeyGenerator(req.clientIp || req.ip || 'unknown');
+// Rutas públicas fuera del límite global (catálogo e imágenes) que llaman a
+// Bihr o escriben en disco: un tope propio por IP.
+const heavyPublicLimiter = rateLimit({
+  keyGenerator: clientKey,
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas peticiones. Inténtalo de nuevo en un minuto.' }
+});
+
 app.use((_req: any, res: any, next: any) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -1460,7 +1471,7 @@ function diskPathFor(rawUrl: string, width: number): string {
   return path.join(dir, `${hash}-${width}.webp`);
 }
 
-app.get('/api/image-proxy', async (req, res) => {
+app.get('/api/image-proxy', heavyPublicLimiter, async (req, res) => {
   try {
     const rawUrl = String(req.query.url || '');
     if (!rawUrl) return res.status(400).json({ error: 'Missing url param' });
@@ -1680,6 +1691,7 @@ app.post('/api/bihr/sync-images/control', async (req: any, res: any) => {
 
 // Estado del downloader de imágenes Andreani (lee BD + PM2)
 app.get('/api/andreani/sync-images/status', async (req: any, res: any) => {
+  if (!requireAdminKey(req, res)) return;
   try {
     let imageDownloaderRunning = false;
     let pm2Status = 'stopped';
@@ -2198,6 +2210,16 @@ const formsLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Demasiados envíos. Por favor, espera 15 minutos.' }
+});
+
+// Validación de cupones: frena la búsqueda de códigos a base de probar.
+const couponLimiter = rateLimit({
+  keyGenerator: clientKey,
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos con cupones. Espera 15 minutos.' }
 });
 
 const authLimiter = rateLimit({
@@ -5390,7 +5412,7 @@ app.all('/api/garage', requireAuth, async (req: any, res) => {
 // ================================================================
 // PUBLIC VALIDATIONS & dynamic mappings
 // ================================================================
-app.post('/api/coupons/validate', async (req: any, res: any) => {
+app.post('/api/coupons/validate', couponLimiter, async (req: any, res: any) => {
   const { code, subtotal } = req.body || {};
   if (!code) return res.status(400).json({ valid: false, error: 'Falta el código de cupón' });
 
@@ -6943,9 +6965,12 @@ app.get('/api/reviews/:productId', async (req, res) => {
   }
 });
 
-app.post('/api/reviews', async (req, res) => {
+app.post('/api/reviews', formsLimiter, async (req, res) => {
   try {
-    const { product_id, rating, title, content } = req.body;
+    const { product_id, rating } = req.body;
+    // Longitudes acotadas (las reseñas quedan pendientes de moderación).
+    const title = req.body?.title ? String(req.body.title).slice(0, 150) : null;
+    const content = req.body?.content ? String(req.body.content).slice(0, 3000) : null;
 
     if (!product_id || !rating) {
       return res.status(400).json({ error: 'product_id and rating are required' });

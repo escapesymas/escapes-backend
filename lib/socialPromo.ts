@@ -11,7 +11,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import sharp from 'sharp';
+import sharp, { type OverlayOptions, type Sharp } from 'sharp';
 import { pool } from '../db.js';
 
 export type Platform = 'tiktok' | 'instagram';
@@ -139,7 +139,7 @@ async function brandWordmark(brand: string): Promise<Buffer> {
 }
 
 /** Logo de la marca (o su nombre si no hay logo) en su cápsula blanca, para escenas y vídeos. */
-async function brandPillLayers(logoFile: string | Buffer, L: Layout = LAYOUTS.tiktok): Promise<sharp.OverlayOptions[]> {
+async function brandPillLayers(logoFile: string | Buffer, L: Layout = LAYOUTS.tiktok): Promise<OverlayOptions[]> {
   const logo = await sharp(logoFile).resize({ width: L.brand.w, height: L.brand.h, fit: 'inside' }).png().toBuffer();
   const lm = await sharp(logo).metadata();
   const pad = 22;
@@ -156,7 +156,7 @@ async function brandPillLayers(logoFile: string | Buffer, L: Layout = LAYOUTS.ti
  * encima de un vídeo (ffmpeg). Devuelve la ruta del PNG.
  */
 export async function logoOverlayFile(brand: string | null | undefined): Promise<{ file: string; missingBrandLogo: boolean }> {
-  const layers: sharp.OverlayOptions[] = [{ input: topShade, left: 0, top: 0 }, { input: await storeLogo('blanco'), left: SIDE, top: TOP }];
+  const layers: OverlayOptions[] = [{ input: topShade, left: 0, top: 0 }, { input: await storeLogo('blanco'), left: SIDE, top: TOP }];
   const logoFile = await brandLogoPath(brand);
   const mark = logoFile || (brand ? await brandWordmark(brand).catch(() => null) : null);
   if (mark) layers.push(...(await brandPillLayers(mark)));
@@ -178,8 +178,8 @@ export async function composePromo(src: string, brand: string | null | undefined
   const meta = await sharp(input).metadata();
   const isProductPhoto = !!meta.width && !!meta.height && meta.width / meta.height > 0.8;
 
-  const layers: sharp.OverlayOptions[] = [];
-  let base: sharp.Sharp;
+  const layers: OverlayOptions[] = [];
+  let base: Sharp;
   if (isProductPhoto) {
     const photo = await sharp(input).flatten({ background: '#ffffff' })
       .resize({ width: L.photo.w, height: L.photo.h, fit: 'inside' }).png().toBuffer();
@@ -270,7 +270,7 @@ export async function composeSlide(scene: string, slide: { title: string; text: 
   const gap = body ? 30 : 0;
   const top = Math.max(L.textTopMin, L.textBottom - th - gap - bh);
   const bar = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="120" height="12"><rect width="120" height="12" rx="6" fill="${ACCENT}"/></svg>`);
-  const layers: sharp.OverlayOptions[] = [
+  const layers: OverlayOptions[] = [
     { input: shadeTop(L.w, L.shadeTop), left: 0, top: 0 },
     { input: shadeBottom(L.w, L.shadeBottom), left: 0, top: L.h - L.shadeBottom },
     { input: await storeLogo('blanco', L.logoW), left: L.side, top: L.top },

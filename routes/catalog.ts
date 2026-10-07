@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { db, pool } from '../db.js';
 import { sql } from 'drizzle-orm';
 import fs from 'fs';
@@ -1042,7 +1043,17 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
 });
 
 // POST /api/catalog/product/:id/refresh-stock
-catalogRouter.post('/catalog/product/:id/refresh-stock', async (req, res) => {
+// Llama a la API de Bihr: tope propio por IP (el catálogo no pasa por el límite global).
+const refreshStockLimiter = rateLimit({
+  keyGenerator: (req: any) => ipKeyGenerator(req.clientIp || req.ip || 'unknown'),
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas consultas de stock. Inténtalo en un minuto.' },
+});
+
+catalogRouter.post('/catalog/product/:id/refresh-stock', refreshStockLimiter, async (req, res) => {
   try {
     const productId = parseInt(req.params.id, 10);
     if (isNaN(productId)) return res.status(400).json({ error: 'ID de producto inválido' });

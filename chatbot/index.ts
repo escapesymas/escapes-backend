@@ -357,10 +357,6 @@ function verifyChatJWT(token: string): ChatUser | null {
 }
 
 export function chatHealthHandler(_req: Request, res: Response) {
-  res.json({
-    status: 'ok',
-    model: CHAT_MODEL,
-    configured: !!process.env.MINIMAX_API_KEY,
-    authenticated: true,
-  });
+  // Sin detalles internos (modelo, claves): solo si está operativo.
+  res.json({ status: process.env.MINIMAX_API_KEY ? 'ok' : 'unconfigured' });
 }

@@ -374,7 +374,7 @@ async function rarestTerm(terms: string[]): Promise<string | null> {
   if (words.length === 0) return null;
   try {
     const { rows } = await pool.query(`SELECT word, freq FROM catalog_words WHERE word = ANY($1::text[])`, [words]);
-    const freq = new Map(rows.map((r: any) => [r.word, Number(r.freq)]));
+    const freq = new Map<string, number>(rows.map((r: any) => [String(r.word), Number(r.freq)] as [string, number]));
     const ranked = words.map((w) => ({ w, f: freq.get(w) ?? 0 })).sort((a, b) => a.f - b.f);
     return ranked[0].f < 100 ? ranked[0].w : null;
   } catch {
