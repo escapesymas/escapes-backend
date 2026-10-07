@@ -5,7 +5,8 @@ name: CI — Escapes Backend
 
 on:
   push:
-    branches: [main]
+    # mejoras/**: comprobar antes de pasar a main (main despliega en Coolify).
+    branches: [main, 'mejoras/**']
   pull_request:
 
 concurrency:
@@ -63,7 +64,7 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm ci --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund --legacy-peer-deps
 
       - name: TypeScript
         run: npx tsc --noEmit

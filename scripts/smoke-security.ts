@@ -16,11 +16,13 @@ const API = (process.env.API_BASE || 'http://localhost:3901').replace(/\/$/, '')
 const SECRET = process.env.JWT_SECRET;
 if (!SECRET) throw new Error('JWT_SECRET requerido para firmar tokens de prueba');
 
-const token = (id: number, email: string, role = 'customer') =>
-  jwt.sign({ user_id: id, email, role, username: email }, SECRET, { expiresIn: '10m' });
+// El personal necesita el segundo paso hecho (claim mfa); sin él, su token vale como cliente.
+const token = (id: number, email: string, role = 'customer', mfa = role === 'admin') =>
+  jwt.sign({ user_id: id, email, role, username: email, ...(mfa && { mfa: true }) }, SECRET, { expiresIn: '10m' });
 const A = token(900001, 'a@test.local');
 const B = token(900002, 'b@test.local');
 const ADMIN = token(900003, 'admin@test.local', 'admin');
+const ADMIN_SIN_2FA = token(900003, 'admin@test.local', 'admin', false);
 
 let failed = 0;
 async function check(name: string, expected: number | number[], path: string, init: RequestInit & { auth?: string } = {}) {
@@ -84,6 +86,9 @@ async function main() {
   await check('email-stats como cliente', 403, '/api/admin/email-stats', { auth: A });
   await check('health/diag sin sesión', 401, '/api/health/diag');
   await check('health/diag como admin', 200, '/api/health/diag', { auth: ADMIN });
+  // Verificación en dos pasos: un admin que solo ha puesto la contraseña no entra al panel.
+  await check('health/diag como admin sin 2FA', [401, 403], '/api/health/diag', { auth: ADMIN_SIN_2FA });
+  await check('mfa/status como admin sin 2FA', 200, '/api/mfa/status', { auth: ADMIN_SIN_2FA });
 
   // Foro: no se puede publicar en nombre de otro
   await check('forum create-thread sin sesión', 401, '/api/forum?action=create-thread', {
