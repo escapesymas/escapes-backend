@@ -23,6 +23,7 @@ async function storeServices(): Promise<string> {
 - Asistente con IA disponible siempre: busca recambios compatibles con la moto del cliente por marca, modelo y año.
 - Asesores humanos expertos en moto${hours ? ` (horario de atención: ${hours})` : ' dentro del horario de atención'}: el cliente pide hablar con una persona desde el mismo chat. El asesor le ayuda a elegir, le envía productos y fotos, le prepara el pedido con sus piezas y le manda el enlace para pagar.
 - Fuera de horario el cliente deja un mensaje y le contestamos; le avisamos al móvil (los avisos son solo de su consulta, nunca publicidad).
+- «Mi garaje» en escapesymas.com: el cliente elige su moto (marca, modelo y año) y la tienda le muestra los recambios y accesorios compatibles con ella.
 - Más de 200 marcas y más de 100.000 recambios, accesorios y equipamiento de moto.`;
 }
 

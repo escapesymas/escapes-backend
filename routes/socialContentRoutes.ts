@@ -6,7 +6,7 @@ import multer from 'multer';
 import { requireAdminRole } from '../lib/agent-auth.js';
 import {
   listSlots, createSlot, deleteSlot, updateSlot, markPublished,
-  startSlotGeneration, autoScheduleUpcoming, addFinalMedia, removeFinalMedia, recomposeSlot, promoForUpload,
+  startSlotGeneration, generatePending, autoScheduleUpcoming, addFinalMedia, removeFinalMedia, recomposeSlot, promoForUpload,
   FORMATS, STATUSES,
 } from '../lib/socialContentCalendar.js';
 import { saveBrandLogo } from '../lib/socialPromo.js';
@@ -84,6 +84,20 @@ socialContentRouter.post('/social-content/auto-schedule', async (req, res) => {
   } catch (err: any) {
     console.error('[SOCIAL CONTENT AUTO SCHEDULE ERROR]:', err.message);
     return res.status(500).json({ error: 'No se pudo generar el calendario' });
+  }
+});
+
+// POST /api/social-content/generate-pending { days? } — genera en segundo plano todos los borradores de la semana.
+socialContentRouter.post('/social-content/generate-pending', async (req, res) => {
+  if (!(await requireAdminRole(req, res))) return;
+  try {
+    const n = Math.max(1, Math.min(14, parseInt(req.body?.days, 10) || 7));
+    const r = await generatePending(n);
+    if (r.alreadyRunning) return res.status(409).json({ error: 'Ya se está generando un lote; espera a que termine' });
+    return res.status(202).json(r);
+  } catch (err: any) {
+    console.error('[SOCIAL CONTENT GENERATE PENDING ERROR]:', err.message);
+    return res.status(500).json({ error: 'No se pudo empezar a generar' });
   }
 });
 

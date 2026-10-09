@@ -213,6 +213,40 @@ export async function startSlotGeneration(id: number): Promise<boolean> {
   return true;
 }
 
+let batchRunning = false;
+
+/**
+ * Genera, una detrás de otra, las publicaciones en borrador sin contenido de
+ * los próximos N días (las de marca, solo si tienen tema). Marca todas como
+ * "generando" al empezar para que el panel lo muestre. Devuelve cuántas.
+ */
+export async function generatePending(days = 7): Promise<{ queued: number; alreadyRunning: boolean }> {
+  if (batchRunning) return { queued: 0, alreadyRunning: true };
+  const { rows } = await pool.query(
+    `UPDATE social_content_calendar SET status = 'generating', error = NULL, updated_at = NOW()
+      WHERE status = 'draft' AND copy IS NULL
+        AND scheduled_at > NOW() AND scheduled_at <= NOW() + ($1 || ' days')::interval
+        AND (campaign IS NOT TRUE OR COALESCE(topic, '') <> '')
+      RETURNING id, scheduled_at`, [String(days)]);
+  const ids = rows.sort((a: any, b: any) => +new Date(a.scheduled_at) - +new Date(b.scheduled_at)).map((r: any) => r.id);
+  if (!ids.length) return { queued: 0, alreadyRunning: false };
+  batchRunning = true;
+  (async () => {
+    for (const id of ids) {
+      if (generatingNow.has(id)) continue;
+      generatingNow.add(id);
+      try {
+        await generateSlotContent(id);
+      } catch (err: any) {
+        console.error(`[SOCIAL CONTENT] lote: publicación ${id}:`, err.message);
+      } finally {
+        generatingNow.delete(id);
+      }
+    }
+  })().finally(() => { batchRunning = false; });
+  return { queued: ids.length, alreadyRunning: false };
+}
+
 /** Genera copy + imágenes para un slot y lo deja en estado "ready". Si falla, vuelve a "draft" con el error. */
 async function generateSlotContent(id: number) {
   const { rows: [slot] } = await pool.query('SELECT * FROM social_content_calendar WHERE id = $1', [id]);
