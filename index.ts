@@ -5516,7 +5516,18 @@ app.post('/api/cart/quote', async (req: any, res: any) => {
       .filter((l: any) => Number.isInteger(l.id) && l.id > 0 && Number.isInteger(l.quantity) && l.quantity >= 1 && l.quantity <= 99);
     const overrides = await proposalOverrides(chatProposal, req.user?.user_id ?? null);
     const q = await quoteOrder({ cart: lines, country, postcode, promoCode, overrides });
+    // Precio unitario que se cobra por producto (el del catálogo con su descuento,
+    // o el del asesor): el carrito lo muestra en cada línea.
+    const byProduct = new Map<number, { cents: number; qty: number }>();
+    for (const it of q.items) {
+      const acc = byProduct.get(it.productId) || { cents: 0, qty: 0 };
+      acc.cents += it.price * it.quantity;
+      acc.qty += it.quantity;
+      byProduct.set(it.productId, acc);
+    }
+    const unitPrices = Object.fromEntries([...byProduct].map(([id, a]) => [id, Math.round(a.cents / a.qty) / 100]));
     res.json({
+      unitPrices,
       subtotal: q.subtotalCents / 100,
       discountPercent: q.discountPercent,
       discount: q.discountCents / 100,
