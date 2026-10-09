@@ -16,6 +16,7 @@ import {
   pgTable, serial, text, varchar, timestamp, integer
 } from 'drizzle-orm/pg-core';
 import crypto from 'crypto';
+import { parseBrowserContext, sendTikTokPurchase, TIKTOK_EVENTS_ENABLED } from './lib/tiktok-events.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
@@ -5838,7 +5839,7 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
     }
 
     // Ownership check before touching Stripe (avoids leaking PI existence).
-    const ownerRes = await db.execute(sql`SELECT user_id, total FROM orders WHERE id = ${parsedOrderId}`);
+    const ownerRes = await db.execute(sql`SELECT user_id, total, shipping_data FROM orders WHERE id = ${parsedOrderId}`);
     if (!ownerRes.rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
     const ownerId = (ownerRes.rows[0] as any).user_id;
     const expectedCents = Number((ownerRes.rows[0] as any).total) || 0;
@@ -5914,8 +5915,49 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
       await cacheBust('cache:filters');
     }
 
+    // Productos del pedido: para el píxel de TikTok (content_id) y la Events API.
+    let items: { id: number; name: string; quantity: number; priceCents: number }[] = [];
+    if (paymentStatus === 'processing') {
+      try {
+        const r = await pool.query(
+          `SELECT oi.product_id, oi.quantity, oi.price, p.name
+             FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = $1`, [parsedOrderId]);
+        items = r.rows.map((row: any) => ({
+          id: Number(row.product_id),
+          name: String(row.name || ''),
+          quantity: Number(row.quantity) || 1,
+          priceCents: Math.round(Number(row.price) || 0),
+        }));
+      } catch { /* sin productos se registra igual el importe */ }
+
+      // Compra a TikTok desde el servidor, solo con permiso de marketing.
+      const tiktokCtx = parseBrowserContext(req.body?.tiktok);
+      if (tiktokCtx.marketing && TIKTOK_EVENTS_ENABLED) {
+        const sd = (() => {
+          const raw = (ownerRes.rows[0] as any).shipping_data;
+          try { return typeof raw === 'string' ? JSON.parse(raw || '{}') : (raw || {}); } catch { return {}; }
+        })();
+        sendTikTokPurchase({
+          orderId: parsedOrderId,
+          totalCents: expectedCents,
+          email: sd.email,
+          phone: sd.phone,
+          ip: req.clientIp || req.ip,
+          userAgent: req.headers['user-agent'],
+          items,
+        }, tiktokCtx).catch(() => {});
+      }
+    }
+
     // totalCents: para registrar la compra con su importe en las estadísticas (Umami).
-    res.json({ success: true, orderId: parsedOrderId, alreadyProcessed: !transitioned, totalCents: expectedCents });
+    res.json({
+      success: true,
+      orderId: parsedOrderId,
+      alreadyProcessed: !transitioned,
+      totalCents: expectedCents,
+      items: items.map((it) => ({ content_id: String(it.id), content_name: it.name, quantity: it.quantity, price: it.priceCents / 100 })),
+    });
   } catch (err: any) {
     console.error('[ORDER FINALIZE ERROR]:', err);
     res.status(500).json({ error: err.message });
