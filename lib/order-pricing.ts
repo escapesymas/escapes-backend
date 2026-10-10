@@ -5,6 +5,7 @@
  */
 import { pool } from '../db.js';
 import { resolveTax, toDestinationCents, taxInTotal } from './tax.js';
+import { floorPrice } from './pricing.js';
 
 /** Descuento por importe del pedido (sobre el subtotal con IVA español). */
 export const ORDER_TIERS = [
@@ -13,6 +14,16 @@ export const ORDER_TIERS = [
   { min: 150, discountPercent: 5, freeShipping: false }, // el envío gratis empieza en 200 € (shipping_methods)
 ];
 const DEFAULT_SHIPPING_CENTS = 1999;
+
+/**
+ * Tope de los descuentos extra (tramo por importe + cupón): cada producto puede
+ * bajar como mucho hasta el precio que deja este margen neto (después de IVA y
+ * comisión de pago), y del margen disponible se descuenta lo que pagamos de
+ * envío y no cobramos. Así un descuento nunca convierte el pedido en pérdidas.
+ */
+export const EXTRA_DISCOUNT_MIN_MARGIN = 5;
+/** Lo que nos cuesta de verdad un envío (Bihr cobra 25 €). */
+export const SHIPPING_REAL_COST_CENTS = 2500;
 
 export interface CartLine { id: number; quantity: number }
 /** Precio pactado por un asesor del chat para un producto (hasta `maxQty` unidades). */
@@ -30,6 +41,8 @@ export interface Quote {
   subtotalCents: number;
   discountPercent: number;
   discountCents: number;
+  /** El descuento pedido no cabía entero sin bajar del margen mínimo y se ha recortado. */
+  discountCapped: boolean;
   shippingCents: number;
   taxRate: number;
   taxLabel: string;
@@ -65,7 +78,7 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
 
   const ids = input.cart.map((l) => l.id);
   const rows = ids.length
-    ? (await pool.query('SELECT id, price, sale_price, promo_price, stock FROM products WHERE id = ANY($1)', [ids])).rows
+    ? (await pool.query('SELECT id, price, sale_price, promo_price, stock, cost FROM products WHERE id = ANY($1)', [ids])).rows
     : [];
   const byId = new Map(rows.map((r: any) => [r.id, r]));
 
@@ -73,6 +86,8 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
   // Líneas en promoción (precio DTO2, el mínimo sin pérdidas) o con descuento del
   // asesor del chat: no admiten más descuentos.
   let promoCents = 0;
+  // Cuánto se puede descontar como máximo sin bajar del margen mínimo (céntimos).
+  let roomCents = 0;
   const items: Quote['items'] = [];
   const stockErrors: Quote['stockErrors'] = [];
   const missing: number[] = [];
@@ -97,6 +112,11 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
     if (rest > 0) {
       subtotalCents += price * rest;
       if (Number(row.promo_price) > 0) promoCents += price * rest;
+      else {
+        // Sin coste conocido no hay margen que repartir: esa línea no admite descuento extra.
+        const cost = Number(row.cost) || 0;
+        if (cost > 0) roomCents += Math.max(0, price - floorPrice(cost, EXTRA_DISCOUNT_MIN_MARGIN)) * rest;
+      }
       items.push({ productId: line.id, quantity: rest, price });
     }
   }
@@ -139,7 +159,11 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
 
   discountPercent = Math.min(100, Math.max(0, discountPercent));
   const discountable = subtotalCents - promoCents;
-  const discountCents = Math.min(discountable, Math.round((discountable * discountPercent) / 100) + Math.max(0, fixedCents));
+  const wanted = Math.min(discountable, Math.round((discountable * discountPercent) / 100) + Math.max(0, fixedCents));
+  // El envío que no cobramos (o cobramos por debajo de su coste) sale del mismo margen.
+  const maxDiscount = Math.max(0, roomCents - Math.max(0, SHIPPING_REAL_COST_CENTS - shippingCents));
+  const discountCents = Math.min(wanted, maxDiscount);
+  const discountCapped = discountCents < wanted;
 
   // Impuesto del destino: los precios llevan el IVA español y se reexpresan con
   // el tipo de la regla (0 % en Canarias, Ceuta y Melilla).
@@ -155,6 +179,7 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
     subtotalCents: subtotalDest,
     discountPercent,
     discountCents: discountDest,
+    discountCapped,
     shippingCents: shippingDest,
     taxRate: tax.rate, taxLabel: tax.label, taxNote: tax.note,
     taxCents: taxInTotal(totalCents, tax.rate),

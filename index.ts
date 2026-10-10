@@ -5531,6 +5531,7 @@ app.post('/api/cart/quote', async (req: any, res: any) => {
       subtotal: q.subtotalCents / 100,
       discountPercent: q.discountPercent,
       discount: q.discountCents / 100,
+      discountCapped: q.discountCapped,
       shipping: q.shippingCents / 100,
       tax: q.taxCents / 100,
       taxRate: q.taxRate,

@@ -87,7 +87,7 @@ export function renderAbandonedCartEmail(
     ${more > 0 ? note(`Y ${more} producto${more === 1 ? '' : 's'} más en tu carrito.`) : ''}
     ${totalsTable([], { label: 'Total del carrito', value: eur(cart.cart_total_cents) })}
     ${button(recoveryUrl, coupon ? 'Usar mi descuento' : 'Recuperar mi carrito')}
-    ${coupon ? note(`El cupón se aplica solo al volver a tu carrito con este botón (o escríbelo en el checkout). Válido ${validity}, un solo uso. No se acumula sobre productos que ya están en promoción.`) : ''}
+    ${coupon ? note(`El cupón se aplica solo al volver a tu carrito con este botón (o escríbelo en el checkout). Válido ${validity}, un solo uso. No se acumula sobre productos que ya están en promoción y puede ser menor en los que ya tienen el precio muy ajustado.`) : ''}
     ${fallbackLink(recoveryUrl)}
     ${note('Si no quieres recibir más recordatorios, ignora este correo: no te enviaremos más de tres.')}
   `, coupon ? `Cupón ${coupon}: ${pct}% de descuento en tu carrito.` : 'Hemos guardado los productos de tu carrito.');
