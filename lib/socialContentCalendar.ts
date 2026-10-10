@@ -107,8 +107,9 @@ async function composeProductPost(scenes: string[], product: SlotProduct): Promi
   const name = `${product.brand} ${product.name.replace(new RegExp(`\\b${product.brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'), '')}`
     .replace(/\s*·\s*Ref\..*$/i, '').replace(/\s+/g, ' ').trim().slice(0, 110);
   try {
-    const card = await composeProductCard(product.images[0], { title: name, text: name }, {
-      brand: product.brand, price: { now: product.price, before: product.price < product.listPrice ? product.listPrice : null },
+    const onSale = product.price < product.listPrice;
+    const card = await composeProductCard(product.images[0], { title: onSale ? 'Precio de oferta' : 'Precio', text: name }, {
+      brand: product.brand, price: { now: product.price, before: onSale ? product.listPrice : null },
     });
     return { urls: [...promo.urls, card], missingBrandLogo: promo.missingBrandLogo };
   } catch (err: any) {

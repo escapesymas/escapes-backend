@@ -7,6 +7,7 @@
  * cuando haya presupuesto/cuota confirmados.
  */
 import fs from 'fs';
+import sharp from 'sharp';
 import path from 'path';
 import { pool } from '../db.js';
 import { minimaxClient, CHAT_MODEL } from '../chatbot/minimax.js';
@@ -247,7 +248,8 @@ Reglas:
 - Si mencionas el envío, usa exactamente los importes de los datos de la tienda.
 - Formas de pago: tarjeta, Bizum y Klarna; solo Klarna es a plazos (nunca digas «Bizum a plazos»).
 - La publicación lleva el enlace del producto de TikTok: la llamada a la acción es «toca el enlace del producto» o similar. Nunca «enlace en la bio».
-- Si el nombre o la descripción dicen para qué moto es, menciónalo; si no lo dicen, invita a comprobar en «Mi garaje» de escapesymas.com que le vale a su moto. No inventes compatibilidades.
+- Si hay motos compatibles en los datos, menciona las principales. Si es una pieza para modelos concretos sin datos de compatibilidad, invita a comprobar en «Mi garaje» de escapesymas.com que le vale a su moto. No inventes compatibilidades.
+- Si el producto es universal (aceite, cargadores, herramientas, fundas, compresores, equipación del motorista, baúles con su placa), no hables de compatibilidad ni de «Mi garaje».
 - Hashtags: nada de ciudades ni regiones (la tienda envía a toda España).
 - Español de España, tono motero cercano.
 
@@ -342,24 +344,72 @@ Responde SOLO con el número de la imagen.` }];
 }
 
 /** Imagen con Gemini, con la foto real del producto como referencia si la hay. */
+/**
+ * ¿La imagen vertical es en realidad una foto apaisada pegada entre franjas?
+ * Gemini lo hace a veces aunque se le pida 9:16: deja una costura horizontal
+ * recta de lado a lado en el tercio de arriba o de abajo.
+ */
+export async function hasLetterbox(input: Buffer): Promise<boolean> {
+  const W = 64;
+  const H = 200;
+  const { data } = await sharp(input).flatten({ background: '#ffffff' }).greyscale()
+    .resize({ width: W, height: H, fit: 'fill' }).raw().toBuffer({ resolveWithObject: true });
+  const diffs: number[] = [0];
+  const fullWidth: number[] = [0];
+  for (let y = 1; y < H; y++) {
+    let sum = 0;
+    let strong = 0;
+    for (let x = 0; x < W; x++) {
+      const d = Math.abs(data[y * W + x] - data[(y - 1) * W + x]);
+      sum += d;
+      if (d > 15) strong++;
+    }
+    diffs.push(sum / W);
+    fullWidth.push(strong / W);
+  }
+  const sorted = diffs.slice(1).sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  for (let y = 1; y < H; y++) {
+    const inBand = (y >= 20 && y <= 90) || (y >= 110 && y <= 180);
+    if (inBand && diffs[y] > Math.max(18, 5 * median) && fullWidth[y] >= 0.8) return true;
+  }
+  return false;
+}
+
+/** Imagen con Gemini, con la foto real del producto como referencia si la hay. Si sale con franjas, se repite una vez. */
 export async function geminiGenerateImage(prompt: string, reference: { data: string; mime: string } | null): Promise<string> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada');
-  const parts: any[] = [{ text: prompt }];
-  if (reference) parts.push({ inlineData: { mimeType: reference.mime, data: reference.data } });
-  const res = await fetch(`${GEMINI_BASE}/models/gemini-3-pro-image:generateContent?key=${GEMINI_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '9:16' } },
-    }),
-    signal: AbortSignal.timeout(90_000),
-  });
-  if (!res.ok) throw new Error(`Gemini imagen ${res.status}`);
-  const data: any = await res.json();
-  const part = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData?.data);
-  if (!part) throw new Error('Gemini no devolvió imagen');
-  return saveBufferAsFile(Buffer.from(part.inlineData.data, 'base64'), 'png');
+  let buffer: Buffer | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const text = attempt === 0 ? prompt : `${prompt}
+IMPORTANTE: una sola fotografía vertical continua de arriba abajo. Nada de una foto horizontal con franjas, bloques de color o relleno arriba y abajo.`;
+    const parts: any[] = [{ text }];
+    if (reference) parts.push({ inlineData: { mimeType: reference.mime, data: reference.data } });
+    const res = await fetch(`${GEMINI_BASE}/models/gemini-3-pro-image:generateContent?key=${GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '9:16' } },
+      }),
+      signal: AbortSignal.timeout(90_000),
+    });
+    if (!res.ok) {
+      if (buffer) break; // la repetición falló: se queda la primera
+      throw new Error(`Gemini imagen ${res.status}`);
+    }
+    const data: any = await res.json();
+    const part = data?.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData?.data);
+    if (!part) {
+      if (buffer) break;
+      throw new Error('Gemini no devolvió imagen');
+    }
+    buffer = Buffer.from(part.inlineData.data, 'base64');
+    const banded = await hasLetterbox(buffer).catch(() => false);
+    if (!banded) break;
+    console.warn(`[SOCIAL CONTENT] imagen con franjas (intento ${attempt + 1}), se repite`);
+  }
+  return saveBufferAsFile(buffer!, 'png');
 }
 
 /** Imagen solo a partir de texto con MiniMax (sin producto: escena genérica sin marcas). */
