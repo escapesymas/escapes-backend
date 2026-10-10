@@ -7,9 +7,9 @@
 import fs from 'fs';
 import path from 'path';
 import { pool } from '../db.js';
-import { generateCopy, generateImages, productBySku, pickProduct } from './socialContentAI.js';
+import { generateCopy, generateImages, productBySku, pickProduct, withBestImageFirst, SlotProduct } from './socialContentAI.js';
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
-import { composeAll, composePromo, composeSlide } from './socialPromo.js';
+import { composeAll, composePromo, composeSlide, composeProductCard } from './socialPromo.js';
 import { generateCampaignCopy, generateScene, Slide } from './socialCampaign.js';
 import { productScene } from './socialContentAI.js';
 import { buildProductSlides, composeProductCarousel, isProductCarousel } from './socialProductCarousel.js';
@@ -97,6 +97,26 @@ const missingLogoNote = (brand?: string | null) =>
   `Sin logo de ${brand || 'la marca'}: se ha puesto su nombre. Si subes el logo en «Logos de marcas», pulsa «Rehacer con logos».`;
 
 /** Marca del producto de una publicación (para su logo). */
+/**
+ * Foto o vídeo con producto: las escenas de ambiente con los logos y, al final,
+ * la ficha con la foto real entera, el nombre y el precio actual (antes se
+ * ponía la foto del catálogo recortada a 9:16 y salía cortada o pixelada).
+ */
+async function composeProductPost(scenes: string[], product: SlotProduct): Promise<{ urls: string[]; missingBrandLogo: boolean }> {
+  const promo = scenes.length ? await composeAll(scenes, product.brand) : { urls: [] as string[], missingBrandLogo: false };
+  const name = `${product.brand} ${product.name.replace(new RegExp(`\\b${product.brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'), '')}`
+    .replace(/\s*·\s*Ref\..*$/i, '').replace(/\s+/g, ' ').trim().slice(0, 110);
+  try {
+    const card = await composeProductCard(product.images[0], { title: name, text: name }, {
+      brand: product.brand, price: { now: product.price, before: product.price < product.listPrice ? product.listPrice : null },
+    });
+    return { urls: [...promo.urls, card], missingBrandLogo: promo.missingBrandLogo };
+  } catch (err: any) {
+    console.warn('[SOCIAL CONTENT] ficha de producto:', err.message);
+    return promo.urls.length ? promo : composeAll(product.images.slice(0, 1), product.brand);
+  }
+}
+
 async function slotBrand(productSku: string | null): Promise<string | null> {
   return productSku ? (await productBySku(productSku))?.brand || null : null;
 }
@@ -119,10 +139,14 @@ export async function recomposeSlot(id: number): Promise<{ missingBrandLogo: boo
     if (media.length) await pool.query(`UPDATE social_content_calendar SET media_urls = $2::jsonb, updated_at = NOW() WHERE id = $1`, [id, JSON.stringify(media)]);
     return { missingBrandLogo: false };
   }
-  const brand = await slotBrand(slot.product_sku);
+  const product = slot.product_sku ? await productBySku(slot.product_sku) : null;
+  const brand = product?.brand || null;
   // Publicaciones de antes de las promos: sus imágenes actuales son las base.
   const base: string[] = slot.base_media?.length ? slot.base_media : slot.media_urls || [];
-  const promo = await composeAll(base, brand);
+  // Formato con ficha de producto: la base son solo escenas (sin fotos del catálogo).
+  // (Las muy antiguas no tienen base: sus imágenes ya llevan los logos, en /promo/.)
+  const withCard = !!product?.images.length && !base.some((u) => product.images.includes(u) || u.includes('/social-content/promo/'));
+  const promo = withCard ? await composeProductPost(base, await withBestImageFirst(product!)) : await composeAll(base, brand);
   const finals = [];
   let missing = promo.missingBrandLogo;
   const oldFiles: string[] = [];
@@ -257,6 +281,7 @@ async function generateSlotContent(id: number) {
     let product = slot.product_sku ? await productBySku(slot.product_sku) : null;
     if (slot.product_sku && !product) throw new Error(`El producto ${slot.product_sku} no existe o no está publicado`);
     if (!product) product = await pickProduct();
+    if (product) product = await withBestImageFirst(product);
 
     const copy = await generateCopy({ format: slot.format, topic: slot.topic, product });
 
@@ -282,9 +307,12 @@ async function generateSlotContent(id: number) {
       return;
     }
 
-    const { urls, notes } = await generateImages({ format: slot.format, topic: slot.topic, script: copy.script, product });
+    const generated = await generateImages({ format: slot.format, topic: slot.topic, script: copy.script, product });
+    const notes = generated.notes;
+    // Con producto: solo las escenas generadas como base; la foto real va en la ficha final.
+    const urls = product?.images.length ? generated.urls.filter((u) => !product!.images.includes(u)) : generated.urls;
     // Imágenes promocionales: logo de escapesymas.com y de la marca encima de cada una.
-    const promo = await composeAll(urls, product?.brand);
+    const promo = product?.images.length ? await composeProductPost(urls, product) : await composeAll(urls, product?.brand);
     if (promo.missingBrandLogo) notes.push(missingLogoNote(product?.brand));
     await pool.query(
       `UPDATE social_content_calendar

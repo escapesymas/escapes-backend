@@ -21,6 +21,8 @@ fs.mkdirSync(uploadDir, { recursive: true });
 
 /** Precio mínimo (céntimos) de un producto elegido automáticamente: nada de tornillería suelta. */
 export const AUTO_MIN_PRICE = 3000;
+/** Stock mínimo para sortear un producto: con 1-2 unidades el enlace de TikTok se queda sin producto enseguida. */
+export const AUTO_MIN_STOCK = 5;
 
 export const NICHE_CONTEXT = `Escapes y Más (escapesymas.com) vende recambios, accesorios y equipamiento de
 moto de más de 200 marcas: escapes, cascos, ropa técnica, transmisión, frenos,
@@ -39,6 +41,8 @@ export interface SlotProduct {
   inStock: boolean;
   description: string;
   images: string[];
+  /** Motos compatibles resumidas (marca modelo años), del catálogo de Bihr. */
+  compatibility: string;
 }
 
 export interface GeneratedCopy {
@@ -53,6 +57,29 @@ export interface GeneratedCopy {
 
 const euros = (cents: number) => (cents / 100).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+/** «Yamaha MT-07 (2014-2024), Yamaha XSR700 (2016-2023) y 12 modelos más» a partir de la compatibilidad del catálogo. */
+export function compatibilitySummary(raw: unknown, max = 6): string {
+  let list: any[] = [];
+  try { list = Array.isArray(raw) ? raw : JSON.parse(String(raw || '[]')); } catch { return ''; }
+  if (!Array.isArray(list) || !list.length) return '';
+  const byModel = new Map<string, { label: string; min: number; max: number; n: number }>();
+  for (const c of list) {
+    const brand = String(c?.brand || '').trim();
+    const model = String(c?.model || '').trim();
+    if (!brand || !model) continue;
+    const label = `${brand.charAt(0)}${brand.slice(1).toLowerCase()} ${model}`;
+    const year = Number(c?.year) || 0;
+    const e = byModel.get(label) || { label, min: year || 9999, max: year, n: 0 };
+    if (year) { e.min = Math.min(e.min, year); e.max = Math.max(e.max, year); }
+    e.n++;
+    byModel.set(label, e);
+  }
+  const models = [...byModel.values()].sort((a, b) => b.n - a.n);
+  const shown = models.slice(0, max).map((m) => (m.max ? `${m.label} (${m.min === m.max ? m.max : `${m.min}-${m.max}`})` : m.label));
+  const rest = models.length - shown.length;
+  return shown.join(', ') + (rest > 0 ? ` y ${rest} ${rest === 1 ? 'modelo' : 'modelos'} más` : '');
+}
+
 function rowToProduct(p: any): SlotProduct {
   const list = Number(p.price);
   const price = Number(p.promo_price) > 0 ? Number(p.promo_price)
@@ -65,13 +92,14 @@ function rowToProduct(p: any): SlotProduct {
   return {
     id: p.id, sku: p.sku, name: p.name, brand: p.brand || '', price, listPrice: list,
     inStock: Number(p.stock) > 0, description, images,
+    compatibility: compatibilitySummary(p.compatibility),
   };
 }
 
 /** Producto publicado por SKU (con sus fotos). */
 export async function productBySku(sku: string): Promise<SlotProduct | null> {
   const { rows: [p] } = await pool.query(
-    `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, description, images
+    `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, description, images, compatibility
      FROM products WHERE upper(sku) = upper($1) AND status = 'published' AND price > 0
      ORDER BY (duplicate_of IS NULL) DESC LIMIT 1`, [sku]);
   return p ? rowToProduct(p) : null;
@@ -79,7 +107,7 @@ export async function productBySku(sku: string): Promise<SlotProduct | null> {
 
 /**
  * Elige un producto para un hueco sin producto, de cualquier marca, con stock,
- * fotos y precio de al menos 30 €. Para que no se repitan:
+ * fotos, precio de al menos 30 € y al menos AUTO_MIN_STOCK unidades. Para que no se repitan:
  * - primero se sortea la MARCA (todas con la misma probabilidad; si no, las
  *   marcas con miles de referencias salen siempre) y se evitan las marcas de
  *   las últimas 10 publicaciones;
@@ -96,16 +124,16 @@ export async function pickProduct(): Promise<SlotProduct | null> {
      recent_brands AS (
        SELECT brand FROM (SELECT brand FROM used ORDER BY scheduled_at DESC LIMIT 10) r),
      eligible AS (
-       SELECT p.id, p.sku, p.name, p.brand, p.price, p.sale_price, p.promo_price, p.stock, p.description, p.images
+       SELECT p.id, p.sku, p.name, p.brand, p.price, p.sale_price, p.promo_price, p.stock, p.description, p.images, p.compatibility
        FROM products p
-       WHERE p.status = 'published' AND p.price >= $1 AND p.stock > 0 AND p.duplicate_of IS NULL
+       WHERE p.status = 'published' AND p.price >= $1 AND p.stock >= $3 AND p.duplicate_of IS NULL
          AND COALESCE(p.brand, '') <> '' AND jsonb_array_length(COALESCE(p.images, '[]'::jsonb)) > 0
          AND ($2 = false OR upper(p.brand) NOT IN (SELECT brand FROM recent_brands))
          AND NOT EXISTS (SELECT 1 FROM used u WHERE u.created_at > NOW() - INTERVAL '120 days'
                          AND (upper(u.sku) = upper(p.sku) OR (p.family_code IS NOT NULL AND u.family_code = p.family_code)))),
      brand AS (SELECT upper(brand) AS b FROM eligible GROUP BY 1 ORDER BY random() LIMIT 1)
      SELECT * FROM eligible WHERE upper(brand) = (SELECT b FROM brand) ORDER BY random() LIMIT 1`,
-    [AUTO_MIN_PRICE, avoidRecentBrands]);
+    [AUTO_MIN_PRICE, avoidRecentBrands, AUTO_MIN_STOCK]);
   let { rows: [p] } = await query(true);
   if (!p) ({ rows: [p] } = await query(false));
   return p ? rowToProduct(p) : null;
@@ -202,7 +230,8 @@ export async function generateCopy(opts: { format: string; topic?: string | null
 - Precio: ${euros(p.price)} €${p.price < p.listPrice ? ` (antes ${euros(p.listPrice)} €)` : ''}
 - ${p.inStock ? 'Disponible' : 'Ahora mismo sin stock'}
 - Enlace: escapesymas.com/producto/${encodeURIComponent(p.sku)}
-- Descripción: ${p.description || '(sin descripción)'}`
+- Descripción: ${p.description || '(sin descripción)'}
+- Motos compatibles (según el catálogo): ${p.compatibility || '(sin datos: no menciones ninguna moto)'}`
     : 'Sin producto concreto: habla de la categoría sin nombrar modelos concretos ni inventar datos.';
 
   const prompt = `${NICHE_CONTEXT}
@@ -216,6 +245,10 @@ Genera contenido para un TikTok de formato "${opts.format}"${opts.topic ? ` con 
 Reglas:
 - Usa solo datos reales de arriba. No prometas plazos de entrega, stock limitado, "últimas unidades" ni descuentos que no aparezcan.
 - Si mencionas el envío, usa exactamente los importes de los datos de la tienda.
+- Formas de pago: tarjeta, Bizum y Klarna; solo Klarna es a plazos (nunca digas «Bizum a plazos»).
+- La publicación lleva el enlace del producto de TikTok: la llamada a la acción es «toca el enlace del producto» o similar. Nunca «enlace en la bio».
+- Si el nombre o la descripción dicen para qué moto es, menciónalo; si no lo dicen, invita a comprobar en «Mi garaje» de escapesymas.com que le vale a su moto. No inventes compatibilidades.
+- Hashtags: nada de ciudades ni regiones (la tienda envía a toda España).
 - Español de España, tono motero cercano.
 
 Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
@@ -265,6 +298,47 @@ async function loadImage(src: string): Promise<{ data: string; mime: string } | 
     }
   } catch { /* sin referencia */ }
   return null;
+}
+
+/**
+ * Pone primero la mejor foto del catálogo: a veces la primera es un dibujo
+ * técnico con medidas, la bolsa de transporte o un detalle de la tela, y la
+ * escena de ambiente y la ficha salían con eso. Gemini (visión) elige la foto
+ * real del producto completo; si falla, se deja el orden del catálogo.
+ */
+export async function withBestImageFirst(p: SlotProduct): Promise<SlotProduct> {
+  if (!GEMINI_API_KEY || p.images.length < 2) return p;
+  const candidates = p.images.slice(0, 4);
+  try {
+    const loaded = await Promise.all(candidates.map((src) => loadImage(src)));
+    const parts: any[] = [{ text: `Estas imágenes son las fotos del catálogo del producto «${p.brand} ${p.name}». Elige la MEJOR para un anuncio y como referencia para generar una foto de ambiente:
+- una FOTO REAL del producto completo y reconocible;
+- descarta dibujos técnicos o esquemas con medidas, embalajes, bolsas o fundas de transporte, etiquetas, detalles parciales (tela, costuras, un trozo) y fotos de otro color o de un accesorio.
+Responde SOLO con el número de la imagen.` }];
+    const index: number[] = [];
+    loaded.forEach((img, i) => {
+      if (!img) return;
+      index.push(i);
+      parts.push({ text: `Imagen ${index.length}:` }, { inlineData: { mimeType: img.mime, data: img.data } });
+    });
+    if (index.length < 2) return p;
+    const res = await fetch(`${GEMINI_BASE}/models/gemini-flash-latest:generateContent?key=${GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts }], generationConfig: { temperature: 0 } }),
+      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+    });
+    if (!res.ok) return p;
+    const data: any = await res.json();
+    const n = parseInt(String(data?.candidates?.[0]?.content?.parts?.map((x: any) => x.text).join('') || '').match(/\d+/)?.[0] || '', 10);
+    const chosen = index[n - 1];
+    if (chosen == null || chosen === 0) return p;
+    const images = [p.images[chosen], ...p.images.filter((_, i) => i !== chosen)];
+    return { ...p, images };
+  } catch (err: any) {
+    console.warn('[SOCIAL CONTENT] elegir foto:', err.message);
+    return p;
+  }
 }
 
 /** Imagen con Gemini, con la foto real del producto como referencia si la hay. */
