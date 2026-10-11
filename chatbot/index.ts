@@ -1,3 +1,4 @@
+import { logAiTurn, validSessionKey } from '../lib/ai-chat-log.js';
 import type { Request, Response } from 'express';
 import { verifyJWT } from '../utils.js';
 import { minimaxClient, CHAT_MODEL, CHAT_LIMITS } from './minimax.js';
@@ -183,9 +184,12 @@ export async function chatHandler(req: Request, res: Response) {
     return res.status(400).json({ error: 'Se requiere al menos un mensaje del usuario.' });
   }
   const cleanInput = lastUserMsg.content;
+  // Conversación (la genera el navegador) para guardar cada turno.
+  const sessionKey = validSessionKey((req.body as any)?.sessionId);
 
   if (containsPromptInjection(cleanInput)) {
     logRequest(user, cleanInput, 'rejected', 'injection');
+    logAiTurn(sessionKey, user.user_id, { question: cleanInput, answer: '¿En qué producto o pedido de Escapes y Más puedo ayudarte?', outcome: 'guardrail' });
     return res.json({
       reply: '¿En qué producto o pedido de Escapes y Más puedo ayudarte?',
       finishReason: 'guardrail',
@@ -205,6 +209,7 @@ export async function chatHandler(req: Request, res: Response) {
 
   if (isOutOfScope(cleanInput)) {
     logRequest(user, cleanInput, 'ok', 'out_of_scope');
+    logAiTurn(sessionKey, user.user_id, { question: cleanInput, answer: 'Lo siento, solo puedo ayudarte con temas de Escapes y Más (catálogo, pedidos o soporte web).', outcome: 'out_of_scope' });
     startStream();
     send({ delta: 'Lo siento, solo puedo ayudarte con temas de Escapes y Más (catálogo, pedidos o soporte web). ¿En qué producto o pedido te echo una mano?' });
     send({ done: true });
@@ -320,7 +325,8 @@ export async function chatHandler(req: Request, res: Response) {
       if (rest.trim()) { send({ delta: rest }); sentText += rest; }
     }
     if (!sentText.trim()) {
-      send({ delta: 'Perdona, no he podido preparar la respuesta. ¿Me lo repites con otras palabras?' });
+      sentText = 'Perdona, no he podido preparar la respuesta. ¿Me lo repites con otras palabras?';
+      send({ delta: sentText });
     } else if (finishReason === 'length') {
       send({ delta: '…' });
     }
@@ -331,10 +337,14 @@ export async function chatHandler(req: Request, res: Response) {
 
     send({ done: true });
     res.end();
+    logAiTurn(sessionKey, user.user_id, {
+      question: cleanInput, answer: sentText, products: cards.map((c) => c.sku).filter(Boolean), offeredHuman: offerHuman,
+    });
     logRequest(user, cleanInput, 'ok', `${offerHuman && support?.available ? 'asesor ' : ''}chars=${sentText.length} hits=${catalog.hits.length}${finishReason === 'length' ? ' cortada' : ''}`);
   } catch (err: any) {
     console.error('[chatbot] minimax error:', err.message || err);
     logRequest(user, cleanInput, 'error', err.message?.slice(0, 80));
+    logAiTurn(sessionKey, user.user_id, { question: cleanInput, answer: '(el asistente no respondió)', outcome: 'error' });
     if (!res.headersSent) {
       return res.status(502).json({ error: 'El asistente IA no responde ahora mismo. Inténtalo en unos minutos.' });
     }

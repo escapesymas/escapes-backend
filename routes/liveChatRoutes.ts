@@ -19,6 +19,7 @@ import { quoteOrder, type PriceOverride } from '../lib/order-pricing.js';
 import { productEconomics, maxDiscountPct, discountedCents, commissionCents, netMarginCents, agentCommissionShare, forgetCommissionShare, COMMISSION_HOLD_DAYS, COMMISSION_SHARE } from '../lib/chat-commission.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
 import { AGENT_LEGAL_VERSION } from '../lib/agent-legal.js';
+import { linkAiHandoff, validSessionKey } from '../lib/ai-chat-log.js';
 import { searchTerms } from '../lib/catalog-query.js';
 import { notifyLiveChat, notifyAgent, sendPushToUser, saveSubscription } from '../pushService.js';
 import { requireAgent, requireAdminRole, type AgentAuth } from '../lib/agent-auth.js';
@@ -153,6 +154,7 @@ liveChatRouter.post('/chat/handoff', async (req: any, res: any) => {
 
     const { rows: [conv] } = await pool.query(
       `INSERT INTO chat_conversations (user_id, offline) VALUES ($1, $2) RETURNING id, status`, [auth.user_id, offline]);
+    linkAiHandoff(validSessionKey(req.body?.aiSessionId), auth.user_id, conv.id);
     // La conversación previa con el asistente, para que el asesor tenga el contexto.
     const transcript: any[] = Array.isArray(req.body?.messages) ? req.body.messages.slice(-20) : [];
     for (const m of transcript) {
@@ -1197,6 +1199,51 @@ liveChatRouter.get('/admin/advisors/announcements', async (req: any, res: any) =
   } catch (err: any) {
     console.error('[LIVE CHAT] announcements:', err.message);
     res.status(500).json({ error: 'No se pudieron cargar los avisos enviados' });
+  }
+});
+
+// GET /api/admin/ai-chats?before=&q= — conversaciones con el asistente IA (solo administradores).
+liveChatRouter.get('/admin/ai-chats', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const before = parseId(req.query.before);
+  const q = clean(req.query.q, 80).toLowerCase();
+  try {
+    const params: any[] = [];
+    const where: string[] = [];
+    if (before) { params.push(before); where.push(`s.id < $${params.length}`); }
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(`(lower(u.email) LIKE $${params.length} OR lower(concat_ws(' ', u.first_name, u.last_name)) LIKE $${params.length} OR lower(s.messages::text) LIKE $${params.length})`);
+    }
+    const { rows } = await pool.query(
+      `SELECT s.id, s.user_id, s.turns, s.handoff_conversation_id, s.created_at, s.updated_at,
+              s.messages->0->>'content' AS first_question,
+              NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS customer_name, u.email AS customer_email
+       FROM ai_chat_sessions s LEFT JOIN users u ON u.id = s.user_id
+       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+       ORDER BY s.id DESC LIMIT 40`, params);
+    res.json({ sessions: rows });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] ai chats:', err.message);
+    res.status(500).json({ error: 'No se pudieron cargar las conversaciones con la IA' });
+  }
+});
+
+// GET /api/admin/ai-chats/:id — una conversación con el asistente IA.
+liveChatRouter.get('/admin/ai-chats/:id', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const id = parseId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'ID inválido' });
+  try {
+    const { rows: [s] } = await pool.query(
+      `SELECT s.id, s.user_id, s.messages, s.turns, s.handoff_conversation_id, s.created_at, s.updated_at,
+              NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS customer_name, u.email AS customer_email
+       FROM ai_chat_sessions s LEFT JOIN users u ON u.id = s.user_id WHERE s.id = $1`, [id]);
+    if (!s) return res.status(404).json({ error: 'Conversación no encontrada' });
+    res.json({ session: s });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] ai chat:', err.message);
+    res.status(500).json({ error: 'No se pudo cargar la conversación' });
   }
 });
 

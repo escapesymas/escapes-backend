@@ -6103,6 +6103,7 @@ async function sendDailySummary(force = false) {
     pendingRefunds: pending.n || 0, abandoned: abandoned.n || 0, newUsers: users.n || 0,
   });
   await pruneNotifications().catch(() => {});
+  await (await import('./lib/ai-chat-log.js')).pruneAiChats();
 }
 
 setInterval(() => {
