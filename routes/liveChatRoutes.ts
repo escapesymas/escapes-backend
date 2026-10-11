@@ -18,6 +18,7 @@ import {
 import { quoteOrder, type PriceOverride } from '../lib/order-pricing.js';
 import { productEconomics, maxDiscountPct, discountedCents, commissionCents, netMarginCents, agentCommissionShare, forgetCommissionShare, COMMISSION_HOLD_DAYS, COMMISSION_SHARE } from '../lib/chat-commission.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
+import { AGENT_LEGAL_VERSION } from '../lib/agent-legal.js';
 import { searchTerms } from '../lib/catalog-query.js';
 import { notifyLiveChat, notifyAgent, sendPushToUser, saveSubscription } from '../pushService.js';
 import { requireAgent, requireAdminRole, type AgentAuth } from '../lib/agent-auth.js';
@@ -1012,7 +1013,9 @@ liveChatRouter.get('/admin/advisors/overview', async (req: any, res: any) => {
     const [{ rows: people }, { rows: convs }, { rows: orders }, { rows: commissionRows }, { rows: payouts }] = await Promise.all([
       pool.query(
         `SELECT u.id, u.email, u.role, COALESCE(a.online, FALSE) AS online, COALESCE(a.paused, FALSE) AS paused,
-                COALESCE(a.commission_share, 50)::float AS commission_share
+                COALESCE(a.commission_share, 50)::float AS commission_share,
+                (SELECT row_to_json(l) FROM (SELECT version, accepted_at, emailed_at FROM agent_legal_acceptances
+                   WHERE user_id = u.id ORDER BY accepted_at DESC LIMIT 1) l) AS legal
          FROM users u LEFT JOIN chat_agents a ON a.user_id = u.id WHERE u.role IN ('asesor', 'admin')`),
       pool.query(
         `SELECT agent_user_id, count(*)::int AS attended,
@@ -1083,6 +1086,7 @@ liveChatRouter.get('/admin/advisors/overview', async (req: any, res: any) => {
       agents.push({
         id: p.id, name: await agentNameFor(p.id), email: p.email, role: p.role,
         online: p.online, paused: p.paused, commission_share: p.commission_share,
+        legal: p.legal ? { ...p.legal, current: p.legal.version === AGENT_LEGAL_VERSION } : null,
         ...s,
         conversion: s.attended ? s.paid / s.attended : null,
         avg_ticket: s.paid ? Math.round(s.revenue / s.paid) : null,

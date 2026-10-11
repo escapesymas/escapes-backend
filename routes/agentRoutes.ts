@@ -8,7 +8,8 @@ import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { pool } from '../db.js';
 import { generateJWT, hashPasswordSHA256 } from '../utils.js';
-import { requireAdminRole, forgetRole } from '../lib/agent-auth.js';
+import { requireAdminRole, requireAgent, forgetRole } from '../lib/agent-auth.js';
+import { agentLegalDocument, lastAcceptance, emailAgentLegal, AGENT_LEGAL_VERSION } from '../lib/agent-legal.js';
 import { agentNameFor, setAgentOnline, addMessage } from '../lib/live-chat.js';
 import { sendTemplatedEmail } from '../lib/email.js';
 
@@ -85,6 +86,7 @@ agentRouter.post('/admin/agents/invite', async (req: any, res: any) => {
       body: `Hola${name ? ` ${name}` : ''},\n\n${inviter} te ha invitado a atender el chat de escapesymas.com como asesor.\n\n` +
         `Desde el panel de asesores podrás responder a los clientes, enviarles productos, preparar pedidos con descuento y ver tus comisiones.\n\n` +
         (existing ? 'Ya tienes cuenta en la tienda: entra con tu email y contraseña para aceptar.\n\n' : 'Crea tu contraseña desde el enlace para empezar.\n\n') +
+        `Al entrar por primera vez te pediremos leer y aceptar la información sobre protección de datos y el compromiso de confidencialidad sobre los datos de los clientes; te enviaremos una copia por email.\n\n` +
         `El enlace caduca en ${INVITE_DAYS} días.`,
       // Enlace como ruta (no ?parámetro): algunas apps de correo pierden los parámetros.
       cta: { label: existing ? 'Aceptar la invitación' : 'Crear mi acceso', url: `${ASESORES_URL}/invitacion/${token}` },
@@ -192,5 +194,67 @@ agentRouter.post('/agent-invitations/:token/accept', async (req: any, res: any) 
     res.status(500).json({ error: 'No se pudo completar el alta' });
   } finally {
     client.release();
+  }
+});
+
+// ── Protección de datos y confidencialidad del asesor ────────────────────
+
+// GET /api/agent/legal — documento vigente y si el asesor ya lo ha aceptado.
+agentRouter.get('/agent/legal', async (req: any, res: any) => {
+  const auth = await requireAgent(req, res);
+  if (!auth) return;
+  try {
+    const doc = agentLegalDocument();
+    const last = await lastAcceptance(auth.user_id);
+    // Los administradores son el propio responsable: no se les pide.
+    res.json({
+      required: !auth.isAdmin && last?.version !== AGENT_LEGAL_VERSION,
+      version: doc.version, title: doc.title, sections: doc.sections, accepted: last,
+    });
+  } catch (err: any) {
+    console.error('[AGENTS] legal:', err.message);
+    res.status(500).json({ error: 'No se pudo cargar el documento' });
+  }
+});
+
+// POST /api/agent/legal/accept — registra la aceptación (versión, huella, IP, navegador) y envía la copia.
+agentRouter.post('/agent/legal/accept', async (req: any, res: any) => {
+  const auth = await requireAgent(req, res);
+  if (!auth) return;
+  try {
+    const doc = agentLegalDocument();
+    const last = await lastAcceptance(auth.user_id);
+    if (last?.version === doc.version) return res.json({ ok: true, accepted: last });
+    const ip = String(req.ip || '').replace(/^::ffff:/, '').slice(0, 60) || null;
+    const { rows: [acc] } = await pool.query(
+      `INSERT INTO agent_legal_acceptances (user_id, version, doc_hash, ip, user_agent) VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, version, accepted_at, ip`,
+      [auth.user_id, doc.version, doc.hash, ip, clean(req.headers['user-agent'], 300) || null]);
+    const { rows: [u] } = await pool.query(`SELECT email FROM users WHERE id = $1`, [auth.user_id]);
+    const emailed = u?.email ? await emailAgentLegal({ id: auth.user_id, email: u.email, name: await agentNameFor(auth.user_id) }, acc).catch(() => false) : false;
+    if (emailed) await pool.query(`UPDATE agent_legal_acceptances SET emailed_at = NOW() WHERE id = $1`, [acc.id]);
+    res.json({ ok: true, accepted: { version: acc.version, accepted_at: acc.accepted_at }, emailed });
+  } catch (err: any) {
+    console.error('[AGENTS] legal accept:', err.message);
+    res.status(500).json({ error: 'No se pudo registrar la aceptación' });
+  }
+});
+
+// POST /api/admin/advisors/:id/legal/send — reenvía al asesor la copia del documento (con su aceptación, si la hay).
+agentRouter.post('/admin/advisors/:id/legal/send', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const { rows: [u] } = await pool.query(`SELECT id, email FROM users WHERE id = $1 AND role = 'asesor'`, [id]);
+    if (!u) return res.status(404).json({ error: 'Asesor no encontrado' });
+    const { rows: [acc] } = await pool.query(
+      `SELECT id, version, accepted_at, ip FROM agent_legal_acceptances WHERE user_id = $1 ORDER BY accepted_at DESC LIMIT 1`, [id]);
+    const emailed = await emailAgentLegal({ id, email: u.email, name: await agentNameFor(id) }, acc || null);
+    if (!emailed) return res.status(502).json({ error: 'No se pudo enviar el email' });
+    if (acc) await pool.query(`UPDATE agent_legal_acceptances SET emailed_at = NOW() WHERE id = $1`, [acc.id]);
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('[AGENTS] legal send:', err.message);
+    res.status(500).json({ error: 'No se pudo enviar el documento' });
   }
 });
