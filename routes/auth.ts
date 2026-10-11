@@ -477,7 +477,11 @@ authRouter.post('/auth', async (req, res) => {
 
         // 2. Si no hay items en user.cart o es invitado, consultar la tabla carts
         if ((!cartItems || cartItems.length === 0) && sessionToken) {
-          const cartRes = await db.execute(sql`SELECT items, user_email, user_first_name, user_last_name FROM carts WHERE session_token = ${sessionToken} AND is_deleted = 0`);
+          // La tabla carts no guarda el nombre ni el email: se sacan del usuario, si lo hay.
+          const cartRes = await db.execute(sql`
+            SELECT c.items, u.email AS user_email, u.first_name AS user_first_name, u.last_name AS user_last_name
+            FROM carts c LEFT JOIN users u ON u.id = c.user_id
+            WHERE c.session_token = ${sessionToken} AND c.is_deleted = 0`);
           if (cartRes.rows.length > 0) {
             const row = cartRes.rows[0] as any;
             if (row.items) {
