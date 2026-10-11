@@ -924,6 +924,7 @@ liveChatRouter.get('/admin/my-commissions', async (req: any, res: any) => {
     res.json({
       agent: { id: agentId, name: await agentNameFor(agentId) },
       holdDays: COMMISSION_HOLD_DAYS,
+      sharePct: Math.round((await agentCommissionShare(agentId)) * 10000) / 100,
       totals: commissionTotals(list),
       commissions: list,
       payouts,
