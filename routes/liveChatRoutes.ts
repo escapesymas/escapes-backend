@@ -1153,7 +1153,8 @@ liveChatRouter.put('/admin/advisors/:id/share', async (req: any, res: any) => {
 
 // POST /api/admin/advisors/notify { title, body, userIds? } — aviso del administrador a los asesores.
 liveChatRouter.post('/admin/advisors/notify', async (req: any, res: any) => {
-  if (!(await requireAdminRole(req, res))) return;
+  const auth = await requireAdminRole(req, res);
+  if (!auth) return;
   const title = clean(req.body?.title, 120);
   const body = clean(req.body?.body, 1000);
   if (!title) return res.status(400).json({ error: 'Escribe un título' });
@@ -1162,11 +1163,36 @@ liveChatRouter.post('/admin/advisors/notify', async (req: any, res: any) => {
     const { rows } = ids.length
       ? await pool.query(`SELECT id FROM users WHERE role = 'asesor' AND id = ANY($1::int[])`, [ids])
       : await pool.query(`SELECT id FROM users WHERE role = 'asesor'`);
-    await Promise.all(rows.map((r: any) => notifyAgent(r.id, { category: 'announcement', title: `📢 ${title}`, body, url: '/?tab=chat' })));
-    res.json({ sent: rows.length });
+    if (!rows.length) return res.status(400).json({ error: 'No hay asesores a los que enviarlo' });
+    const { rows: [ann] } = await pool.query(
+      `INSERT INTO agent_announcements (title, body, created_by) VALUES ($1, $2, $3) RETURNING id`, [title, body || null, auth.user_id]);
+    await Promise.all(rows.map((r: any) => notifyAgent(r.id, {
+      category: 'announcement', title: `📢 ${title}`, body, url: '/?tab=chat', announcementId: ann.id,
+    })));
+    res.json({ sent: rows.length, id: ann.id });
   } catch (err: any) {
     console.error('[LIVE CHAT] advisors notify:', err.message);
     res.status(500).json({ error: 'No se pudo enviar el aviso' });
+  }
+});
+
+// GET /api/admin/advisors/announcements — avisos enviados a los asesores y quién los ha leído.
+liveChatRouter.get('/admin/advisors/announcements', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT a.id, a.title, a.body, a.created_at,
+              COALESCE(json_agg(json_build_object('user_id', n.user_id, 'read_at', n.read_at) ORDER BY n.user_id)
+                FILTER (WHERE n.id IS NOT NULL), '[]') AS recipients
+       FROM agent_announcements a LEFT JOIN agent_notifications n ON n.announcement_id = a.id
+       GROUP BY a.id ORDER BY a.created_at DESC LIMIT 50`);
+    for (const a of rows) {
+      for (const r of a.recipients) r.name = await agentNameFor(r.user_id);
+    }
+    res.json({ announcements: rows });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] announcements:', err.message);
+    res.status(500).json({ error: 'No se pudieron cargar los avisos enviados' });
   }
 });
 

@@ -220,7 +220,7 @@ export async function sendPushToUser(userId: number, payload: { title: string; b
 
 // ── Avisos de los asesores ───────────────────────────────────────────────
 
-export interface AgentNotice { category: string; title: string; body?: string; url?: string; tag?: string }
+export interface AgentNotice { category: string; title: string; body?: string; url?: string; tag?: string; announcementId?: number }
 
 /**
  * Aviso para un asesor: se guarda en su historial del panel (agent_notifications)
@@ -237,8 +237,8 @@ export async function notifyAgent(userId: number, notice: AgentNotice, opts: { p
       : { rowCount: 0 };
     if (!updated.rowCount) {
       await pool.query(
-        `INSERT INTO agent_notifications (user_id, category, title, body, url, tag) VALUES ($1, $2, $3, $4, $5, $6)`,
-        [userId, notice.category, notice.title, notice.body || null, notice.url || null, notice.tag || null]);
+        `INSERT INTO agent_notifications (user_id, category, title, body, url, tag, announcement_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [userId, notice.category, notice.title, notice.body || null, notice.url || null, notice.tag || null, notice.announcementId || null]);
     }
   } catch (err: any) {
     console.error('[AGENT NOTICE ERROR]:', err.message);
