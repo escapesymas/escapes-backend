@@ -218,6 +218,58 @@ export async function sendPushToUser(userId: number, payload: { title: string; b
   }
 }
 
+// ── Avisos de los asesores ───────────────────────────────────────────────
+
+export interface AgentNotice { category: string; title: string; body?: string; url?: string; tag?: string }
+
+/**
+ * Aviso para un asesor: se guarda en su historial del panel (agent_notifications)
+ * y se envía a su móvil. Con `tag`, un aviso sin leer de lo mismo (p. ej. la
+ * misma conversación) se actualiza en vez de repetirse. Nunca lanza.
+ */
+export async function notifyAgent(userId: number, notice: AgentNotice, opts: { push?: boolean } = {}) {
+  try {
+    const updated = notice.tag
+      ? await pool.query(
+        `UPDATE agent_notifications SET title = $3, body = $4, url = $5, category = $6, created_at = NOW()
+         WHERE id = (SELECT id FROM agent_notifications WHERE user_id = $1 AND tag = $2 AND read_at IS NULL ORDER BY id DESC LIMIT 1)
+         RETURNING id`, [userId, notice.tag, notice.title, notice.body || null, notice.url || null, notice.category])
+      : { rowCount: 0 };
+    if (!updated.rowCount) {
+      await pool.query(
+        `INSERT INTO agent_notifications (user_id, category, title, body, url, tag) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [userId, notice.category, notice.title, notice.body || null, notice.url || null, notice.tag || null]);
+    }
+  } catch (err: any) {
+    console.error('[AGENT NOTICE ERROR]:', err.message);
+  }
+  if (opts.push !== false) {
+    await sendPushToUser(userId, { title: notice.title, body: notice.body || '', url: notice.url || '/?tab=chat', tag: notice.tag });
+  }
+}
+
+export async function listAgentNotifications(userId: number, opts: { limit?: number; before?: number } = {}) {
+  const limit = Math.min(Math.max(opts.limit || 30, 1), 100);
+  const params: any[] = [userId];
+  let where = 'user_id = $1';
+  if (opts.before) { params.push(opts.before); where += ` AND id < $${params.length}`; }
+  params.push(limit);
+  const [{ rows: items }, { rows: [u] }] = await Promise.all([
+    pool.query(`SELECT id, category, title, body, url, created_at, read_at FROM agent_notifications
+                WHERE ${where} ORDER BY id DESC LIMIT $${params.length}`, params),
+    pool.query(`SELECT count(*)::int AS n FROM agent_notifications WHERE user_id = $1 AND read_at IS NULL`, [userId]),
+  ]);
+  return { items, unread: u?.n || 0 };
+}
+
+export async function markAgentNotificationsRead(userId: number, ids: number[] | 'all') {
+  if (ids === 'all') {
+    await pool.query(`UPDATE agent_notifications SET read_at = NOW() WHERE user_id = $1 AND read_at IS NULL`, [userId]);
+  } else if (ids.length) {
+    await pool.query(`UPDATE agent_notifications SET read_at = NOW() WHERE user_id = $1 AND id = ANY($2) AND read_at IS NULL`, [userId, ids]);
+  }
+}
+
 // ── Historial ────────────────────────────────────────────────────────────
 
 export async function unreadCount(): Promise<number> {
@@ -250,6 +302,7 @@ export async function markNotificationsRead(ids: number[] | 'all') {
 /** Borra avisos de más de 90 días (lo llama el resumen diario). */
 export async function pruneNotifications() {
   await pool.query(`DELETE FROM admin_notifications WHERE created_at < NOW() - INTERVAL '90 days'`);
+  await pool.query(`DELETE FROM agent_notifications WHERE created_at < NOW() - INTERVAL '90 days'`).catch(() => {});
 }
 
 // ── Avisos concretos ─────────────────────────────────────────────────────
@@ -384,8 +437,8 @@ export async function notifyLiveChat(info: { conversationId: number; title: stri
         `SELECT u.id FROM users u JOIN chat_agents a ON a.user_id = u.id
          WHERE u.role = 'asesor' AND a.online AND NOT a.paused
            AND NOT EXISTS (SELECT 1 FROM chat_conversations c WHERE c.agent_user_id = u.id AND c.status <> 'closed')`);
-    await Promise.all(rows.map((r: any) => sendPushToUser(r.id, {
-      title: info.title, body: info.body, url, tag: `chat-${info.conversationId}`,
+    await Promise.all(rows.map((r: any) => notifyAgent(r.id, {
+      category: 'chat', title: info.title, body: info.body, url, tag: `chat-${info.conversationId}`,
     })));
   } catch (err: any) {
     console.error('[PUSH CHAT AGENTS ERROR]:', err.message);

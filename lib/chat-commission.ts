@@ -4,7 +4,8 @@
  * Margen neto de una unidad = precio sin IVA − coste − comisión del cobro
  * (Stripe) − coste de pagar la comisión al asesor (Stripe Connect, 0,25 %).
  * - El asesor puede descontar hasta dejar un margen neto del 20 % del coste.
- * - Su comisión es el 50 % del margen neto que queda después del descuento.
+ * - Su comisión es un % del margen neto que queda después del descuento: el
+ *   50 % por defecto, ajustable por asesor (chat_agents.commission_share).
  * - El coste de pagarle (0,25 % de lo enviado) se calcula sobre la comisión
  *   máxima del producto y se trata como un coste más de la venta: al asesor no
  *   se le descuenta nada. Los fijos de Connect (0,10 € por pago y 2 € al mes
@@ -15,6 +16,7 @@
  * Todos los importes en céntimos; los precios de venta llevan el IVA español.
  */
 import { VAT, PAYMENT_FEE_PCT, PAYMENT_FEE_FIXED } from './pricing.js';
+import { pool } from '../db.js';
 
 export const MIN_MARKUP = 0.20;
 export const COMMISSION_SHARE = 0.5;
@@ -24,6 +26,24 @@ export const PAYOUT_FEE_PCT = 0.0025;
 export const COMMISSION_HOLD_DAYS = 30;
 
 const saleFee = (grossCents: number) => grossCents * PAYMENT_FEE_PCT + PAYMENT_FEE_FIXED;
+
+const shareCache = new Map<number, { at: number; share: number }>();
+
+/** Parte del margen neto (0-1) que cobra un asesor; caché de 30 s como los roles. */
+export async function agentCommissionShare(userId: number | null | undefined): Promise<number> {
+  if (!userId) return COMMISSION_SHARE;
+  const hit = shareCache.get(userId);
+  if (hit && Date.now() - hit.at < 30_000) return hit.share;
+  const { rows } = await pool.query(`SELECT commission_share FROM chat_agents WHERE user_id = $1`, [userId]).catch(() => ({ rows: [] as any[] }));
+  const pct = Number(rows[0]?.commission_share);
+  const share = Number.isFinite(pct) && pct >= 0 && pct <= 100 ? pct / 100 : COMMISSION_SHARE;
+  shareCache.set(userId, { at: Date.now(), share });
+  return share;
+}
+
+export function forgetCommissionShare(userId: number) {
+  shareCache.delete(userId);
+}
 
 /**
  * Coste por unidad de pagar la comisión al asesor: 0,25 % de la comisión
@@ -56,13 +76,13 @@ export function discountedCents(listGrossCents: number, discountPct: number): nu
 }
 
 /** Comisión por unidad vendida a `grossCents`; `listGrossCents` es el precio sin descuento del asesor. */
-export function commissionCents(grossCents: number, costCents: number | null | undefined, listGrossCents = grossCents): number | null {
+export function commissionCents(grossCents: number, costCents: number | null | undefined, listGrossCents = grossCents, share = COMMISSION_SHARE): number | null {
   if (!costCents || costCents <= 0) return null;
-  return Math.max(0, Math.round(COMMISSION_SHARE * netMarginCents(grossCents, costCents, listGrossCents)));
+  return Math.max(0, Math.round(share * netMarginCents(grossCents, costCents, listGrossCents)));
 }
 
 /** Lo que el asesor puede hacer con un producto: descuento máximo y comisión mínima/máxima por unidad. */
-export function productEconomics(listGrossCents: number, costCents: number | null | undefined, inPromo = false) {
+export function productEconomics(listGrossCents: number, costCents: number | null | undefined, inPromo = false, share = COMMISSION_SHARE) {
   const hasCost = !!costCents && costCents > 0;
   if (inPromo) {
     return { has_cost: hasCost, in_promo: true, max_discount_pct: 0, commission_max: 0, commission_min: 0 };
@@ -72,7 +92,7 @@ export function productEconomics(listGrossCents: number, costCents: number | nul
     has_cost: hasCost,
     in_promo: false,
     max_discount_pct: max,
-    commission_max: hasCost ? commissionCents(listGrossCents, costCents, listGrossCents) : null,
-    commission_min: hasCost ? commissionCents(discountedCents(listGrossCents, max), costCents, listGrossCents) : null,
+    commission_max: hasCost ? commissionCents(listGrossCents, costCents, listGrossCents, share) : null,
+    commission_min: hasCost ? commissionCents(discountedCents(listGrossCents, max), costCents, listGrossCents, share) : null,
   };
 }

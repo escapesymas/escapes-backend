@@ -16,10 +16,10 @@ import {
   isAgentOnline, setAgentOnline, setAgentPaused, isAgentPaused,
 } from '../lib/live-chat.js';
 import { quoteOrder, type PriceOverride } from '../lib/order-pricing.js';
-import { productEconomics, maxDiscountPct, discountedCents, commissionCents, COMMISSION_HOLD_DAYS } from '../lib/chat-commission.js';
+import { productEconomics, maxDiscountPct, discountedCents, commissionCents, netMarginCents, agentCommissionShare, forgetCommissionShare, COMMISSION_HOLD_DAYS, COMMISSION_SHARE } from '../lib/chat-commission.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
 import { searchTerms } from '../lib/catalog-query.js';
-import { notifyLiveChat, sendPushToUser, saveSubscription } from '../pushService.js';
+import { notifyLiveChat, notifyAgent, sendPushToUser, saveSubscription } from '../pushService.js';
 import { requireAgent, requireAdminRole, type AgentAuth } from '../lib/agent-auth.js';
 import { sendTemplatedEmail } from '../lib/email.js';
 
@@ -303,12 +303,13 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
       `UPDATE orders SET created_by_user_id = $2, sales_channel = 'chat', chat_order_id = $3 WHERE id = $1
        RETURNING total, created_at`, [orderId, co.agent_user_id, co.id]);
     // Atribuible al asesor: sus productos (hasta la cantidad que preparó), sin el
-    // resto del carrito ni el envío; comisión = 50 % del margen neto de lo cobrado.
+    // resto del carrito ni el envío; comisión = % del asesor sobre el margen neto de lo cobrado.
     const { rows: [full] } = await pool.query(`SELECT items FROM chat_orders WHERE id = $1`, [co.id]);
     const { rows: orderItems } = await pool.query(
       `SELECT product_id, quantity, price FROM order_items WHERE order_id = $1 ORDER BY price`, [orderId]);
     let attributed = 0;
     let commission = 0;
+    const share = await agentCommissionShare(co.agent_user_id);
     for (const it of full?.items || []) {
       let left = Number(it.quantity) || 0;
       for (const oi of orderItems.filter((r: any) => Number(r.product_id) === Number(it.id))) {
@@ -317,7 +318,7 @@ export async function linkChatOrder(token: string, orderId: number, userId: numb
         left -= units;
         attributed += Number(oi.price) * units;
         // Productos en promoción al preparar el pedido: sin comisión.
-        if (!it.promo) commission += (commissionCents(Number(oi.price), it.cost_cents, Number(it.list_cents) || Number(oi.price)) || 0) * units;
+        if (!it.promo) commission += (commissionCents(Number(oi.price), it.cost_cents, Number(it.list_cents) || Number(oi.price), share) || 0) * units;
       }
     }
     await pool.query(`UPDATE chat_orders SET attributed_cents = $2, commission_cents = $3 WHERE id = $1`, [co.id, attributed, commission]);
@@ -554,10 +555,10 @@ async function productCard(productId: number) {
   return (await productRow(productId))?.card || null;
 }
 
-/** Tarjeta para el panel: con el descuento máximo y la comisión mínima/máxima por unidad. */
-async function adminProductCard(productId: number) {
+/** Tarjeta para el panel: con el descuento máximo y la comisión mínima/máxima por unidad (con el % del asesor). */
+async function adminProductCard(productId: number, share = COMMISSION_SHARE) {
   const row = await productRow(productId);
-  return row ? { ...row.card, ...productEconomics(row.eff, row.cost, row.promo) } : null;
+  return row ? { ...row.card, ...productEconomics(row.eff, row.cost, row.promo, share) } : null;
 }
 
 /**
@@ -565,7 +566,7 @@ async function adminProductCard(productId: number) {
  * mínimo y calcula la comisión. `strict` rechaza descuentos por encima del
  * máximo (al enviar); sin él se recortan (vista previa).
  */
-async function priceProposal(rawItems: any[], strict: boolean) {
+async function priceProposal(rawItems: any[], strict: boolean, share = COMMISSION_SHARE) {
   const lines: any[] = [];
   const errors: string[] = [];
   for (const raw of rawItems.slice(0, 30)) {
@@ -586,7 +587,7 @@ async function priceProposal(rawItems: any[], strict: boolean) {
       discount = max;
     }
     const unit = discountedCents(row.eff, discount);
-    const commissionUnit = row.promo ? 0 : commissionCents(unit, row.cost, row.eff);
+    const commissionUnit = row.promo ? 0 : commissionCents(unit, row.cost, row.eff, share);
     lines.push({
       id, quantity, discount, list: row.eff, unit, cost: row.cost, max_discount_pct: max, in_promo: row.promo,
       commission_unit: commissionUnit, commission: commissionUnit != null ? commissionUnit * quantity : null,
@@ -702,7 +703,8 @@ liveChatRouter.post('/admin/chats/:id/image', async (req: any, res: any, next: a
 
 // GET /api/admin/chat-products?q= — buscador de productos para enviar o añadir al pedido.
 liveChatRouter.get('/admin/chat-products', async (req: any, res: any) => {
-  if (!(await requireAgent(req, res))) return;
+  const auth = await requireAgent(req, res);
+  if (!auth) return;
   const q = clean(req.query.q, 120);
   const terms = searchTerms(q).filter((t) => !t.includes(' ')).slice(0, 6);
   if (!terms.length) return res.json({ products: [] });
@@ -712,7 +714,8 @@ liveChatRouter.get('/admin/chat-products', async (req: any, res: any) => {
       `SELECT p.id FROM products p WHERE p.status = 'published' AND p.price > 0 AND ${conds}
        ORDER BY (upper(p.sku) = upper($${terms.length + 1})) DESC, (p.stock > 0) DESC, p.name LIMIT 20`,
       [...terms.map((t) => `%${t}%`), q]);
-    const products = (await Promise.all(rows.map((r: any) => adminProductCard(r.id)))).filter(Boolean);
+    const share = await agentCommissionShare(auth.user_id);
+    const products = (await Promise.all(rows.map((r: any) => adminProductCard(r.id, share)))).filter(Boolean);
     res.json({ products });
   } catch (err: any) {
     console.error('[LIVE CHAT] products:', err.message);
@@ -724,8 +727,10 @@ liveChatRouter.get('/admin/chat-products', async (req: any, res: any) => {
 liveChatRouter.get('/admin/chats/:id/cart', async (req: any, res: any) => {
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ error: 'ID inválido' });
-  if (!(await agentFor(req, res, id))) return;
+  const auth = await agentFor(req, res, id);
+  if (!auth) return;
   try {
+    const share = await agentCommissionShare(auth.user_id);
     const { rows: [conv] } = await pool.query(`SELECT user_id FROM chat_conversations WHERE id = $1`, [id]);
     if (!conv) return res.status(404).json({ error: 'Conversación no encontrada' });
     const { rows: [cart] } = await pool.query(
@@ -734,7 +739,7 @@ liveChatRouter.get('/admin/chats/:id/cart', async (req: any, res: any) => {
     let raw: any[] = [];
     try { raw = JSON.parse(cart?.items || '[]'); } catch { raw = []; }
     const items = (await Promise.all(raw.slice(0, 50).map(async (it: any) => {
-      const card = await adminProductCard(parseInt(it.id, 10));
+      const card = await adminProductCard(parseInt(it.id, 10), share);
       const quantity = Math.max(1, Math.min(99, parseInt(it.quantity, 10) || 1));
       return card ? { ...card, quantity } : { id: it.id, name: it.title || it.name || 'Producto', quantity, unavailable: true };
     })));
@@ -747,9 +752,10 @@ liveChatRouter.get('/admin/chats/:id/cart', async (req: any, res: any) => {
 
 // POST /api/admin/chats/:id/order-preview { items: [{id, quantity, discount}] } — importes y comisión.
 liveChatRouter.post('/admin/chats/:id/order-preview', async (req: any, res: any) => {
-  if (!(await agentFor(req, res, parseId(req.params.id)))) return;
+  const auth = await agentFor(req, res, parseId(req.params.id));
+  if (!auth) return;
   try {
-    const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], false);
+    const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], false, await agentCommissionShare(auth.user_id));
     res.json({
       lines: p.lines.map(({ card, cost, ...l }) => l),
       quote: p.quote && {
@@ -775,7 +781,7 @@ liveChatRouter.post('/admin/chats/:id/order', async (req: any, res: any) => {
     if (!conv || conv.status === 'closed') return res.status(409).json({ error: 'La conversación está cerrada.' });
     // Antes de guardar nada: si es un chat nuevo, se asigna (o falla si el asesor está ocupado).
     await ensureTaken(id, auth);
-    const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], true);
+    const p = await priceProposal(Array.isArray(req.body?.items) ? req.body.items : [], true, await agentCommissionShare(auth.user_id));
     if (p.errors.length) return res.status(400).json({ error: p.errors.join(' · ') });
     if (!p.lines.length || !p.quote) return res.status(400).json({ error: 'Añade al menos un producto' });
 
@@ -976,6 +982,12 @@ liveChatRouter.post('/admin/commission-payouts', async (req: any, res: any) => {
       [agentId, name, amount, method, reference, note, auth.user_id]);
     await client.query(`UPDATE chat_orders SET payout_id = $1 WHERE id = ANY($2::int[])`, [payout.id, available.map((r) => r.id)]);
     await client.query('COMMIT');
+    notifyAgent(agentId, {
+      category: 'payout',
+      title: `💶 Te hemos pagado ${eurText(amount)} de comisiones`,
+      body: `${available.length} pedido${available.length === 1 ? '' : 's'} · ${method}${reference ? ` · ${reference}` : ''}`,
+      url: '/?tab=chat',
+    }).catch(() => {});
     res.json({ payout, count: available.length });
   } catch (err: any) {
     await client.query('ROLLBACK').catch(() => {});
@@ -983,6 +995,177 @@ liveChatRouter.post('/admin/commission-payouts', async (req: any, res: any) => {
     res.status(500).json({ error: 'No se pudo registrar el pago' });
   } finally {
     client.release();
+  }
+});
+
+const eurText = (cents: number) => `${(cents / 100).toFixed(2).replace('.', ',')} €`;
+const validDate = (v: any) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
+
+// GET /api/admin/advisors/overview?from=&to= — gestión de asesores: KPIs del periodo
+// (chats, pedidos, ventas, descuentos, margen y comisión) y estado de sus comisiones.
+liveChatRouter.get('/admin/advisors/overview', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const to = validDate(req.query.to) ? new Date(String(req.query.to)) : new Date();
+  const from = validDate(req.query.from) ? new Date(String(req.query.from)) : new Date(to.getTime() - 30 * 86400_000);
+  try {
+    const [{ rows: people }, { rows: convs }, { rows: orders }, { rows: commissionRows }, { rows: payouts }] = await Promise.all([
+      pool.query(
+        `SELECT u.id, u.email, u.role, COALESCE(a.online, FALSE) AS online, COALESCE(a.paused, FALSE) AS paused,
+                COALESCE(a.commission_share, 50)::float AS commission_share
+         FROM users u LEFT JOIN chat_agents a ON a.user_id = u.id WHERE u.role IN ('asesor', 'admin')`),
+      pool.query(
+        `SELECT agent_user_id, count(*)::int AS attended,
+                round(avg(extract(epoch FROM first_response_at - created_at)) FILTER (WHERE first_response_at IS NOT NULL))::int AS avg_first_response_s,
+                round(avg(rating)::numeric, 2)::float AS avg_rating, count(rating)::int AS ratings
+         FROM chat_conversations WHERE agent_user_id IS NOT NULL AND created_at >= $1 AND created_at < $2
+         GROUP BY agent_user_id`, [from, to]),
+      pool.query(
+        `SELECT co.agent_user_id, co.items, co.status AS co_status, co.order_id, o.status AS order_status,
+                co.attributed_cents, co.commission_cents, co.estimate_commission_cents
+         FROM chat_orders co LEFT JOIN orders o ON o.id = co.order_id
+         WHERE co.agent_user_id IS NOT NULL AND co.created_at >= $1 AND co.created_at < $2`, [from, to]),
+      pool.query(`${COMMISSION_ROWS_SQL} WHERE co.agent_user_id IS NOT NULL ORDER BY co.created_at DESC LIMIT 10000`),
+      pool.query(
+        `SELECT id, agent_user_id, agent_name, amount_cents, method, reference, note, paid_at
+         FROM commission_payouts WHERE paid_at >= $1 AND paid_at < $2 ORDER BY paid_at DESC LIMIT 200`, [from, to]),
+    ]);
+
+    const blank = () => ({
+      attended: 0, avg_first_response_s: null as number | null, avg_rating: null as number | null, ratings: 0,
+      sent: 0, ordered: 0, paid: 0, voided: 0, revenue: 0, list_value: 0, sold_value: 0,
+      margin: 0, commission: 0, no_cost_units: 0,
+      states: { awaiting: 0, holding: 0, available: 0, paid_out: 0, void: 0 } as Record<CommissionState, number>,
+      available_count: 0, last_payout_at: null as string | null,
+    });
+    const stats = new Map<number, ReturnType<typeof blank>>();
+    const get = (id: number) => stats.get(id) || stats.set(id, blank()).get(id)!;
+
+    for (const c of convs) Object.assign(get(c.agent_user_id), {
+      attended: c.attended, avg_first_response_s: c.avg_first_response_s, avg_rating: c.avg_rating, ratings: c.ratings,
+    });
+    for (const o of orders) {
+      const a = get(o.agent_user_id);
+      a.sent++;
+      if (o.order_id) a.ordered++;
+      const voided = o.co_status === 'cancelled' || (o.order_id && VOID_STATUSES.includes(o.order_status));
+      if (voided) { a.voided++; continue; }
+      if (!o.order_id || !PAID_STATUSES.includes(o.order_status)) continue;
+      a.paid++;
+      let sold = 0;
+      for (const it of Array.isArray(o.items) ? o.items : []) {
+        const qty = Number(it.quantity) || 0;
+        const unit = Number(it.unit_cents) || 0;
+        const list = Number(it.list_cents) || unit;
+        const cost = Number(it.cost_cents) || 0;
+        sold += unit * qty;
+        a.list_value += list * qty;
+        if (cost > 0) a.margin += Math.round(netMarginCents(unit, cost, list)) * qty;
+        else a.no_cost_units += qty;
+      }
+      a.sold_value += sold;
+      a.revenue += Number(o.attributed_cents ?? sold) || 0;
+      a.commission += Number(o.commission_cents ?? o.estimate_commission_cents) || 0;
+    }
+    for (const r of commissionRows.map(decorateCommission)) {
+      const a = get(r.agent_user_id);
+      a.states[r.state as CommissionState] += r.amount;
+      if (r.state === 'available' && r.amount > 0) a.available_count++;
+      if (r.payout_paid_at && (!a.last_payout_at || r.payout_paid_at > a.last_payout_at)) a.last_payout_at = r.payout_paid_at;
+    }
+
+    const agents = [];
+    for (const p of people) {
+      const a = stats.get(p.id);
+      // Los administradores solo salen si han atendido chats o vendido algo.
+      if (!a && p.role !== 'asesor') continue;
+      const s = a || blank();
+      agents.push({
+        id: p.id, name: await agentNameFor(p.id), email: p.email, role: p.role,
+        online: p.online, paused: p.paused, commission_share: p.commission_share,
+        ...s,
+        conversion: s.attended ? s.paid / s.attended : null,
+        avg_ticket: s.paid ? Math.round(s.revenue / s.paid) : null,
+        avg_discount_pct: s.list_value ? (1 - s.sold_value / s.list_value) * 100 : null,
+        commission_of_margin: s.margin > 0 ? s.commission / s.margin : null,
+        margin_pct: s.revenue > 0 ? s.margin / (s.revenue / 1.21) : null,
+      });
+    }
+    agents.sort((x, y) => y.revenue - x.revenue || y.attended - x.attended);
+
+    const sum = (k: string) => agents.reduce((acc, a: any) => acc + (Number(a[k]) || 0), 0);
+    const totals = {
+      agents: agents.filter((a) => a.role === 'asesor').length,
+      online: agents.filter((a) => a.online).length,
+      attended: sum('attended'), sent: sum('sent'), paid: sum('paid'), revenue: sum('revenue'),
+      margin: sum('margin'), commission: sum('commission'), list_value: sum('list_value'), sold_value: sum('sold_value'),
+      awaiting: agents.reduce((acc, a) => acc + a.states.awaiting, 0),
+      holding: agents.reduce((acc, a) => acc + a.states.holding, 0),
+      available: agents.reduce((acc, a) => acc + a.states.available, 0),
+      paid_out_period: payouts.reduce((acc: number, p: any) => acc + Number(p.amount_cents), 0),
+    };
+    res.json({
+      from: from.toISOString(), to: to.toISOString(), holdDays: COMMISSION_HOLD_DAYS, defaultShare: COMMISSION_SHARE * 100,
+      totals: {
+        ...totals,
+        conversion: totals.attended ? totals.paid / totals.attended : null,
+        avg_ticket: totals.paid ? Math.round(totals.revenue / totals.paid) : null,
+        avg_discount_pct: totals.list_value ? (1 - totals.sold_value / totals.list_value) * 100 : null,
+        commission_of_margin: totals.margin > 0 ? totals.commission / totals.margin : null,
+      },
+      agents,
+      payouts,
+    });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] advisors overview:', err.message);
+    res.status(500).json({ error: 'No se pudieron calcular los datos de los asesores' });
+  }
+});
+
+// PUT /api/admin/advisors/:id/share { share } — % del margen neto que cobra el asesor
+// (afecta a los pedidos que prepare a partir de ahora, no a los ya creados).
+liveChatRouter.put('/admin/advisors/:id/share', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const id = parseId(req.params.id);
+  const share = Math.round(Number(req.body?.share) * 100) / 100;
+  if (!id || !(share >= 0 && share <= 90)) return res.status(400).json({ error: 'El porcentaje debe estar entre 0 y 90' });
+  try {
+    const { rows: [old] } = await pool.query(`SELECT commission_share FROM chat_agents WHERE user_id = $1`, [id]);
+    const { rowCount } = await pool.query(
+      `INSERT INTO chat_agents (user_id, commission_share) SELECT id, $2 FROM users WHERE id = $1 AND role IN ('asesor', 'admin')
+       ON CONFLICT (user_id) DO UPDATE SET commission_share = EXCLUDED.commission_share`, [id, share]);
+    if (!rowCount) return res.status(404).json({ error: 'Asesor no encontrado' });
+    forgetCommissionShare(id);
+    if (old && Number(old.commission_share) !== share) {
+      notifyAgent(id, {
+        category: 'commission',
+        title: `📈 Tu comisión pasa a ser el ${String(share).replace('.', ',')} % del margen`,
+        body: 'Se aplica a los pedidos que prepares a partir de ahora.',
+        url: '/?tab=chat',
+      }).catch(() => {});
+    }
+    res.json({ ok: true, share });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] advisor share:', err.message);
+    res.status(500).json({ error: 'No se pudo guardar el porcentaje' });
+  }
+});
+
+// POST /api/admin/advisors/notify { title, body, userIds? } — aviso del administrador a los asesores.
+liveChatRouter.post('/admin/advisors/notify', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const title = clean(req.body?.title, 120);
+  const body = clean(req.body?.body, 1000);
+  if (!title) return res.status(400).json({ error: 'Escribe un título' });
+  const ids = Array.isArray(req.body?.userIds) ? req.body.userIds.map(parseId).filter(Boolean) : [];
+  try {
+    const { rows } = ids.length
+      ? await pool.query(`SELECT id FROM users WHERE role = 'asesor' AND id = ANY($1::int[])`, [ids])
+      : await pool.query(`SELECT id FROM users WHERE role = 'asesor'`);
+    await Promise.all(rows.map((r: any) => notifyAgent(r.id, { category: 'announcement', title: `📢 ${title}`, body, url: '/?tab=chat' })));
+    res.json({ sent: rows.length });
+  } catch (err: any) {
+    console.error('[LIVE CHAT] advisors notify:', err.message);
+    res.status(500).json({ error: 'No se pudo enviar el aviso' });
   }
 });
 

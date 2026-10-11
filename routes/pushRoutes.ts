@@ -2,8 +2,10 @@ import { Router } from 'express';
 import {
   getVapidPublicKey, saveSubscription, removeSubscription, sendNotificationToAll, updatePreferences,
   getSubscriptionPreferences, listNotifications, markNotificationsRead, unreadCount, NOTIFICATION_CATEGORIES,
+  listAgentNotifications, markAgentNotificationsRead,
 } from '../pushService.js';
 import { authenticateRequest } from '../utils.js';
+import { requireAgent } from '../lib/agent-auth.js';
 
 export const pushRouter = Router();
 
@@ -138,6 +140,37 @@ pushRouter.post('/push/history/read', async (req, res) => {
     return res.json({ success: true, unread: await unreadCount() });
   } catch (err: any) {
     console.error('[PUSH READ ERROR]:', err.message);
+    return res.status(500).json({ error: 'No se pudo actualizar' });
+  }
+});
+
+// ── Avisos del asesor (su propio historial) ──────────────────────────────
+
+// GET /api/agent/notifications?limit=&before=
+pushRouter.get('/agent/notifications', async (req, res) => {
+  const auth = await requireAgent(req, res);
+  if (!auth) return;
+  try {
+    return res.json(await listAgentNotifications(auth.user_id, {
+      limit: parseInt(String(req.query.limit || '30')) || 30,
+      before: parseInt(String(req.query.before || '')) || undefined,
+    }));
+  } catch (err: any) {
+    console.error('[AGENT NOTICES ERROR]:', err.message);
+    return res.status(500).json({ error: 'No se pudieron leer los avisos' });
+  }
+});
+
+// POST /api/agent/notifications/read  { ids: number[] } | { all: true }
+pushRouter.post('/agent/notifications/read', async (req, res) => {
+  const auth = await requireAgent(req, res);
+  if (!auth) return;
+  try {
+    const { ids, all } = req.body || {};
+    await markAgentNotificationsRead(auth.user_id, all ? 'all' : (Array.isArray(ids) ? ids.map((x: any) => parseInt(x)).filter(Number.isFinite) : []));
+    return res.json({ success: true });
+  } catch (err: any) {
+    console.error('[AGENT NOTICES READ ERROR]:', err.message);
     return res.status(500).json({ error: 'No se pudo actualizar' });
   }
 });
