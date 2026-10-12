@@ -7,7 +7,6 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
-import sharp from 'sharp';
 import { pool } from '../db.js';
 import { authenticateRequest } from '../utils.js';
 import {
@@ -24,6 +23,7 @@ import { searchTerms } from '../lib/catalog-query.js';
 import { notifyLiveChat, notifyAgent, sendPushToUser, saveSubscription } from '../pushService.js';
 import { requireAgent, requireAdminRole, type AgentAuth } from '../lib/agent-auth.js';
 import { sendTemplatedEmail } from '../lib/email.js';
+import { processImage, ImageSandboxUnavailable } from '../lib/image-sandbox.js';
 
 export const liveChatRouter = Router();
 
@@ -675,6 +675,20 @@ export const imageUpload = multer({
   limits: { fileSize: 12 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => cb(null, /^image\/(jpeg|png|webp|gif|heic|heif|avif)$/.test(file.mimetype)),
 });
+/**
+ * Guarda una foto del chat recodificada a WebP (sin metadatos como la ubicación
+ * y sin ficheros que no sean imagen). Se abre en el procesador aislado.
+ */
+export async function saveChatImage(buffer: Buffer) {
+  const out = await processImage(buffer, {
+    width: 1600, height: 1600, fit: 'inside', quality: 82, formats: ['jpeg', 'png', 'webp', 'gif', 'heif'],
+  });
+  await fs.promises.mkdir(CHAT_UPLOAD_DIR, { recursive: true });
+  const name = `${crypto.randomUUID()}.webp`;
+  await fs.promises.writeFile(path.join(CHAT_UPLOAD_DIR, name), out.data);
+  return { url: `/uploads/chat/${name}`, width: out.width, height: out.height };
+}
+
 liveChatRouter.post('/admin/chats/:id/image', async (req: any, res: any, next: any) => {
   const a = await agentFor(req, res, parseId(req.params.id));
   if (!a) return;
@@ -686,13 +700,7 @@ liveChatRouter.post('/admin/chats/:id/image', async (req: any, res: any, next: a
   if (!id || !req.file) return res.status(400).json({ error: 'Falta la imagen (JPG, PNG, WEBP o GIF de hasta 12 MB)' });
   try {
     await ensureTaken(id, auth);
-    // Se recodifica siempre (quita metadatos como la ubicación y evita ficheros que no sean imagen).
-    const image = sharp(req.file.buffer, { failOn: 'error' }).rotate();
-    const out = await image.resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).webp({ quality: 82 }).toBuffer({ resolveWithObject: true });
-    await fs.promises.mkdir(CHAT_UPLOAD_DIR, { recursive: true });
-    const name = `${crypto.randomUUID()}.webp`;
-    await fs.promises.writeFile(path.join(CHAT_UPLOAD_DIR, name), out.data);
-    const payload = { url: `/uploads/chat/${name}`, width: out.info.width, height: out.info.height };
+    const payload = await saveChatImage(req.file.buffer);
     const caption = clean(req.body?.caption, 300);
     const sent = await agentSend(id, auth, 'image', caption, payload, caption ? `📷 ${caption}` : 'Te ha enviado una imagen');
     if (!sent) return res.status(409).json({ error: 'La conversación está cerrada.' });
@@ -700,6 +708,7 @@ liveChatRouter.post('/admin/chats/:id/image', async (req: any, res: any, next: a
   } catch (err: any) {
     if (err instanceof AgentBusyError) return res.status(409).json({ error: err.message });
     console.error('[LIVE CHAT] image:', err.message);
+    if (err instanceof ImageSandboxUnavailable) return res.status(503).json({ error: 'Ahora mismo no podemos procesar imágenes. Inténtalo en unos minutos.' });
     res.status(400).json({ error: 'No se pudo procesar la imagen' });
   }
 });

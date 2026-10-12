@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
-import sharp from 'sharp';
+import { processImage, detectImageType, ImageRejected, IMAGE_MIME } from '../lib/image-sandbox.js';
 import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
 import { getLiveStockValue } from '../bihrService.js';
@@ -848,16 +848,27 @@ catalogRouter.get('/products/:id(\\d+)/image', async (req: any, res: any) => {
       return servePlaceholder(res, 'upstream-too-large');
     }
     const original = Buffer.from(ab);
+    // Lo que no sea una imagen de verdad (HTML de error, otro formato…) no se reenvía.
+    const originalType = detectImageType(original);
+    if (!originalType || originalType === 'heif') return servePlaceholder(res, 'not-image');
 
+    // Se abre en el procesador aislado (lib/image-sandbox.ts), nunca en este proceso.
     let optimized: Buffer;
     try {
-      optimized = await sharp(original)
-        .resize({ width: w, withoutEnlargement: true, fit: 'inside' })
-        .webp({ quality: 80, effort: 4 })
-        .toBuffer();
-    } catch (sharpErr: any) {
-      console.error(`[product-image] sharp error for product ${productId}: ${sharpErr?.message || sharpErr}`);
-      return servePlaceholder(res, 'sharp-error');
+      ({ data: optimized } = await processImage(original, {
+        width: w, fit: 'inside', quality: 80, formats: ['jpeg', 'png', 'webp', 'gif'],
+      }));
+    } catch (err: any) {
+      if (err instanceof ImageRejected) {
+        console.error(`[product-image] imagen no válida para el producto ${productId}`);
+        return servePlaceholder(res, 'invalid-image');
+      }
+      // Procesador caído: la original tal cual (la decodifica el navegador), sin guardarla.
+      console.error(`[product-image] procesador no disponible para el producto ${productId}: ${err.message}`);
+      res.set('Content-Type', IMAGE_MIME[originalType]);
+      res.set('Cache-Control', 'public, max-age=300');
+      res.set('X-Image-Cache', 'ORIGINAL');
+      return res.end(original);
     }
 
     if (safeSku) {

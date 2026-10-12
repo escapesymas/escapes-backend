@@ -22,7 +22,6 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
-import sharp from 'sharp';
 import {
   getLiveStockLevel, getLiveStockValue, checkProductsInfo, createBihrOrder, syncBihrCatalog
 } from './bihrService.js';
@@ -36,6 +35,7 @@ import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats 
 import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-webhook-service.js';
 import { processEmailRetryQueue, recordOpen, emailStats, sendEmail, sendTemplatedEmail } from './lib/email.js';
 import { orderEmailItems } from './lib/order-emails.js';
+import { processImage, detectImageType, ImageRejected, IMAGE_MIME } from './lib/image-sandbox.js';
 import { formatOrderNumber } from './lib/email-templates.js';
 import { REFUND_REASONS, REFUNDABLE_STATUSES, REFUND_REASON_MIN, REFUND_REASON_MAX, refundEstimate, refundRequestsByOrder, refundRequestView, type RefundLine } from './lib/refunds.js';
 import Stripe from 'stripe';
@@ -779,13 +779,15 @@ app.post('/api/upload/avatar', requireAuth, avatarLimiter, avatarUpload.single('
 
     let webp: Buffer;
     try {
-      webp = await sharp(file.buffer, { limitInputPixels: 50_000_000 })
-        .rotate()
-        .resize(AVATAR_SIZE, AVATAR_SIZE, { fit: 'cover', position: 'centre' })
-        .webp({ quality: 85 })
-        .toBuffer();
-    } catch {
-      return res.status(400).json({ error: 'No hemos podido leer la imagen. Prueba con otra en JPG, PNG o WebP.' });
+      ({ data: webp } = await processImage(file.buffer, {
+        width: AVATAR_SIZE, height: AVATAR_SIZE, fit: 'cover', quality: 85, formats: ['jpeg', 'png', 'webp'],
+      }));
+    } catch (err) {
+      if (err instanceof ImageRejected) {
+        return res.status(400).json({ error: 'No hemos podido leer la imagen. Prueba con otra en JPG, PNG o WebP.' });
+      }
+      console.error('[UPLOAD AVATAR]', (err as Error).message);
+      return res.status(503).json({ error: 'Ahora mismo no podemos procesar fotos. Inténtalo en unos minutos.' });
     }
     const filename = `avatar-${crypto.randomUUID()}.webp`;
     await fs.promises.writeFile(path.join(uploadDir, filename), webp);
@@ -1473,7 +1475,7 @@ app.get('/api/health/stripe', async (_req: any, res: any) => {
 // ================================================================
 // IMAGE PROXY (Cloudflare-bypass for catalog images)
 // El CDN Bihr bloquea con 403 a navegadores de usuarios finales.
-// El VPS sí tiene acceso. Cacheamos en disco + optimizamos con sharp.
+// El VPS sí tiene acceso. Cacheamos en disco + optimizamos en el procesador aislado.
 // ================================================================
 const IMAGE_PROXY_CACHE_DIR = path.join(os.tmpdir(), 'image-proxy-cache');
 if (!fs.existsSync(IMAGE_PROXY_CACHE_DIR)) {
@@ -1484,6 +1486,20 @@ const imageProxyCache = new Map<string, { buffer: Buffer; contentType: string; e
 const IMAGE_PROXY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días
 const IMAGE_PROXY_MAX_ENTRIES = 5000;
 const ALLOWED_IMAGE_HOSTS = ['api.mybihr.com', 'bihr.net', 'cdn.mybihr.com'];
+const IMAGE_PROXY_MAX_BYTES = 15 * 1024 * 1024;
+
+/** SVG «Imagen no disponible» para que la web no muestre una imagen rota. */
+function imagePlaceholder(res: any, width: number, reason: string) {
+  res.set('Content-Type', 'image/svg+xml');
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.set('X-Image-Proxy', `PLACEHOLDER-${reason}`);
+  return res.end(Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${width}" viewBox="0 0 ${width} ${width}">` +
+    `<rect width="100%" height="100%" fill="#1a1a1a"/>` +
+    `<text x="50%" y="50%" text-anchor="middle" dy=".3em" fill="#666" font-family="monospace" font-size="14">Imagen no disponible</text>` +
+    `</svg>`
+  ));
+}
 const ALLOWED_SIZES = new Set([200, 400, 600, 800]);
 
 function diskPathFor(rawUrl: string, width: number): string {
@@ -1539,31 +1555,34 @@ app.get('/api/image-proxy', heavyPublicLimiter, async (req, res) => {
 
     if (!upstream.ok) {
       console.warn(`[image-proxy] upstream ${upstream.status} for ${rawUrl.substring(0, 80)}`);
-      // Generar placeholder SVG para que la UI muestre algo en vez de imagen rota
-      const placeholder = Buffer.from(
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${width}" viewBox="0 0 ${width} ${width}">` +
-        `<rect width="100%" height="100%" fill="#1a1a1a"/>` +
-        `<text x="50%" y="50%" text-anchor="middle" dy=".3em" fill="#666" font-family="monospace" font-size="14">Imagen no disponible</text>` +
-        `</svg>`
-      );
-      res.set('Content-Type', 'image/svg+xml');
-      res.set('Cache-Control', 'public, max-age=3600');
-      res.set('X-Image-Proxy', 'PLACEHOLDER');
-      return res.end(placeholder);
+      return imagePlaceholder(res, width, 'UPSTREAM');
+    }
+    if (Number(upstream.headers.get('content-length') || 0) > IMAGE_PROXY_MAX_BYTES) {
+      return imagePlaceholder(res, width, 'TOO-LARGE');
     }
 
     const ab = await upstream.arrayBuffer();
+    if (ab.byteLength > IMAGE_PROXY_MAX_BYTES) return imagePlaceholder(res, width, 'TOO-LARGE');
     const originalBuffer = Buffer.from(ab);
+    // Lo que no sea una imagen de verdad (HTML de error, otro formato…) no se reenvía.
+    const originalType = detectImageType(originalBuffer);
+    if (!originalType || originalType === 'heif') return imagePlaceholder(res, width, 'NOT-IMAGE');
 
+    // Se abre en el procesador aislado (lib/image-sandbox.ts), nunca en este proceso.
     let optimized: Buffer;
     try {
-      optimized = await sharp(originalBuffer)
-        .resize({ width, withoutEnlargement: true, fit: 'inside' })
-        .webp({ quality: 80, effort: 4 })
-        .toBuffer();
-    } catch (sharpErr: any) {
-      console.error('[image-proxy] sharp error, fallback to original:', sharpErr.message);
-      optimized = originalBuffer;
+      ({ data: optimized } = await processImage(originalBuffer, {
+        width, fit: 'inside', quality: 80, formats: ['jpeg', 'png', 'webp', 'gif'],
+      }));
+    } catch (err: any) {
+      if (err instanceof ImageRejected) return imagePlaceholder(res, width, 'INVALID');
+      // Procesador caído: la original va tal cual (la decodifica el navegador) y no
+      // se guarda, para optimizarla en la próxima visita.
+      console.error('[image-proxy] procesador no disponible, se sirve la original:', err.message);
+      res.set('Content-Type', IMAGE_MIME[originalType]);
+      res.set('Cache-Control', 'public, max-age=3600');
+      res.set('X-Image-Proxy', 'ORIGINAL');
+      return res.end(originalBuffer);
     }
 
     // Persistir en disco (fire & forget)

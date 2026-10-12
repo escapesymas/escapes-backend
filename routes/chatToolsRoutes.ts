@@ -6,10 +6,6 @@
  * recordatorio del pedido preparado que no se ha pagado.
  */
 import { Router } from 'express';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import sharp from 'sharp';
 import { pool } from '../db.js';
 import { requireAgent, requireAdminRole } from '../lib/agent-auth.js';
 import { addMessage, agentNameFor, currentConversation } from '../lib/live-chat.js';
@@ -18,25 +14,15 @@ import { sendTemplatedEmail } from '../lib/email.js';
 import { minimaxClient, CHAT_MODEL } from '../chatbot/minimax.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
 import {
-  agentFor, customer, customerName, parseId, clean, PAID_STATUSES, CHAT_UPLOAD_DIR, imageUpload,
-  agentSend, AgentBusyError,
+  agentFor, customer, customerName, parseId, clean, PAID_STATUSES, imageUpload,
+  agentSend, AgentBusyError, saveChatImage,
 } from './liveChatRoutes.js';
+import { ImageSandboxUnavailable } from '../lib/image-sandbox.js';
 
 export const chatToolsRouter = Router();
 
 const PUBLIC_URL = (process.env.PUBLIC_BASE_URL || 'https://escapesymas.com').replace(/\/$/, '');
 const eur = (cents: number) => `${(cents / 100).toFixed(2).replace('.', ',')} €`;
-
-/** Guarda una imagen del chat recodificada a WebP (sin metadatos como la ubicación). */
-async function saveChatImage(buffer: Buffer) {
-  const out = await sharp(buffer, { failOn: 'error' }).rotate()
-    .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
-    .webp({ quality: 82 }).toBuffer({ resolveWithObject: true });
-  await fs.promises.mkdir(CHAT_UPLOAD_DIR, { recursive: true });
-  const name = `${crypto.randomUUID()}.webp`;
-  await fs.promises.writeFile(path.join(CHAT_UPLOAD_DIR, name), out.data);
-  return { url: `/uploads/chat/${name}`, width: out.info.width, height: out.info.height };
-}
 
 // ── Cliente ──────────────────────────────────────────────────────────────
 
@@ -69,6 +55,7 @@ chatToolsRouter.post('/chat/live/image', (req: any, res: any, next: any) => {
     res.json({ message: msg });
   } catch (err: any) {
     console.error('[CHAT TOOLS] customer image:', err.message);
+    if (err instanceof ImageSandboxUnavailable) return res.status(503).json({ error: 'Ahora mismo no podemos procesar fotos. Inténtalo en unos minutos.' });
     res.status(400).json({ error: 'No se pudo enviar la imagen' });
   }
 });
