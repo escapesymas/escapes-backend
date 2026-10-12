@@ -726,7 +726,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use('/api', catalogRouter);
 app.use('/api', ordersRouter);
 // Login, registro y cambios de contraseña: límite estricto por IP (solo cuentan los fallos).
-const AUTH_LIMITED_ACTIONS = new Set(['login', 'register', 'social-login', 'change-password', 'delete-account', 'verify-email', 'resend-verification']);
+const AUTH_LIMITED_ACTIONS = new Set(['login', 'register', 'social-login', 'change-password', 'delete-account', 'verify-email', 'resend-verification', 'confirm-email-change']);
 app.post('/api/auth', (req: any, res: any, next: any) =>
   AUTH_LIMITED_ACTIONS.has(String(req.query?.action || '')) ? authLimiter(req, res, next) : next());
 app.use('/api', authRouter);
@@ -742,18 +742,23 @@ app.use('/api', mfaRouter);
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
 // /uploads se sirve como estático en el mismo origen, así que nunca se debe
 // conservar la extensión que manda el cliente (.html, .svg → XSS almacenado).
-const AVATAR_MIME_EXT: Record<string, string> = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/webp': '.webp',
-};
+// Los avatares se guardan siempre como WebP cuadrado de 512 px (la web pide
+// recortar antes de subir; aquí se asegura aunque llegue otra cosa) y sin
+// metadatos de la foto (GPS, cámara…).
+const AVATAR_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const AVATAR_SIZE = 512;
 const avatarUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadDir),
-    filename: (_req, file, cb) => cb(null, `avatar-${crypto.randomUUID()}${AVATAR_MIME_EXT[file.mimetype] || '.bin'}`),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
-  fileFilter: (_req, file, cb) => cb(null, Boolean(AVATAR_MIME_EXT[file.mimetype])),
+  fileFilter: (_req, file, cb) => cb(null, AVATAR_MIMES.has(file.mimetype)),
+});
+const avatarLimiter = rateLimit({
+  keyGenerator: clientKey,
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Has cambiado la foto muchas veces seguidas. Espera 15 minutos.' }
 });
 const upload = multer({
   storage: multer.diskStorage({
@@ -767,18 +772,35 @@ const requireAdminKeyMw = (req: any, res: any, next: any) => {
   if (requireAdminKey(req, res)) next();
 };
 
-app.post('/api/upload/avatar', requireAuth, avatarUpload.single('avatar'), async (req: any, res: any) => {
+app.post('/api/upload/avatar', requireAuth, avatarLimiter, avatarUpload.single('avatar'), async (req: any, res: any) => {
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ error: 'Sube una imagen JPG, PNG o WebP de máximo 5 MB' });
 
-    const url = `/uploads/${file.filename}`;
+    let webp: Buffer;
+    try {
+      webp = await sharp(file.buffer, { limitInputPixels: 50_000_000 })
+        .rotate()
+        .resize(AVATAR_SIZE, AVATAR_SIZE, { fit: 'cover', position: 'centre' })
+        .webp({ quality: 85 })
+        .toBuffer();
+    } catch {
+      return res.status(400).json({ error: 'No hemos podido leer la imagen. Prueba con otra en JPG, PNG o WebP.' });
+    }
+    const filename = `avatar-${crypto.randomUUID()}.webp`;
+    await fs.promises.writeFile(path.join(uploadDir, filename), webp);
+
+    const url = `/uploads/${filename}`;
     // Siempre el avatar del usuario autenticado, nunca un userId del body.
+    const prev = await db.execute(sql`SELECT avatar_url FROM users WHERE id = ${req.user.user_id}`);
     await db.execute(sql`
       UPDATE users
       SET avatar_url = ${url}
       WHERE id = ${req.user.user_id}
     `);
+    // La foto anterior ya no la usa nadie: fuera del disco.
+    const old = String((prev.rows[0] as any)?.avatar_url || '').match(/^\/uploads\/(avatar-[\w-]+\.(?:webp|png|jpe?g))$/);
+    if (old) fs.promises.unlink(path.join(uploadDir, old[1])).catch(() => {});
 
     return res.json({ success: true, url });
   } catch (err: any) {

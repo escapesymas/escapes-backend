@@ -4,6 +4,7 @@ import { sql } from 'drizzle-orm';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import { sendTemplatedEmail } from '../lib/email.js';
+import { formatOrderNumber } from '../lib/email-templates.js';
 import {
   generateJWT,
   hashPasswordSHA256,
@@ -35,6 +36,145 @@ async function sendVerificationEmail(user: { id: number; email: string; first_na
   return result.status === 'sent';
 }
 
+// ── Cambio de email desde «Mi perfil» ─────────────────────────────────────
+// El email nuevo queda en pending_email hasta que el cliente abre el enlace
+// que le llega a esa dirección; mientras, sigue entrando con el anterior.
+const EMAIL_CHANGE_RESEND_SECONDS = 60;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const PASSWORD_MIN = 8;
+// Avatar: una foto subida por /api/upload/avatar o uno de los emojis del perfil.
+const AVATAR_URL_RE = /^(?:\/uploads\/avatar-[\w-]+\.(?:webp|png|jpe?g)|emoji:.{1,16})$/u;
+
+async function sendEmailChangeEmail(user: { id: number; email: string; first_name?: string; username?: string }, newEmail: string) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await db.execute(sql`
+    UPDATE users SET pending_email = ${newEmail},
+                     email_change_token_hash = ${sha256(token)},
+                     email_change_expires = NOW() + (${VERIFY_TTL_HOURS} || ' hours')::interval,
+                     email_change_sent_at = NOW()
+    WHERE id = ${user.id}`);
+  const name = user.first_name || user.username || '';
+  const url = `${SITE_URL}/confirmar-email?token=${token}`;
+  // En segundo plano: con reintentos el envío puede tardar más de un minuto.
+  sendTemplatedEmail('confirm-email-change', newEmail, { name, url, newEmail })
+    .then((r) => { if (r.status !== 'sent') console.error(`[AUTH] No se pudo enviar el cambio de email a ${newEmail}: ${r.lastError || r.status}`); })
+    .catch((e) => console.error('[AUTH EMAIL CHANGE ERROR]:', e.message));
+  // Aviso al email actual: si no lo ha pedido el cliente, se entera a tiempo.
+  sendTemplatedEmail('generic', user.email, {
+    subject: 'Han pedido cambiar el email de tu cuenta',
+    body: `Hola${name ? ` ${name}` : ''},\n\nHemos recibido una petición para cambiar el email de tu cuenta de Escapes y Más a ${newEmail}. El cambio no se aplicará hasta que se confirme desde esa dirección.\n\nSi no lo has pedido tú, entra en tu perfil, cancela el cambio y cambia tu contraseña.`,
+    cta: { label: 'Ir a mi perfil', url: `${SITE_URL}/perfil` },
+  }).catch((e) => console.error('[AUTH EMAIL CHANGE NOTICE ERROR]:', e.message));
+}
+
+/** Copia de los datos personales del cliente (derecho de acceso del RGPD). */
+async function exportUserData(userId: number) {
+  const parse = (v: any, fallback: any) => { try { return typeof v === 'string' ? JSON.parse(v) : (v ?? fallback); } catch { return fallback; } };
+  const rows = async (q: any) => (await db.execute(q)).rows as any[];
+  const euros = (cents: any) => (Number(cents) || 0) / 100;
+
+  const [user] = await rows(sql`SELECT * FROM users WHERE id = ${userId}`);
+  if (!user) return null;
+  const billing = parse(user.billing, {}) || {};
+  const { addresses, ...billingRest } = billing;
+
+  const orders = await rows(sql`SELECT * FROM orders WHERE user_id = ${userId} ORDER BY created_at DESC`);
+  const orderIds = orders.map((o) => o.id);
+  const items = orderIds.length ? await rows(sql`
+    SELECT oi.order_id, oi.quantity, oi.price, p.name AS product_name
+    FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id
+    WHERE oi.order_id IN (${sql.join(orderIds.map((id) => sql`${id}`), sql`, `)})
+    ORDER BY oi.id`) : [];
+
+  const conversations = await rows(sql`
+    SELECT id, status, agent_name, created_at, closed_at, rating, rating_comment
+    FROM chat_conversations WHERE user_id = ${userId} ORDER BY created_at`);
+  const convIds = conversations.map((c) => c.id);
+  const messages = convIds.length ? await rows(sql`
+    SELECT conversation_id, sender, kind, content, created_at FROM chat_messages
+    WHERE conversation_id IN (${sql.join(convIds.map((id) => sql`${id}`), sql`, `)})
+    ORDER BY id`) : [];
+
+  return {
+    generado: new Date().toISOString(),
+    responsable: 'Escapes y Más (escapesymas.com) · info@escapesymas.com',
+    ley_aplicable: 'Reglamento General de Protección de Datos (RGPD) y LOPDGDD (España)',
+    perfil: {
+      nombre_usuario: user.username,
+      email: user.email,
+      email_pendiente_de_confirmar: user.pending_email || null,
+      nombre: user.first_name || '',
+      apellidos: user.last_name || '',
+      telefono: billing.phone || '',
+      avatar: user.avatar_url || '',
+      rango: user.rank || 'Novato',
+      experiencia_xp: user.xp || 0,
+      cuenta_creada: user.created_at,
+      email_confirmado: user.email_verified_at,
+    },
+    datos_de_facturacion: billingRest,
+    direcciones_guardadas: Array.isArray(addresses) ? addresses : [],
+    motos_garaje: parse(user.garage, []) || [],
+    motos_registradas: await rows(sql`SELECT brand AS marca, model AS modelo, year AS anio, created_at AS fecha FROM garage WHERE user_id = ${userId} ORDER BY id`),
+    carrito: parse(user.cart, []) || [],
+    pedidos: orders.map((o) => ({
+      numero: formatOrderNumber(o.id, o.created_at),
+      fecha: o.created_at,
+      estado: o.status,
+      subtotal_eur: euros(o.subtotal),
+      descuento_eur: euros(o.discount_amount),
+      cupon: o.promo_code || null,
+      envio_eur: euros(o.shipping_cost),
+      impuestos_eur: euros(o.tax_amount),
+      total_eur: euros(o.total),
+      reembolsado_eur: euros(o.refunded_amount),
+      metodo_de_pago: o.payment_method || null,
+      pagado: o.paid_at,
+      datos_de_envio: parse(o.shipping_data, {}),
+      transportista: o.carrier || null,
+      seguimiento: o.tracking_number || null,
+      productos: items.filter((i) => i.order_id === o.id).map((i) => ({
+        producto: i.product_name || 'Producto eliminado',
+        cantidad: i.quantity,
+        precio_unidad_eur: euros(i.price),
+      })),
+    })),
+    solicitudes_de_reembolso: await rows(sql`
+      SELECT order_id AS pedido, scope AS alcance, items AS productos, amount_cents / 100.0 AS importe_eur,
+             reason_code AS motivo, reason AS explicacion, status AS estado, admin_note AS respuesta,
+             refunded_cents / 100.0 AS reembolsado_eur, created_at AS fecha, resolved_at AS resuelta
+      FROM refund_requests WHERE user_id = ${userId} ORDER BY id`),
+    resenas: await rows(sql`
+      SELECT p.name AS producto, r.rating AS puntuacion, r.title AS titulo, r.content AS texto,
+             r.status AS estado, r.created_at AS fecha
+      FROM product_reviews r LEFT JOIN products p ON p.id = r.product_id
+      WHERE r.user_id = ${userId} ORDER BY r.id`),
+    avisos_de_stock: await rows(sql`
+      SELECT p.name AS producto, s.created_at AS fecha, s.notified AS avisado
+      FROM stock_notifications s LEFT JOIN products p ON p.id = s.product_id
+      WHERE LOWER(s.email) = LOWER(${user.email}) ORDER BY s.id`),
+    chat_con_asesores: conversations.map((c) => ({
+      fecha: c.created_at,
+      cerrada: c.closed_at,
+      estado: c.status,
+      asesor: c.agent_name || null,
+      valoracion: c.rating,
+      comentario_valoracion: c.rating_comment || null,
+      mensajes: messages.filter((m) => m.conversation_id === c.id).map((m) => ({
+        de: m.sender, tipo: m.kind || 'text', texto: m.content, fecha: m.created_at,
+      })),
+    })),
+    chat_con_el_asistente: (await rows(sql`
+      SELECT messages, created_at, updated_at FROM ai_chat_sessions WHERE user_id = ${userId} ORDER BY id`))
+      .map((s) => ({ inicio: s.created_at, ultimo_mensaje: s.updated_at, mensajes: parse(s.messages, []) })),
+    foro: {
+      temas: await rows(sql`SELECT title AS titulo, content AS texto, created_at AS fecha FROM forum_posts WHERE user_id = ${userId} ORDER BY id`),
+      respuestas: await rows(sql`SELECT content AS texto, created_at AS fecha FROM forum_replies WHERE user_id = ${userId} ORDER BY id`),
+    },
+    dispositivos_con_notificaciones: Number((await rows(sql`SELECT COUNT(*)::int AS n FROM push_subscriptions WHERE user_id = ${userId}`))[0]?.n || 0),
+  };
+}
+
 /** Datos del usuario que se devuelven al iniciar sesión. */
 function sessionUser(user: any) {
   const parse = (v: any, fallback: any) => { try { return typeof v === 'string' ? JSON.parse(v) : (v ?? fallback); } catch { return fallback; } };
@@ -42,6 +182,7 @@ function sessionUser(user: any) {
     id: user.id,
     username: user.username,
     email: user.email,
+    pendingEmail: user.pending_email || '',
     firstName: user.first_name || '',
     lastName: user.last_name || '',
     avatarUrl: user.avatar_url || '',
@@ -206,6 +347,7 @@ authRouter.get('/auth', async (req, res) => {
         id: user.id,
         username: user.username,
         email: user.email,
+        pendingEmail: user.pending_email || '',
         firstName: user.first_name || '',
         lastName: user.last_name || '',
         avatarUrl: user.avatar_url || '',
@@ -216,6 +358,14 @@ authRouter.get('/auth', async (req, res) => {
         garage,
         cart
       });
+    } else if (action === 'export-data') {
+      // Siempre los datos del usuario de la sesión, nunca los de otro id.
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      const data = await exportUserData(auth.user_id);
+      if (!data) return res.status(404).json({ error: 'Usuario no encontrado' });
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json(data);
     } else if (action === 'search-users') {
       const { q } = req.query as any;
       if (!q) return res.json([]);
@@ -289,6 +439,7 @@ authRouter.post('/auth', async (req, res) => {
         id: user.id,
         username: user.username,
         email: user.email,
+        pendingEmail: user.pending_email || '',
         firstName: user.first_name || '',
         lastName: user.last_name || '',
         avatarUrl: user.avatar_url || '',
@@ -327,13 +478,26 @@ authRouter.post('/auth', async (req, res) => {
           return res.status(400).json({ error: `El nombre de usuario (@${cleanUsername}) ya está reservado por otro piloto.` });
         }
       }
-      if (email && email.toLowerCase() !== user.email.toLowerCase()) {
+      const newEmail = typeof email === 'string' ? email.trim() : '';
+      const emailChanged = Boolean(newEmail) && newEmail.toLowerCase() !== String(user.email).toLowerCase();
+      // Un administrador que corrige el email de otro cliente lo aplica directamente;
+      // el propio cliente tiene que confirmarlo desde la dirección nueva.
+      const confirmEmail = emailChanged && !(auth.role === 'admin' && targetUserId !== auth.user_id);
+      if (emailChanged) {
+        if (!EMAIL_RE.test(newEmail)) return res.status(400).json({ error: 'El email no es válido.' });
         const existRes = await db.execute(sql`
-          SELECT id FROM users WHERE LOWER(email) = LOWER(${email}) AND id != ${targetUserId}
+          SELECT id FROM users WHERE LOWER(email) = LOWER(${newEmail}) AND id != ${targetUserId}
         `);
         if (existRes.rows.length > 0) {
           return res.status(400).json({ error: 'El correo electrónico ya está registrado por otro usuario' });
         }
+        const sentAt = user.email_change_sent_at ? new Date(user.email_change_sent_at).getTime() : 0;
+        if (confirmEmail && Date.now() - sentAt < EMAIL_CHANGE_RESEND_SECONDS * 1000) {
+          return res.status(429).json({ error: 'Te acabamos de enviar un enlace de confirmación. Espera un minuto para pedir otro.' });
+        }
+      }
+      if (avatarUrl !== undefined && avatarUrl !== '' && !AVATAR_URL_RE.test(String(avatarUrl))) {
+        return res.status(400).json({ error: 'Avatar no válido.' });
       }
 
       const billingJson = billing !== undefined
@@ -349,14 +513,61 @@ authRouter.post('/auth', async (req, res) => {
           username = COALESCE(${cleanUsernameToSave || null}, username),
           first_name = COALESCE(${firstName || null}, first_name),
           last_name = COALESCE(${lastName || null}, last_name),
-          email = COALESCE(${email || null}, email),
+          email = COALESCE(${emailChanged && !confirmEmail ? newEmail : null}, email),
           billing = ${billingJson}::jsonb,
           garage = ${garageJson}::jsonb,
           avatar_url = COALESCE(${avatarUrl || null}, avatar_url)
         WHERE id = ${targetUserId}
       `);
 
+      if (confirmEmail) {
+        await sendEmailChangeEmail(user, newEmail);
+        return res.json({ success: true, pendingEmail: newEmail });
+      }
       return res.json({ success: true });
+    }
+
+    if (action === 'cancel-email-change') {
+      const auth = authenticateRequest(req);
+      if (!auth) return res.status(401).json({ error: 'No autenticado' });
+      await db.execute(sql`
+        UPDATE users SET pending_email = NULL, email_change_token_hash = NULL, email_change_expires = NULL
+        WHERE id = ${auth.user_id}`);
+      return res.json({ success: true });
+    }
+
+    if (action === 'confirm-email-change') {
+      const token = String(body.token || '');
+      if (!/^[a-f0-9]{64}$/.test(token)) return res.status(400).json({ error: 'Enlace no válido.', code: 'invalid_token' });
+      const found = await db.execute(sql`
+        SELECT id, pending_email FROM users
+        WHERE email_change_token_hash = ${sha256(token)} AND email_change_expires > NOW() AND pending_email IS NOT NULL`);
+      if (found.rows.length === 0) {
+        return res.status(400).json({ error: 'El enlace no es válido o ha caducado. Vuelve a cambiar el email desde «Mi perfil».', code: 'invalid_token' });
+      }
+      const pending = found.rows[0] as any;
+      const taken = await db.execute(sql`
+        SELECT id FROM users WHERE LOWER(email) = LOWER(${pending.pending_email}) AND id != ${pending.id}`);
+      if (taken.rows.length > 0) {
+        await db.execute(sql`
+          UPDATE users SET pending_email = NULL, email_change_token_hash = NULL, email_change_expires = NULL
+          WHERE id = ${pending.id}`);
+        return res.status(400).json({ error: 'Ese email ya lo usa otra cuenta.', code: 'email_taken' });
+      }
+      const updated = await db.execute(sql`
+        UPDATE users SET email = pending_email, pending_email = NULL,
+                         email_change_token_hash = NULL, email_change_expires = NULL,
+                         email_verified = TRUE, email_verified_at = NOW()
+        WHERE id = ${pending.id}
+        RETURNING *`);
+      const user = updated.rows[0] as any;
+      // El token de sesión lleva el email (avisos de pedidos y del carrito): si
+      // quien abre el enlace es el propio cliente con la sesión abierta, se renueva.
+      const auth = authenticateRequest(req);
+      if (auth && auth.user_id === user.id && !STAFF_ROLES.has(user.role)) {
+        setAuthCookie(res, generateJWT(user));
+      }
+      return res.json({ success: true, email: user.email });
     }
 
     if (action === 'change-password') {
@@ -367,6 +578,9 @@ authRouter.post('/auth', async (req, res) => {
       const targetId = (auth.role === 'admin' && requestedId) ? requestedId : auth.user_id;
       if (!targetId || !currentPassword || !newPassword) {
         return res.status(400).json({ error: 'Faltan datos obligatorios' });
+      }
+      if (String(newPassword).length < PASSWORD_MIN) {
+        return res.status(400).json({ error: `La nueva contraseña debe tener al menos ${PASSWORD_MIN} caracteres.` });
       }
 
       const userRes = await db.execute(sql`SELECT * FROM users WHERE id = ${targetId}`);
@@ -599,6 +813,9 @@ authRouter.post('/auth', async (req, res) => {
     if (action === 'register') {
       const { email, password, username, firstName, lastName } = body;
       if (!email || !password) return res.status(400).json({ error: 'Falta email o contraseña' });
+      if (String(password).length < PASSWORD_MIN) {
+        return res.status(400).json({ error: `La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.` });
+      }
 
       const existing = await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = LOWER(${email})`);
       if (existing.rows.length > 0) {

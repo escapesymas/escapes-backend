@@ -12,6 +12,7 @@
  *
  * Plantillas:
  *   - verify-email          confirmación de email al registrarse
+ *   - confirm-email-change  confirmación del email nuevo al cambiarlo en «Mi perfil»
  *   - order-confirmation    pedido pagado (con líneas y factura adjunta)
  *   - order-shipped         pedido enviado con seguimiento
  *   - order-cancelled       pedido cancelado
@@ -278,6 +279,32 @@ El enlace caduca en 24 horas. Si no has creado tú esta cuenta, ignora este mens
     ${fallbackLink(d.url)}
     ${note('El enlace caduca en 24 horas. Si no has creado tú esta cuenta, ignora este mensaje.')}
   `, 'Activa tu cuenta con un clic. El enlace caduca en 24 horas.');
+  return { subject, text, html };
+}
+
+export interface ConfirmEmailChangeData {
+  name?: string;
+  url: string;
+  newEmail: string;
+}
+
+export function confirmEmailChange(d: ConfirmEmailChangeData): RenderedEmail {
+  const subject = `Confirma tu nuevo email en ${BRAND}`;
+  const text = `Hola${d.name ? ` ${d.name}` : ''},
+
+Has pedido cambiar el email de tu cuenta de ${BRAND} a ${d.newEmail}. Para confirmarlo, abre este enlace:
+
+${d.url}
+
+Hasta que lo confirmes seguirás usando tu email anterior. El enlace caduca en 24 horas. Si no lo has pedido tú, ignora este mensaje.${signature}`;
+  const html = shell(`
+    ${heading('Confirma tu nuevo email')}
+    ${greeting(d.name)}
+    ${p(`Has pedido cambiar el email de tu cuenta a <strong>${escapeHtml(d.newEmail)}</strong>. Pulsa el botón para confirmarlo:`)}
+    ${button(d.url, 'Confirmar el cambio')}
+    ${fallbackLink(d.url)}
+    ${note('Hasta que lo confirmes seguirás usando tu email anterior. El enlace caduca en 24 horas. Si no lo has pedido tú, ignora este mensaje.')}
+  `, 'Confirma el cambio de email de tu cuenta. El enlace caduca en 24 horas.');
   return { subject, text, html };
 }
 
@@ -659,6 +686,7 @@ export function internal(d: InternalData): RenderedEmail {
 
 type TemplateMap = {
   'verify-email': VerifyEmailData;
+  'confirm-email-change': ConfirmEmailChangeData;
   'order-confirmation': OrderConfirmationData;
   'order-shipped': OrderShippedData;
   'order-cancelled': OrderCancelledData;
@@ -682,6 +710,7 @@ export type TemplateName = keyof TemplateMap;
 export function renderEmail<K extends keyof TemplateMap>(template: K, data: TemplateMap[K]): RenderedEmail {
   switch (template) {
     case 'verify-email':        return verifyEmail(data as any);
+    case 'confirm-email-change': return confirmEmailChange(data as any);
     case 'order-confirmation':  return orderConfirmation(data as any);
     case 'order-shipped':       return orderShipped(data as any);
     case 'order-cancelled':     return orderCancelled(data as any);
