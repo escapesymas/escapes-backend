@@ -9,6 +9,7 @@
 import webPush from 'web-push';
 import { db, pool } from './db.js';
 import { sql } from 'drizzle-orm';
+import { pushToUser, pushToAdmins } from './lib/agent-stream.js';
 
 // Claves VAPID. Las de respaldo son las que tiene ya registradas el iPhone del
 // administrador; si se configuran en el entorno, habrá que volver a activar
@@ -243,6 +244,8 @@ export async function notifyAgent(userId: number, notice: AgentNotice, opts: { p
   } catch (err: any) {
     console.error('[AGENT NOTICE ERROR]:', err.message);
   }
+  // Programa de escritorio abierto: el aviso llega al momento.
+  pushToUser(userId, { category: notice.category, title: notice.title, body: notice.body, url: notice.url });
   if (opts.push !== false) {
     await sendPushToUser(userId, { title: notice.title, body: notice.body || '', url: notice.url || '/?tab=chat', tag: notice.tag });
   }
@@ -421,6 +424,7 @@ export async function notifyNewUser(user: { name: string; email: string }) {
  */
 export async function notifyLiveChat(info: { conversationId: number; title: string; body: string; agentUserId?: number | null }) {
   const url = adminUrl('chat', { chat: info.conversationId });
+  pushToAdmins({ category: 'chat', title: info.title, body: info.body, url });
   await sendNotificationToAll({
     title: info.title,
     body: info.body,

@@ -4,6 +4,7 @@ import {
   getSubscriptionPreferences, listNotifications, markNotificationsRead, unreadCount, NOTIFICATION_CATEGORIES,
   listAgentNotifications, markAgentNotificationsRead,
 } from '../pushService.js';
+import { addStreamClient, writeEvent } from '../lib/agent-stream.js';
 import { authenticateRequest } from '../utils.js';
 import { requireAgent } from '../lib/agent-auth.js';
 
@@ -173,4 +174,26 @@ pushRouter.post('/agent/notifications/read', async (req, res) => {
     console.error('[AGENT NOTICES READ ERROR]:', err.message);
     return res.status(500).json({ error: 'No se pudo actualizar' });
   }
+});
+
+// GET /api/agent/stream — avisos en directo para el programa de escritorio
+// (server-sent events). Al conectar manda `hello` con los avisos sin leer y
+// cada 25 s un comentario para que ningún proxy dé la conexión por muerta.
+pushRouter.get('/agent/stream', async (req, res) => {
+  const auth = await requireAgent(req, res);
+  if (!auth) return;
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  const remove = addStreamClient(auth.user_id, auth.isAdmin, res);
+  try {
+    const { unread } = await listAgentNotifications(auth.user_id, { limit: 1 });
+    writeEvent(res, 'hello', { unread });
+  } catch {
+    writeEvent(res, 'hello', { unread: 0 });
+  }
+  const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* cerrada */ } }, 25_000);
+  req.on('close', () => { clearInterval(ping); remove(); });
 });
