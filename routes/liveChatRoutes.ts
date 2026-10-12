@@ -520,7 +520,7 @@ export async function notifyCustomer(conv: any, agentName: string, preview: stri
 }
 
 /** Mensaje del asesor de cualquier tipo (texto, producto, imagen o pedido). */
-async function agentSend(
+export async function agentSend(
   conversationId: number, agent: AgentAuth, kind: ChatMessageKind, content: string, payload: any, preview: string,
 ) {
   const adminUserId = agent.user_id;

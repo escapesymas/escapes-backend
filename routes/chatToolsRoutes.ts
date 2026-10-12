@@ -19,6 +19,7 @@ import { minimaxClient, CHAT_MODEL } from '../chatbot/minimax.js';
 import { formatOrderNumber } from '../lib/email-templates.js';
 import {
   agentFor, customer, customerName, parseId, clean, PAID_STATUSES, CHAT_UPLOAD_DIR, imageUpload,
+  agentSend, AgentBusyError,
 } from './liveChatRoutes.js';
 
 export const chatToolsRouter = Router();
@@ -172,6 +173,44 @@ chatToolsRouter.get('/admin/quick-replies', async (req: any, res: any) => {
     `SELECT id, title, body, owner_user_id FROM chat_quick_replies
      WHERE owner_user_id IS NULL OR owner_user_id = $1 ORDER BY (owner_user_id IS NULL) DESC, title`, [auth.user_id]);
   res.json({ replies: rows.map((r: any) => ({ ...r, global: r.owner_user_id == null, editable: r.owner_user_id === auth.user_id || (r.owner_user_id == null && auth.isAdmin) })) });
+});
+
+// POST /api/admin/chats/:id/quick-reply { replyId } — envía una respuesta rápida
+// (desde la notificación del programa de escritorio) con sus variables rellenas.
+chatToolsRouter.post('/admin/chats/:id/quick-reply', async (req: any, res: any) => {
+  const id = parseInt(req.params.id, 10);
+  const replyId = parseInt(req.body?.replyId, 10);
+  if (!Number.isFinite(id) || !Number.isFinite(replyId)) return res.status(400).json({ error: 'Datos no válidos' });
+  const auth = await agentFor(req, res, id);
+  if (!auth) return;
+  try {
+    const { rows: [r] } = await pool.query(
+      `SELECT body FROM chat_quick_replies WHERE id = $1 AND (owner_user_id IS NULL OR owner_user_id = $2)`, [replyId, auth.user_id]);
+    if (!r) return res.status(404).json({ error: 'Respuesta rápida no encontrada' });
+    const { rows: [conv] } = await pool.query(`SELECT user_id FROM chat_conversations WHERE id = $1`, [id]);
+    if (!conv) return res.status(404).json({ error: 'Conversación no encontrada' });
+    const { rows: [u] } = await pool.query(`SELECT first_name, garage FROM users WHERE id = $1`, [conv.user_id]);
+    let moto = '';
+    try {
+      const g = typeof u?.garage === 'string' ? JSON.parse(u.garage) : u?.garage;
+      const first = Array.isArray(g) ? g[0] : null;
+      moto = first ? [first.brand, first.model, first.year].filter(Boolean).join(' ') : '';
+    } catch { /* sin garaje */ }
+    // Las mismas variables que en el panel (QuickReplies.tsx).
+    const content = String(r.body)
+      .replace(/\{cliente\}/g, u?.first_name || '')
+      .replace(/\{moto\}/g, moto || 'tu moto')
+      .replace(/\{asesor\}/g, await agentNameFor(auth.user_id))
+      .replace(/\s+([,.!?])/g, '$1')
+      .trim();
+    const out = await agentSend(id, auth, 'text', content, null, content);
+    if (!out) return res.status(409).json({ error: 'La conversación está cerrada.' });
+    res.json(out);
+  } catch (err: any) {
+    if (err instanceof AgentBusyError) return res.status(409).json({ error: err.message });
+    console.error('[CHAT TOOLS] quick reply:', err.message);
+    res.status(500).json({ error: 'No se pudo enviar' });
+  }
 });
 
 // POST /api/admin/quick-replies { title, body, global } — «global» (para todos) solo administradores.

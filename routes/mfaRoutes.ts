@@ -321,3 +321,57 @@ mfaRouter.post('/mfa/recovery/regenerate', async (req, res) => {
     [s.userId, JSON.stringify(codes.map((c) => sha256(normCode(c))))]);
   res.json({ recoveryCodes: codes });
 });
+
+// ---------------------------------------------------------------- programa de escritorio
+
+const DEVICE_DAYS = 30;
+
+// POST /api/mfa/device-token { name } — el programa de escritorio de asesores pide
+// recordar este dispositivo. Solo con la sesión completa (dos pasos hechos).
+mfaRouter.post('/mfa/device-token', async (req, res) => {
+  const s = await staff(req, res, { allowPending: false });
+  if (!s) return;
+  const token = crypto.randomBytes(32).toString('hex');
+  const name = String(req.body?.name || '').replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, 80) || 'Programa de escritorio';
+  await pool.query(
+    `INSERT INTO staff_devices (user_id, token_hash, name, expires_at) VALUES ($1, $2, $3, NOW() + ($4 || ' days')::interval)`,
+    [s.userId, sha256(token), name, String(DEVICE_DAYS)]);
+  res.json({ token, days: DEVICE_DAYS });
+});
+
+// POST /api/mfa/device-refresh { token } — sesión nueva de 24 h para un dispositivo
+// recordado (sin contraseña ni código). Cada uso alarga la caducidad 30 días.
+mfaRouter.post('/mfa/device-refresh', mfaLimiter, async (req, res) => {
+  const token = String(req.body?.token || '');
+  if (!/^[a-f0-9]{64}$/.test(token)) return res.status(401).json({ error: 'Dispositivo no reconocido' });
+  const { rows: [d] } = await pool.query(
+    `UPDATE staff_devices SET last_used_at = NOW(), expires_at = NOW() + ($2 || ' days')::interval
+     WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW() RETURNING user_id`,
+    [sha256(token), String(DEVICE_DAYS)]);
+  if (!d) return res.status(401).json({ error: 'Dispositivo no reconocido o caducado. Vuelve a iniciar sesión.' });
+  const { rows: [user] } = await pool.query(`SELECT * FROM users WHERE id = $1`, [d.user_id]);
+  if (!user || !STAFF_ROLES.has(user.role)) {
+    await pool.query(`UPDATE staff_devices SET revoked_at = NOW() WHERE token_hash = $1`, [sha256(token)]);
+    return res.status(401).json({ error: 'Esta cuenta ya no tiene acceso al panel' });
+  }
+  res.json({ token: generateJWT(user, { mfa: true }) });
+});
+
+// GET /api/mfa/devices — programas de escritorio recordados de la cuenta.
+mfaRouter.get('/mfa/devices', async (req, res) => {
+  const s = await staff(req, res, { allowPending: false });
+  if (!s) return;
+  const { rows } = await pool.query(
+    `SELECT id, name, created_at, last_used_at, expires_at FROM staff_devices
+     WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW() ORDER BY id DESC`, [s.userId]);
+  res.json({ devices: rows });
+});
+
+// DELETE /api/mfa/devices/:id — olvidar un dispositivo (tendrá que volver a iniciar sesión).
+mfaRouter.delete('/mfa/devices/:id', async (req, res) => {
+  const s = await staff(req, res, { allowPending: false });
+  if (!s) return;
+  await pool.query(`UPDATE staff_devices SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
+    [parseInt(req.params.id, 10) || 0, s.userId]);
+  res.json({ ok: true });
+});

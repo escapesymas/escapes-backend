@@ -113,6 +113,8 @@ agentRouter.post('/admin/agents/:userId/revoke', async (req: any, res: any) => {
   try {
     const { rowCount } = await pool.query(`UPDATE users SET role = 'customer' WHERE id = $1 AND role = 'asesor'`, [userId]);
     if (!rowCount) return res.status(400).json({ error: 'Esa cuenta no es de asesor' });
+    // Sus programas de escritorio recordados dejan de servir.
+    await pool.query(`UPDATE staff_devices SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
     forgetRole(userId);
     await setAgentOnline(userId, false);
     const { rows } = await pool.query(
