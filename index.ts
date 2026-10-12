@@ -56,6 +56,7 @@ import { liveChatRouter, linkChatOrder, chatOrderPaid, proposalOverrides } from 
 import { agentRouter } from './routes/agentRoutes.js';
 import { chatToolsRouter, startChatJobs } from './routes/chatToolsRoutes.js';
 import { mfaRouter } from './routes/mfaRoutes.js';
+import { motoAlertRouter } from './routes/motoAlertRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -738,6 +739,7 @@ app.use('/api', liveChatRouter);
 app.use('/api', agentRouter);
 app.use('/api', chatToolsRouter);
 app.use('/api', mfaRouter);
+app.use('/api', motoAlertRouter);
 
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
 // /uploads se sirve como estático en el mismo origen, así que nunca se debe
@@ -6150,6 +6152,25 @@ async function sendDailySummary(force = false) {
 setInterval(() => {
   sendDailySummary().catch((e) => console.error('[DAILY SUMMARY ERROR]:', e.message));
 }, 5 * 60_000);
+
+// Avisos de piezas nuevas para la moto: una pasada al día a partir de las 10:00
+// (además de la que se hace al terminar cada actualización del catálogo de Bihr).
+async function dailyMotoAlerts() {
+  const madrid = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const get = (t: string) => madrid.find((x) => x.type === t)?.value || '';
+  if (parseInt(get('hour')) < 10) return;
+  const today = `${get('year')}-${get('month')}-${get('day')}`;
+  const claim = await pool.query(
+    `INSERT INTO catalog_meta (key, value) VALUES ('moto_alerts_daily', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value WHERE catalog_meta.value <> EXCLUDED.value
+     RETURNING value`, [today]);
+  if (!claim.rows.length) return;
+  await (await import('./lib/moto-alerts.js')).runMotoAlerts('diaria');
+}
+
+setInterval(() => {
+  dailyMotoAlerts().catch((e) => console.error('[MOTO ALERTS ERROR]:', e.message));
+}, 10 * 60_000);
 
 // ================================================================
 // PERSISTENT CART ENDPOINTS

@@ -542,6 +542,12 @@ async function processPricesCatalog(catalog: any, catalogType: string, startTime
     console.log(`[BIHR SERVICE]: DTO2 actualizado en ${n} productos; promociones: ${promos.applied} aplicadas, ${promos.removed} retiradas.`);
   }
   updateCatalogSyncState({ status: 'completed', catalogType, startTime, endTime: new Date().toISOString(), inserted: 0, updated });
+
+  // Último paso de la actualización del catálogo (productos → compatibilidades →
+  // precios): avisar a los clientes de las piezas nuevas para sus motos.
+  import('./lib/moto-alerts.js')
+    .then((m) => m.runMotoAlerts('catalogo'))
+    .catch((e) => console.error('[BIHR SERVICE] Error con los avisos de piezas nuevas:', e));
 }
 
 async function processCatalogJson(filePath: string, catalogType: string, startTime: string) {
