@@ -301,6 +301,7 @@ function getCatalogData() {
     try {
       if (fs.existsSync(p)) {
         catalogDataCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        mergeExtraMotos(catalogDataCache, path.join(path.dirname(p), 'moto_catalog_extra.json'));
         return catalogDataCache;
       }
     } catch {
@@ -310,6 +311,28 @@ function getCatalogData() {
 
   catalogDataCache = { hierarchy: {}, compatibility: {} };
   return catalogDataCache;
+}
+
+/**
+ * Motos añadidas a mano (moto_catalog_extra.json) que Bihr aún no tiene, p. ej.
+ * Cyclone: así el cliente puede elegirlas en el selector y guardarlas en su garaje.
+ * Solo añade marcas, modelos y años que falten; nunca pisa los datos de Bihr.
+ */
+function mergeExtraMotos(catalog: any, file: string) {
+  try {
+    if (!fs.existsSync(file)) return;
+    const extra = JSON.parse(fs.readFileSync(file, 'utf-8'))?.hierarchy || {};
+    catalog.hierarchy ||= {};
+    for (const [brand, models] of Object.entries<any>(extra)) {
+      const b = (catalog.hierarchy[brand] ||= {});
+      for (const [model, years] of Object.entries<any>(models)) {
+        const m = (b[model] ||= {});
+        for (const [year, codes] of Object.entries<any>(years)) m[year] ||= codes;
+      }
+    }
+  } catch (e: any) {
+    console.warn('[CATALOG] moto_catalog_extra.json no válido:', e.message);
+  }
 }
 
 
@@ -341,7 +364,7 @@ function parseTitleYears(title: string): [number, number] | null {
 catalogRouter.get('/vehicles', async (req, res) => {
   const { action, brand, model, year } = req.query as any;
   try {
-    const redisKey = `cache:vehicles:v6:${action || ''}:${brand || ''}:${model || ''}:${year || ''}`;
+    const redisKey = `cache:vehicles:v7:${action || ''}:${brand || ''}:${model || ''}:${year || ''}`;
     const cached = await cacheGet<any>(redisKey);
     if (cached) return res.json(cached);
 

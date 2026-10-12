@@ -48,6 +48,8 @@ COPY --chown=backend:nodejs templates/ ./templates/
 # Migraciones SQL versionadas (lib/migrate.ts las aplica al arrancar)
 COPY --chown=backend:nodejs migrations/ ./migrations/
 COPY --chown=backend:nodejs moto_catalog.jso[n] ./
+# Motos añadidas a mano que Bihr aún no tiene (se fusionan con moto_catalog.json)
+COPY --chown=backend:nodejs moto_catalog_extra.json ./
 COPY --chown=backend:nodejs catalog-csv.zi[p] ./
 
 # El hook post-deploy vive en el servidor (/usr/local/bin/escapes-post-deploy.sh,

@@ -1,0 +1,69 @@
+{
+  "_nota": "Motos que añadimos a mano porque Bihr aún no las tiene (para que el cliente pueda elegirlas y guardarlas). Se fusionan con moto_catalog.json sin pisar lo de Bihr. Años vacíos = sin códigos de compatibilidad todavía.",
+  "hierarchy": {
+    "CYCLONE": {
+      "AQS401": {
+        "2026": []
+      },
+      "BATTLO": {
+        "2024": [],
+        "2025": [],
+        "2026": []
+      },
+      "CARRERA": {
+        "2025": [],
+        "2026": []
+      },
+      "RA1000": {
+        "2026": []
+      },
+      "RA125 PLUS": {
+        "2025": [],
+        "2026": []
+      },
+      "RA2": {
+        "2025": [],
+        "2026": []
+      },
+      "RA600": {
+        "2026": []
+      },
+      "RT1": {
+        "2025": [],
+        "2026": []
+      },
+      "RT2": {
+        "2025": [],
+        "2026": []
+      },
+      "RT3S": {
+        "2025": [],
+        "2026": []
+      },
+      "RX1": {
+        "2024": []
+      },
+      "RX1 PRO": {
+        "2025": [],
+        "2026": []
+      },
+      "RX2": {
+        "2025": [],
+        "2026": []
+      },
+      "RX4": {
+        "2024": [],
+        "2025": [],
+        "2026": []
+      },
+      "RX6": {
+        "2025": [],
+        "2026": []
+      },
+      "RX600": {
+        "2025": [],
+        "2026": []
+      }
+    }
+  }
+}
