@@ -7,6 +7,8 @@
 //     422 si no es una imagen admitida · 503 si está saturado
 //   GET /salud → 200
 import http from 'node:http';
+import net from 'node:net';
+import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -132,12 +134,50 @@ const server = http.createServer(async (req, res) => {
 });
 server.requestTimeout = 60_000;
 
-// Un socket que quedó de un arranque anterior impide escuchar: se borra.
-fs.rmSync(SOCKET, { force: true });
-server.listen(SOCKET, () => {
+// Cada contenedor escucha en su propio socket y SOCKET es un enlace a él. En un
+// redespliegue arranca el nuevo antes de parar el viejo, y al cerrarse un socket
+// Node borra su fichero: con una ruta compartida, el viejo borraría la del nuevo.
+const DIR = path.dirname(SOCKET);
+const OWN = path.join(DIR, `imagenes-${os.hostname()}.sock`);
+
+/** Borra los sockets de contenedores que ya no existen (nadie escucha en ellos). */
+function cleanStaleSockets() {
+  for (const f of fs.readdirSync(DIR)) {
+    const p = path.join(DIR, f);
+    if (!/^imagenes-.+\.sock$/.test(f) || p === OWN) continue;
+    const c = net.connect(p);
+    c.on('connect', () => c.destroy());
+    c.on('error', (e) => { if (e.code === 'ECONNREFUSED') fs.rmSync(p, { force: true }); });
+  }
+}
+
+/** Cambio atómico del enlace: el backend pasa a este contenedor sin cortes. */
+function linkToOwn() {
+  const tmp = `${SOCKET}.${os.hostname()}.tmp`;
+  fs.rmSync(tmp, { force: true });
+  fs.symlinkSync(path.basename(OWN), tmp);
+  fs.renameSync(tmp, SOCKET);
+}
+
+fs.rmSync(OWN, { force: true });
+server.listen(OWN, () => {
   // El backend corre con otro usuario: tiene que poder conectarse.
-  fs.chmodSync(SOCKET, 0o666);
-  console.log(`[IMAGENES] escuchando en ${SOCKET}`);
+  fs.chmodSync(OWN, 0o666);
+  linkToOwn();
+  console.log(`[IMAGENES] escuchando en ${OWN} (enlace ${SOCKET})`);
+  cleanStaleSockets();
+  // Si el enlace desaparece o apunta a un contenedor que ya no está, vuelve a
+  // este; si apunta a otro contenedor vivo, se respeta.
+  const relink = () => { linkToOwn(); console.log('[IMAGENES] enlace recuperado'); };
+  setInterval(() => {
+    let target = null;
+    try { target = path.join(DIR, fs.readlinkSync(SOCKET)); } catch { /* no hay enlace */ }
+    if (target === OWN) return;
+    if (!target) return relink();
+    const c = net.connect(target);
+    c.on('connect', () => c.destroy());
+    c.on('error', relink);
+  }, 5000).unref();
 });
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
