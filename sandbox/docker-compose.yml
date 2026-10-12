@@ -1,0 +1,27 @@
+# Procesador de imágenes aislado (app aparte en Coolify, build pack Docker
+# Compose, con este fichero). Abre las fotos que suben clientes y asesores y
+# las de los proveedores, para que un archivo malicioso no llegue nunca al
+# proceso del backend, que tiene la base de datos y las claves.
+#
+# Sin red, sin variables de entorno ni secretos, disco de solo lectura, sin
+# privilegios y con memoria y procesos limitados. Lo único compartido es la
+# carpeta del socket, que el backend ve dentro de su volumen de subidas
+# (/app/server/uploads/.imgsock; no se publica: no entra en PUBLIC_UPLOAD_RE).
+services:
+  imagenes:
+    build: .
+    restart: unless-stopped
+    network_mode: none
+    read_only: true
+    user: "61010:61010"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - /data/escapes-uploads/.imgsock:/run/imgsock

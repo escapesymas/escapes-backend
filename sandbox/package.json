@@ -1,0 +1,13 @@
+{
+  "name": "escapes-imagenes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Procesador de imágenes aislado (sin red ni secretos) para escapes-backend",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "sharp": "0.35.5"
+  }
+}
