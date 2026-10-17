@@ -47,14 +47,14 @@ const safeSkuForFile = (sku: string) => String(sku || '').replace(/[^A-Za-z0-9._
 
 /** Cuenta lo que le pasó a una descarga en castellano (fetch solo dice «fetch failed»). */
 function explain(err: any): string {
-  const code = String(err?.cause?.code || err?.code || '');
+  const code = String(err?.cause?.code || err?.code || err?.errors?.[0]?.code || '');
   if (err?.name === 'TimeoutError' || err?.name === 'AbortError') return 'sin respuesta a tiempo';
   if (code === 'ENOTFOUND') return 'no se encuentra el servidor (DNS)';
   if (code === 'ECONNREFUSED') return 'conexión rechazada';
   if (code === 'ECONNRESET' || code === 'UND_ERR_SOCKET') return 'conexión cortada por el servidor';
   if (/^UNABLE_TO_(VERIFY|GET)/.test(code)) return `el certificado del servidor no se puede verificar (${code}); no se pudo completar la cadena de certificados`;
   if (/CERT|TLS|SSL/.test(code)) return `error de certificado (${code})`;
-  if (err?.message === 'fetch failed') return `fallo de red${code ? ` (${code})` : ''}`;
+  if (err?.message === 'fetch failed' || err instanceof AggregateError) return `fallo de red${code ? ` (${code})` : ''}`;
   return err?.message || String(err);
 }
 
@@ -102,8 +102,10 @@ async function rangeFetch(zipUrl: string, range: ByteRange, timeoutMs: number): 
       const location = r.headers.location;
       const next = location ? new URL(location, current) : null;
       if (!next || hop >= 3) throw new Error(`redirección ${r.status} sin destino`);
-      if (next.host !== new URL(zipUrl).host && !(next.protocol === 'https:' && BIHR_REDIRECT_HOST.test(next.hostname))) {
-        throw new Error(`redirección a ${next.host} no permitida`);
+      const origin = new URL(zipUrl);
+      const bihrHost = next.protocol === 'https:' && BIHR_REDIRECT_HOST.test(next.hostname);
+      if ((origin.protocol === 'https:' && next.protocol !== 'https:') || (next.host !== origin.host && !bihrHost)) {
+        throw new Error(`redirección a ${next.protocol}//${next.host} no permitida`);
       }
       current = next.toString();
       continue;
