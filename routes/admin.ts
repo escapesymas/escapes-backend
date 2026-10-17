@@ -11,6 +11,7 @@ import { LATEST_CATALOG_JSON } from '../bihrService.js';
 import { cacheBust } from '../lib/cache.js';
 import { repairProductImages } from '../lib/bihr-images.js';
 import { getImageAudit, filterAuditItems, auditToCsv, recheckProductImages } from '../lib/image-audit.js';
+import { startRepairJob, stopRepairJob, getRepairJobState, RepairJobBusy } from '../lib/image-repair-job.js';
 
 export const adminRouter = Router();
 
@@ -200,4 +201,26 @@ adminRouter.get('/admin/catalog/image-audit', requireAdmin, async (req: any, res
     console.error('[IMAGE AUDIT ERROR]:', err.message);
     return res.status(500).json({ error: err.message });
   }
+});
+
+// Descarga en bloque de las fotos de los productos sin imagen (ver lib/image-repair-job.ts).
+// POST empieza (scope: 'stock' = solo con stock, 'all' = todos; useApi; concurrency), GET da el estado, POST /stop para.
+adminRouter.post('/admin/catalog/image-repair', requireAdmin, async (req: any, res: any) => {
+  try {
+    const job = await startRepairJob({ scope: req.body?.scope, useApi: req.body?.useApi, concurrency: req.body?.concurrency });
+    console.log(`[IMAGE REPAIR JOB] lanzado por ${req.user?.email || req.user?.id || 'admin'} (${job.scope})`);
+    return res.status(202).json(job);
+  } catch (err: any) {
+    if (err instanceof RepairJobBusy) return res.status(409).json({ error: err.message, state: getRepairJobState() });
+    console.error('[IMAGE REPAIR JOB ERROR]:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+adminRouter.get('/admin/catalog/image-repair', requireAdmin, (_req: any, res: any) => res.json(getRepairJobState()));
+
+adminRouter.post('/admin/catalog/image-repair/stop', requireAdmin, (req: any, res: any) => {
+  const job = stopRepairJob();
+  console.log(`[IMAGE REPAIR JOB] parada pedida por ${req.user?.email || req.user?.id || 'admin'} (${job.status})`);
+  return res.json(job);
 });
