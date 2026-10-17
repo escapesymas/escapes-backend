@@ -7,7 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 import { pool } from '../db.js';
-import { generateCopy, generateImages, productBySku, pickProduct, withBestImageFirst, SlotProduct } from './socialContentAI.js';
+import { generateCopy, generateImages, productBySku, pickProduct, withBestImageFirst, withLoadableImages, SlotProduct } from './socialContentAI.js';
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
 import { composeAll, composePromo, composeSlide, composeProductCard } from './socialPromo.js';
 import { generateCampaignCopy, generateScene, Slide } from './socialCampaign.js';
@@ -272,6 +272,20 @@ export async function generatePending(days = 7): Promise<{ queued: number; alrea
   return { queued: ids.length, alreadyRunning: false };
 }
 
+/** Producto sorteado cuyas fotos se pueden descargar; salta los que tienen la ficha apuntando a fotos que ya no existen. */
+async function pickProductWithPhoto(): Promise<SlotProduct | null> {
+  const skipped: string[] = [];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = await pickProduct(skipped);
+    if (!candidate) return null;
+    const product = await withLoadableImages(candidate);
+    if (product.images.length) return product;
+    console.warn(`[SOCIAL CONTENT] ${candidate.sku}: sin fotos descargables, se sortea otro producto`);
+    skipped.push(candidate.sku);
+  }
+  throw new Error('No se encontró un producto con fotos descargables; vuelve a intentarlo');
+}
+
 /** Genera copy + imágenes para un slot y lo deja en estado "ready". Si falla, vuelve a "draft" con el error. */
 async function generateSlotContent(id: number) {
   const { rows: [slot] } = await pool.query('SELECT * FROM social_content_calendar WHERE id = $1', [id]);
@@ -281,7 +295,15 @@ async function generateSlotContent(id: number) {
     // Siempre sobre un producto real: el elegido o uno de las marcas destacadas.
     let product = slot.product_sku ? await productBySku(slot.product_sku) : null;
     if (slot.product_sku && !product) throw new Error(`El producto ${slot.product_sku} no existe o no está publicado`);
-    if (!product) product = await pickProduct();
+    if (product) {
+      const photos = product.images.length;
+      product = await withLoadableImages(product);
+      if (photos && !product.images.length) {
+        throw new Error(`No se puede descargar ninguna foto del producto ${product.sku} (el catálogo apunta a fotos del proveedor que ya no existen). Elige otro producto`);
+      }
+    } else {
+      product = await pickProductWithPhoto();
+    }
     if (product) product = await withBestImageFirst(product);
 
     const copy = await generateCopy({ format: slot.format, topic: slot.topic, product });

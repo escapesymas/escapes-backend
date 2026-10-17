@@ -35,6 +35,7 @@ export async function composeProductCarousel(slides: ProductSlide[], productSku:
   const p = productSku ? await productBySku(productSku) : null;
   const brand = p?.brand || null;
   const out: string[] = [];
+  let firstError = '';
   for (let i = 0; i < slides.length; i++) {
     const sl = slides[i];
     const isLast = i === slides.length - 1;
@@ -45,7 +46,10 @@ export async function composeProductCarousel(slides: ProductSlide[], productSku:
       } else out.push(await composeProductCard(sl.image, sl, { brand, accent: isLast }, platform));
     } catch (err: any) {
       console.warn('[SOCIAL CAROUSEL] diapositiva', i, err.message);
+      firstError ||= err.message;
     }
   }
+  // Si no sale ninguna, el motivo (p. ej. la foto no se descarga) llega al panel en vez de un error genérico.
+  if (!out.length && firstError) throw new Error(`No se pudieron componer las diapositivas (${firstError})`);
   return out;
 }

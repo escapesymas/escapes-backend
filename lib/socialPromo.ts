@@ -13,6 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import sharp, { type OverlayOptions, type Sharp } from 'sharp';
 import { processImage } from './image-sandbox.js';
+import { fetchRemoteImage } from './remote-image.js';
 import { pool } from '../db.js';
 
 export type Platform = 'tiktok' | 'instagram';
@@ -72,13 +73,7 @@ async function readRawImage(src: string): Promise<Buffer> {
     if (!file.startsWith(UPLOADS)) throw new Error('Ruta no permitida');
     return fs.promises.readFile(file);
   }
-  if (/^https?:\/\//.test(src)) {
-    const r = await fetch(src, { signal: AbortSignal.timeout(20_000) });
-    if (!r.ok) throw new Error(`No se pudo descargar la imagen (${r.status})`);
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > 15 * 1024 * 1024) throw new Error('Imagen demasiado grande');
-    return buf;
-  }
+  if (/^https?:\/\//.test(src)) return (await fetchRemoteImage(src, 20_000)).data;
   throw new Error('Imagen no válida');
 }
 
