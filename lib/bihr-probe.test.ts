@@ -21,7 +21,10 @@ describe('checkProbeUrl', () => {
 describe('probeImageUrl', () => {
   it('prueba cuatro formas de pedirla y cuenta lo que contesta cada una, sin seguir redirecciones', async () => {
     const calls: { headers: Record<string, string>; redirect: string }[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => {
+    const requested: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: any, init: any) => {
+      if (String(input).endsWith('/cdn-cgi/trace')) return new Response('fl=1\nip=203.0.113.9\nuag=secreto\nloc=DE\nhttp=http/1.1\n', { status: 200 });
+      requested.push(String(input));
       calls.push({ headers: init.headers, redirect: init.redirect });
       const browser = /Chrome/.test(init.headers['User-Agent'] || '') && !!init.headers.Referer;
       if (browser) return new Response(JPEG, { status: 200, headers: { 'content-type': 'image/jpeg', server: 'cloudflare', 'cf-ray': 'abc-MAD', 'set-cookie': 'secreto=1' } });
@@ -29,13 +32,18 @@ describe('probeImageUrl', () => {
     }));
     const probe = await probeImageUrl(new URL(URL_OK));
     expect(probe.url).toBe('api.mybihr.com/medias/1008253-1-800Wx800H'); // sin el context firmado
-    expect(probe.results).toHaveLength(4);
+    expect(probe.results).toHaveLength(6); // las cuatro formas, sin context y la forma corta
     expect(calls.every((c) => c.redirect === 'manual')).toBe(true);
-    expect(probe.results.map((r) => r.status)).toEqual([404, 200, 404, 404]);
+    expect(probe.results.map((r) => r.status)).toEqual([404, 200, 404, 404, 200, 200]);
+    expect(probe.sent).toEqual({ length: URL_OK.length, end: URL_OK.slice(-8) });
+    expect(requested.slice(0, 4).every((u) => u === URL_OK)).toBe(true);
+    expect(requested[4]).toBe('https://api.mybihr.com/medias/1008253-1-800Wx800H'); // sin context
+    expect(requested[5]).toBe('https://api.mybihr.com/medias/800Wx800H-1008253-1.jpg'); // forma corta
+    expect(probe.trace).toEqual({ estado: '200', ip: '203.0.113.9', loc: 'DE', http: 'http/1.1' }); // solo las claves útiles
     expect(probe.results[1]).toMatchObject({ isImage: true, contentType: 'image/jpeg', bytes: JPEG.length });
     expect(probe.results[1].headers).toEqual({ server: 'cloudflare', 'cf-ray': 'abc-MAD', 'content-type': 'image/jpeg' }); // sin set-cookie
     expect(probe.results[0]).toMatchObject({ isImage: false, bodyStart: 'Not Found <html>' });
-    expect(calls[3].headers).toEqual({}); // la última no manda nada propio
+    expect(calls[3].headers).toEqual({}); // la cuarta no manda nada propio
   });
 
   it('un fallo de red o un tiempo agotado se cuenta en esa variante y no rompe las demás', async () => {
@@ -47,7 +55,7 @@ describe('probeImageUrl', () => {
       return new Response(JPEG, { status: 200, headers: { 'content-type': 'image/jpeg' } });
     }));
     const { results } = await probeImageUrl(new URL(URL_OK));
-    expect(results.map((r) => r.error ?? r.status)).toEqual(['ECONNRESET', 'sin respuesta a tiempo', 200, 200]);
+    expect(results.slice(0, 4).map((r) => r.error ?? r.status)).toEqual(['ECONNRESET', 'sin respuesta a tiempo', 200, 200]);
   });
 
   it('lee como mucho 64 KB de la respuesta', async () => {
