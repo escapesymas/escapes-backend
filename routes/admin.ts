@@ -11,6 +11,7 @@ import { LATEST_CATALOG_JSON } from '../bihrService.js';
 import { cacheBust } from '../lib/cache.js';
 import { repairProductImages } from '../lib/bihr-images.js';
 import { getImageAudit, filterAuditItems, auditToCsv, recheckProductImages } from '../lib/image-audit.js';
+import { checkProbeUrl, probeImageUrl } from '../lib/bihr-probe.js';
 import { startRepairJob, stopRepairJob, getRepairJobState, RepairJobBusy } from '../lib/image-repair-job.js';
 
 export const adminRouter = Router();
@@ -223,4 +224,16 @@ adminRouter.post('/admin/catalog/image-repair/stop', requireAdmin, (req: any, re
   const job = stopRepairJob();
   console.log(`[IMAGE REPAIR JOB] parada pedida por ${req.user?.email || req.user?.id || 'admin'} (${job.status})`);
   return res.json(job);
+});
+
+// Prueba un enlace de foto de Bihr desde el servidor, de varias maneras (ver lib/bihr-probe.ts).
+adminRouter.post('/admin/catalog/probe-image-url', requireAdmin, async (req: any, res: any) => {
+  const checked = checkProbeUrl(req.body?.url);
+  if ('error' in checked) return res.status(400).json({ error: checked.error });
+  try {
+    return res.json(await probeImageUrl(checked.url));
+  } catch (err: any) {
+    console.error('[PROBE IMAGE URL ERROR]:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
 });
