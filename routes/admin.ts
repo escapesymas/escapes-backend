@@ -10,6 +10,7 @@ import { refreshCompatModels } from '../lib/compat.js';
 import { LATEST_CATALOG_JSON } from '../bihrService.js';
 import { cacheBust } from '../lib/cache.js';
 import { repairProductImages } from '../lib/bihr-images.js';
+import { getImageAudit, filterAuditItems, auditToCsv, recheckProductImages } from '../lib/image-audit.js';
 
 export const adminRouter = Router();
 
@@ -168,11 +169,35 @@ adminRouter.post('/admin/products/:id(\\d+)/repair-images', requireAdmin, async 
     if (result.saved > 0) {
       // Listados, compatibilidades por moto y sugerencias del buscador guardan las fotos de la ficha.
       await Promise.all([cacheBust('cache:products'), cacheBust('compat:prod'), cacheBust('cache:suggest')]);
+      await recheckProductImages(id).catch((e: any) => console.error('[IMAGE AUDIT RECHECK]:', e.message));
     }
     console.log(`[REPAIR IMAGES] producto ${id}: ${result.saved} fotos guardadas (${req.user?.email || req.user?.id || 'admin'})`);
     return res.json(result);
   } catch (err: any) {
     console.error('[REPAIR IMAGES ERROR]:', err.message);
     return res.status(/Ya se están/.test(err.message) ? 409 : 500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/catalog/image-audit
+// Productos de la tienda que se ven sin imagen (ver lib/image-audit.ts).
+// Filtros: problem=sin_foto|foto_remota|fichero_perdido, stock=1 (solo con stock), q=texto,
+// page, limit; refresh=1 vuelve a recorrer el catálogo; format=csv descarga todos los que cumplan el filtro.
+adminRouter.get('/admin/catalog/image-audit', requireAdmin, async (req: any, res: any) => {
+  try {
+    const one = (v: unknown) => (Array.isArray(v) ? String(v[0] ?? '') : String(v ?? ''));
+    const audit = await getImageAudit({ refresh: one(req.query.refresh) === '1' });
+    const items = filterAuditItems(audit.items, { problem: one(req.query.problem), q: one(req.query.q), onlyInStock: one(req.query.stock) === '1' });
+    if (one(req.query.format) === 'csv') {
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', `attachment; filename="productos-sin-imagen-${new Date().toISOString().slice(0, 10)}.csv"`);
+      return res.send(auditToCsv(items));
+    }
+    const limit = Math.min(Math.max(parseInt(one(req.query.limit), 10) || 50, 1), 200);
+    const page = Math.max(parseInt(one(req.query.page), 10) || 1, 1);
+    return res.json({ summary: audit.summary, total: items.length, page, limit, items: items.slice((page - 1) * limit, page * limit) });
+  } catch (err: any) {
+    console.error('[IMAGE AUDIT ERROR]:', err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
