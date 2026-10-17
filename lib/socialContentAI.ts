@@ -12,6 +12,7 @@ import path from 'path';
 import { pool } from '../db.js';
 import { minimaxClient, CHAT_MODEL } from '../chatbot/minimax.js';
 import { storePolicies } from '../chatbot/index.js';
+import { fetchRemoteImage } from './remote-image.js';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
@@ -114,8 +115,9 @@ export async function productBySku(sku: string): Promise<SlotProduct | null> {
  *   las últimas 10 publicaciones;
  * - después un producto de esa marca cuya familia (mismo modelo en otras tallas
  *   o colores) no se haya publicado en los últimos 120 días.
+ * `excludeSkus`: productos ya descartados en esta generación (p. ej. sin foto descargable).
  */
-export async function pickProduct(): Promise<SlotProduct | null> {
+export async function pickProduct(excludeSkus: string[] = []): Promise<SlotProduct | null> {
   const query = (avoidRecentBrands: boolean) => pool.query(
     `WITH used AS (
        SELECT p.sku, p.family_code, upper(p.brand) AS brand, c.scheduled_at, c.created_at
@@ -130,11 +132,12 @@ export async function pickProduct(): Promise<SlotProduct | null> {
        WHERE p.status = 'published' AND p.price >= $1 AND p.stock >= $3 AND p.duplicate_of IS NULL
          AND COALESCE(p.brand, '') <> '' AND jsonb_array_length(COALESCE(p.images, '[]'::jsonb)) > 0
          AND ($2 = false OR upper(p.brand) NOT IN (SELECT brand FROM recent_brands))
+         AND NOT (upper(p.sku) = ANY($4::text[]))
          AND NOT EXISTS (SELECT 1 FROM used u WHERE u.created_at > NOW() - INTERVAL '120 days'
                          AND (upper(u.sku) = upper(p.sku) OR (p.family_code IS NOT NULL AND u.family_code = p.family_code)))),
      brand AS (SELECT upper(brand) AS b FROM eligible GROUP BY 1 ORDER BY random() LIMIT 1)
      SELECT * FROM eligible WHERE upper(brand) = (SELECT b FROM brand) ORDER BY random() LIMIT 1`,
-    [AUTO_MIN_PRICE, avoidRecentBrands, AUTO_MIN_STOCK]);
+    [AUTO_MIN_PRICE, avoidRecentBrands, AUTO_MIN_STOCK, excludeSkus.map((s) => s.toUpperCase())]);
   let { rows: [p] } = await query(true);
   if (!p) ({ rows: [p] } = await query(false));
   return p ? rowToProduct(p) : null;
@@ -294,12 +297,23 @@ async function loadImage(src: string): Promise<{ data: string; mime: string } | 
       return { data: buf.toString('base64'), mime: ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg' };
     }
     if (/^https?:\/\//.test(src)) {
-      const r = await fetch(src, { signal: AbortSignal.timeout(15_000) });
-      if (!r.ok) return null;
-      return { data: Buffer.from(await r.arrayBuffer()).toString('base64'), mime: r.headers.get('content-type') || 'image/jpeg' };
+      const { data, mime } = await fetchRemoteImage(src, 15_000);
+      return { data: data.toString('base64'), mime };
     }
-  } catch { /* sin referencia */ }
+  } catch (err: any) {
+    console.warn('[SOCIAL CONTENT] foto no disponible:', src.slice(0, 120), err.message);
+  }
   return null;
+}
+
+/**
+ * Deja solo las fotos del producto que se pueden leer ahora mismo. La ficha del
+ * catálogo puede apuntar a fotos del proveedor que ya no existen o a ficheros
+ * locales borrados; si la primera falla, las diapositivas no se podían componer.
+ */
+export async function withLoadableImages(p: SlotProduct): Promise<SlotProduct> {
+  const loadable = await Promise.all(p.images.map(async (src) => ((await loadImage(src)) ? src : null)));
+  return { ...p, images: loadable.filter((src): src is string => !!src) };
 }
 
 /**
