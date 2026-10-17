@@ -7,12 +7,13 @@ import path from 'path';
 import type { AddressInfo } from 'net';
 
 // BD simulada: cada prueba deja en `db` la ficha que devuelve el SELECT y mira qué UPDATE se hizo.
-const db = vi.hoisted(() => ({ product: null as any, clash: false, updateRows: 1, updates: [] as any[][] }));
+const db = vi.hoisted(() => ({ product: null as any, clash: false, clashQueries: 0, contestedRows: [] as any[], updateRows: 1, updates: [] as any[][] }));
 
 vi.mock('../db.js', () => ({
   pool: {
     query: vi.fn(async (sql: string, params: any[]) => {
-      if (sql.includes('regexp_replace')) return { rows: db.clash ? [{ '?column?': 1 }] : [] };
+      if (sql.includes('GROUP BY')) return { rows: db.contestedRows };
+      if (sql.includes('regexp_replace')) { db.clashQueries++; return { rows: db.clash ? [{ '?column?': 1 }] : [] }; }
       if (sql.startsWith('SELECT id, sku')) return { rows: db.product ? [db.product] : [] };
       if (sql.startsWith('UPDATE products')) { db.updates.push(params); return { rowCount: db.updateRows, rows: [] }; }
       return { rows: [] };
@@ -30,7 +31,7 @@ vi.mock('./image-sandbox.js', async (importOriginal) => ({
   }),
 }));
 
-import { readZipIndex, readZipEntry, zipPhotosFor, repairProductImages } from './bihr-images.js';
+import { readZipIndex, readZipEntry, zipPhotosFor, repairProductImages, contestedFileBases, failureKind } from './bihr-images.js';
 
 interface ZipFile { name: string; data: Buffer; store?: boolean; declaredSize?: number; crc?: number }
 
@@ -90,6 +91,7 @@ const zips: Record<string, { body: Buffer; ignoreRange?: boolean }> = {
     { name: '8010897003-2.jpg', data: JPG(2), store: true },
     { name: '8010897003-1.jpg', data: JPG(1) },
   ]) },
+  '/CRC-pictures.zip': { body: buildZip([{ name: 'MAL-1.jpg', data: JPG(6), crc: 12345 }]) },
   '/pequeno.zip': { ignoreRange: true, body: buildZip([{ name: 'A-1.jpg', data: JPG(4) }, { name: 'C-1.jpg', data: JPG(5) }]) },
   '/bomba.zip': { body: buildZip([{ name: 'BOMB-1.jpg', data: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2 * 1024 * 1024)]), declaredSize: 300 }]) },
   '/crc.zip': { body: buildZip([{ name: 'MAL-1.jpg', data: JPG(6), crc: 12345 }]) },
@@ -122,6 +124,21 @@ beforeAll(async () => {
 });
 
 afterAll(() => { server.close(); });
+
+describe('zipPhotosFor', () => {
+  const file = (name: string) => ({ name, offset: 0, compSize: 0, uncompSize: 0, crc32: 0 });
+
+  it('busca por código sin distinguir mayúsculas, con carpetas y códigos con guiones o puntos', () => {
+    const files = [file('fotos/80-108.97-1.JPG'), file('80-108.97-2.jpeg'), file('ABC-1-2.jpg'), file('ABC-1.jpg'), file('ABC-3.png'), file('ABC-1.jpg.bak'), file('Abc-1.jpg')];
+    expect([...zipPhotosFor(files, '80-108.97').keys()]).toEqual([1, 2]);
+    expect(zipPhotosFor(files, '80-108.97').get(1)?.name).toBe('fotos/80-108.97-1.JPG');
+    expect([...zipPhotosFor(files, 'abc').keys()]).toEqual([1]);
+    expect(zipPhotosFor(files, 'ABC').get(1)?.name).toBe('ABC-1.jpg'); // si hay dos con el mismo número, la primera
+    expect([...zipPhotosFor(files, 'ABC-1').keys()]).toEqual([2]);
+    expect(zipPhotosFor(files, 'A.C').size).toBe(0);
+    expect(zipPhotosFor(files, '').size).toBe(0);
+  });
+});
 
 describe('zip de fotos de Bihr por rangos', () => {
   it('lista los ficheros y encuentra las fotos de una referencia sin confundir otras', async () => {
@@ -193,11 +210,14 @@ describe('reparar las fotos de un producto', () => {
       images, images_raw: images === null ? null : JSON.stringify(images), ...over };
   };
   const repair = () => repairProductImages(244141, { zipBase: base, uploadsDir: uploads });
+  const repairZipOnly = () => repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['zip'] });
 
   beforeEach(() => {
     uploads = fs.mkdtempSync(path.join(os.tmpdir(), 'bihr-repair-'));
     db.product = product();
     db.clash = false;
+    db.clashQueries = 0;
+    db.contestedRows = [];
     db.updateRows = 1;
     db.updates.length = 0;
     sandbox.fail = false;
@@ -277,5 +297,90 @@ describe('reparar las fotos de un producto', () => {
     expect(r.attempts.find((a) => a.source === 'zip')?.detail).toBe('HTTP 404');
     expect(r.attempts.find((a) => a.source === 'api')?.detail).toContain('credenciales');
     expect(db.updates).toHaveLength(0);
+  });
+  it('dice qué pasó: guardada, nada que hacer, la fuente no la tiene o la fuente falló', async () => {
+    expect((await repair()).outcome).toBe('saved');
+    fs.mkdirSync(path.join(uploads, 'optimized'), { recursive: true });
+    fs.writeFileSync(path.join(uploads, 'optimized', 'buena.webp'), 'x');
+    db.product = product({ images: [{ src: '/uploads/optimized/buena.webp' }] });
+    expect((await repair()).outcome).toBe('nothing_to_do');
+    db.product = product({ sku: 'NOESTA', part_number: 'NOESTA' });
+    const missing = await repairZipOnly();
+    expect(missing).toMatchObject({ saved: 0, outcome: 'not_found' });
+    db.product = product({ brand: 'gone', images: [] });
+    expect((await repairZipOnly()).outcome).toBe('not_found'); // la marca no tiene zip (HTTP 404): no es un fallo
+    db.product = product({ brand: 'crc', sku: 'MAL', part_number: 'MAL' });
+    const damaged = await repairZipOnly();
+    expect(damaged).toMatchObject({ outcome: 'error', errorScope: 'product' }); // la foto del zip está dañada: es de este producto
+    expect(damaged.reason).toContain('CRC');
+    sandbox.fail = true;
+    db.product = product();
+    expect(await repair()).toMatchObject({ outcome: 'error', errorScope: 'service' }); // el procesador de imágenes no responde
+  });
+
+  it('si la API no se puede usar (sin credenciales) lo dice como error de la fuente, no como «no tiene la foto»', async () => {
+    db.product = product({ sku: 'NOESTA', part_number: 'NOESTA', images: [] });
+    const r = await repair(); // zip sin esa referencia y la API sin credenciales
+    expect(r).toMatchObject({ outcome: 'error', errorScope: 'service', reason: 'api: sin credenciales de la API de Bihr' });
+  });
+
+  it('failureKind separa lo que no está, lo que no sirve y lo que falla', () => {
+    const k = (source: 'zip' | 'api' | 'catalogo', detail: string) => failureKind({ source, detail });
+    expect(k('zip', 'HTTP 404')).toBe('missing');
+    expect(k('zip', 'ninguna de las referencias está en el zip')).toBe('missing');
+    expect(k('api', 'HTTP 404')).toBe('missing');
+    expect(k('api', 'respuesta demasiado pequeña')).toBe('missing');
+    expect(k('zip', 'la foto del zip está dañada (CRC)')).toBe('product');
+    expect(k('catalogo', 'procesador de imágenes: Imagen no válida')).toBe('product');
+    expect(k('api', 'HTTP 500')).toBe('service');
+    expect(k('api', 'HTTP 429')).toBe('service');
+    expect(k('api', 'la API de Bihr no responde bien; se vuelve a probar en unos minutos')).toBe('service');
+    expect(k('api', 'autenticación rechazada (HTTP 401)')).toBe('service');
+    expect(k('zip', 'sin respuesta a tiempo')).toBe('service');
+    expect(k('zip', 'zip de más de 4 GB (ZIP64), no se puede leer por rangos')).toBe('service');
+    expect(k('catalogo', 'procesador de imágenes: HTTP 503')).toBe('service');
+  });
+
+  it('un producto sin marca no tiene zip que mirar y se dice', async () => {
+    db.product = product({ brand: null });
+    const r = await repairZipOnly();
+    expect(r.outcome).toBe('not_found');
+    expect(r.attempts.find((a) => a.source === 'zip')?.detail).toContain('no tiene marca');
+  });
+
+  it('con sources solo prueba esas fuentes', async () => {
+    db.product = product({ sku: 'NOESTA', part_number: 'NOESTA', images: [] });
+    const zipOnly = await repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['zip'] });
+    expect(new Set(zipOnly.attempts.map((a) => a.source))).toEqual(new Set(['zip']));
+    const apiOnly = await repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['api'] });
+    expect(apiOnly.attempts.map((a) => a.source)).toEqual(['api']);
+    const all = await repair();
+    expect(new Set(all.attempts.map((a) => a.source))).toEqual(new Set(['zip', 'api']));
+  });
+
+  it('con exactCodes no usa el código del fabricante (otra pieza podría tener ese número)', async () => {
+    db.product = product({ sku: 'XXX', part_number: 'XXX', supplier_code: 'OTRA' });
+    const exact = await repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['zip'], exactCodes: true });
+    expect(exact.outcome).toBe('not_found');
+    expect(db.updates).toHaveLength(0);
+    const loose = await repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['zip'] });
+    expect(loose.saved).toBe(1);
+    expect(loose.attempts.some((a) => a.target === 'OTRA-1.jpg')).toBe(true);
+  });
+
+  it('con la lista de nombres repetidos ya calculada no consulta la tabla por cada producto', async () => {
+    await repairProductImages(244141, { zipBase: base, uploadsDir: uploads, contested: new Set() });
+    expect(db.clashQueries).toBe(0);
+    expect(fs.readdirSync(path.join(uploads, 'optimized'))).toContain('8010897003_0_800.webp');
+    await repairProductImages(244141, { zipBase: base, uploadsDir: uploads, contested: new Set(['8010897003']) });
+    expect(db.clashQueries).toBe(0);
+    expect(fs.readdirSync(path.join(uploads, 'optimized'))).toContain('8010897003_id244141_0_800.webp');
+    await repair();
+    expect(db.clashQueries).toBe(1);
+  });
+
+  it('contestedFileBases lista los nombres de fichero que dan varios productos', async () => {
+    db.contestedRows = [{ base: 'AB_C' }, { base: '123' }];
+    expect(await contestedFileBases()).toEqual(new Set(['AB_C', '123']));
   });
 });

@@ -37,7 +37,39 @@ const ZIP64 = 0xffffffff;
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
 export interface RepairAttempt { source: 'catalogo' | 'zip' | 'api'; target: string; ok: boolean; detail: string }
-export interface RepairResult { saved: number; attempts: RepairAttempt[] }
+/**
+ * `saved`: se guardó alguna foto; `nothing_to_do`: la ficha ya tiene fotos que existen;
+ * `not_found`: la fuente funcionó pero no tiene la foto; `error`: alguna fuente falló.
+ */
+export type RepairOutcome = 'saved' | 'nothing_to_do' | 'not_found' | 'error';
+export interface RepairResult {
+  saved: number;
+  attempts: RepairAttempt[];
+  outcome: RepairOutcome;
+  /** Con `error`: si falla la propia fuente (red, API, procesador) o solo la foto de este producto. */
+  errorScope?: 'product' | 'service';
+  /** Con `error`: el intento fallido que lo explica, p. ej. «api: HTTP 500». */
+  reason?: string;
+}
+export type RepairSource = RepairAttempt['source'];
+const NOT_IN_ZIP = 'ninguna de las referencias está en el zip';
+const NO_BRAND = 'el producto no tiene marca; no se sabe qué zip usar';
+/** Respuestas de una fuente que funcionó pero no tiene la foto (no son un fallo). */
+const NOT_FOUND_DETAILS = new Set([NOT_IN_ZIP, NO_BRAND]);
+
+/**
+ * Qué significa un intento fallido: `missing` (la fuente funciona pero no tiene la foto), `product`
+ * (la foto está pero no sirve: dañada, no es una imagen, el procesador la rechaza) o `service`
+ * (falla la propia fuente: red, tiempo, 5xx, 429, autenticación, API en pausa, procesador caído).
+ */
+export type FailureKind = 'missing' | 'product' | 'service';
+const PRODUCT_FAILURE = /dañada \(CRC\)|no coincide con el del zip|no se pudo descomprimir|más grande de lo que dice|imagen demasiado grande|la respuesta no es una imagen|fichero cifrado|fichero ZIP64|compresión .* no admitida|Imagen no válida/;
+export function failureKind(a: Pick<RepairAttempt, 'source' | 'detail'>): FailureKind {
+  if (NOT_FOUND_DETAILS.has(a.detail) || a.detail === 'HTTP 404') return 'missing';
+  // La API de Bihr contesta con algo que no es una foto cuando no tiene la de ese producto.
+  if (a.source === 'api' && /^(respuesta demasiado pequeña|imagen demasiado grande|la respuesta no es una imagen)$/.test(a.detail)) return 'missing';
+  return PRODUCT_FAILURE.test(a.detail) ? 'product' : 'service';
+}
 
 const inflateRaw = promisify(zlib.inflateRaw) as (buf: Buffer, opts: zlib.ZlibOptions) => Promise<Buffer>;
 const repairing = new Set<number>();
@@ -189,28 +221,48 @@ export async function readZipEntry(zipUrl: string, entry: ZipEntry, timeoutMs = 
 
 const ZIP_INDEX_TTL_MS = 6 * 3600_000;
 const ZIP_INDEX_MAX_CACHED = 8;
-const zipIndexCache = new Map<string, { at: number; files: Promise<ZipEntry[]> }>();
+/** Una marca sin zip (HTTP 404) no se vuelve a pedir en unos minutos: con miles de productos serían miles de 404. */
+const ZIP_MISSING_TTL_MS = 10 * 60_000;
+const zipIndexCache = new Map<string, { at: number; files: Promise<ZipEntry[]>; missing?: boolean }>();
 
-/** Índice del zip de una marca, guardado unas horas; solo se guarda si se leyó bien. */
+/** Índice del zip de una marca, guardado unas horas; solo se guarda si se leyó bien (o si no existe). */
 function cachedZipIndex(zipUrl: string, maxAgeMs = ZIP_INDEX_TTL_MS): Promise<ZipEntry[]> {
   const hit = zipIndexCache.get(zipUrl);
-  if (hit && Date.now() - hit.at < maxAgeMs) return hit.files;
-  const entry = { at: Date.now(), files: readZipIndex(zipUrl) };
+  if (hit && Date.now() - hit.at < Math.min(maxAgeMs, hit.missing ? ZIP_MISSING_TTL_MS : Infinity)) return hit.files;
+  const entry: { at: number; files: Promise<ZipEntry[]>; missing?: boolean } = { at: Date.now(), files: readZipIndex(zipUrl) };
   zipIndexCache.set(zipUrl, entry);
-  entry.files.catch(() => { if (zipIndexCache.get(zipUrl) === entry) zipIndexCache.delete(zipUrl); });
+  entry.files.catch((err) => {
+    if (err?.message === 'HTTP 404') entry.missing = true;
+    else if (zipIndexCache.get(zipUrl) === entry) zipIndexCache.delete(zipUrl);
+  });
   while (zipIndexCache.size > ZIP_INDEX_MAX_CACHED) zipIndexCache.delete(zipIndexCache.keys().next().value as string);
   return entry.files;
 }
 
+/** Índice <código en minúsculas> → fotos por número, de un listado de zip (se calcula una vez por listado). */
+const photosByCode = new WeakMap<ZipEntry[], Map<string, Map<number, ZipEntry>>>();
+
+function zipLookup(files: ZipEntry[]): Map<string, Map<number, ZipEntry>> {
+  let index = photosByCode.get(files);
+  if (index) return index;
+  index = new Map();
+  for (const f of files) {
+    const m = /^(.+)-(\d+)\.jpe?g$/i.exec(f.name.split('/').pop() || '');
+    if (!m) continue;
+    const n = Number(m[2]);
+    if (!(n >= 1)) continue;
+    const key = m[1].toLowerCase();
+    let photos = index.get(key);
+    if (!photos) index.set(key, (photos = new Map()));
+    if (!photos.has(n)) photos.set(n, f);
+  }
+  photosByCode.set(files, index);
+  return index;
+}
+
 /** Fotos <código>-1.jpg, -2.jpg… del zip, por número. */
 export function zipPhotosFor(files: ZipEntry[], partNumber: string): Map<number, ZipEntry> {
-  const re = new RegExp(`^${partNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-(\\d+)\\.jpe?g$`, 'i');
-  const out = new Map<number, ZipEntry>();
-  for (const f of files) {
-    const n = Number(f.name.split('/').pop()?.match(re)?.[1] ?? f.name.match(re)?.[1]);
-    if (n >= 1 && !out.has(n)) out.set(n, f);
-  }
-  return out;
+  return new Map(zipLookup(files).get(partNumber.toLowerCase()) || []);
 }
 
 // ---------------------------------------------------------------- API de Bihr
@@ -241,18 +293,79 @@ function bihrApiToken(): Promise<string> {
   return apiTokenRequest;
 }
 
-async function bihrApiImage(code: string, timeoutMs: number, retry = true): Promise<Buffer> {
-  const token = await bihrApiToken();
-  const r = await fetch(`${BIHR_API_BASE}/api/v2.1/Products/Image/${encodeURIComponent(code)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+/**
+ * La API de Bihr limita las peticiones (429 si van muy seguidas): todas las llamadas del proceso
+ * salen de una en una, con al menos 250 ms entre una y otra.
+ */
+const API_MIN_GAP_MS = 250;
+let apiChain: Promise<void> = Promise.resolve();
+let apiLastCallAt = 0;
+
+async function apiGate(): Promise<void> {
+  const previous = apiChain;
+  let release!: () => void;
+  apiChain = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const wait = apiLastCallAt + API_MIN_GAP_MS - Date.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    apiLastCallAt = Date.now();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Tras 5 fallos seguidos (red, 5xx, 429, autenticación) la API se deja en paz 5 minutos. Un 404 no es un fallo
+ * («no tengo esa foto») y, como un 200, demuestra que la API responde: reinicia la cuenta.
+ */
+const API_FAILURE_LIMIT = 5;
+const API_PAUSE_MS = 5 * 60_000;
+let apiFailures = 0;
+let apiPausedUntil = 0;
+const apiFailed = () => { if (++apiFailures >= API_FAILURE_LIMIT) apiPausedUntil = Date.now() + API_PAUSE_MS; };
+
+async function bihrApiImage(code: string, timeoutMs: number, retry = true, backoff = 0): Promise<Buffer> {
+  if (apiPausedUntil) {
+    if (apiPausedUntil > Date.now()) throw new Error('la API de Bihr no responde bien; se vuelve a probar en unos minutos');
+    apiPausedUntil = 0; // pasó la pausa: vuelve a tener sus cinco intentos
+    apiFailures = 0;
+  }
+  let token: string;
+  try {
+    token = await bihrApiToken();
+  } catch (err) {
+    apiFailed(); // sin esto cada producto pediría un token nuevo aunque Bihr rechace el acceso
+    throw err;
+  }
+  await apiGate();
+  let r: Response;
+  try {
+    r = await fetch(`${BIHR_API_BASE}/api/v2.1/Products/Image/${encodeURIComponent(code)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    apiFailed();
+    throw err;
+  }
   if ((r.status === 401 || r.status === 403) && retry) {
     r.body?.cancel().catch(() => {});
     apiToken = null; // el token puede haberse revocado antes de caducar
-    return bihrApiImage(code, timeoutMs, false);
+    return bihrApiImage(code, timeoutMs, false, backoff);
   }
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (r.status === 429 && backoff < 3) {
+    r.body?.cancel().catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** backoff));
+    return bihrApiImage(code, timeoutMs, retry, backoff + 1);
+  }
+  if (!r.ok) {
+    r.body?.cancel().catch(() => {});
+    if (r.status === 404) apiFailures = 0;
+    else apiFailed();
+    throw new Error(`HTTP ${r.status}`);
+  }
+  apiFailures = 0;
   const buf = Buffer.from(await r.arrayBuffer());
   if (buf.length < 200) throw new Error('respuesta demasiado pequeña');
   if (buf.length > REMOTE_IMAGE_MAX_BYTES) throw new Error('imagen demasiado grande');
@@ -312,17 +425,51 @@ function needsPhoto(img: any, uploadsDir: string): boolean {
   return false;
 }
 
+export interface RepairOptions {
+  /** Solo cambian en las pruebas. */
+  zipBase?: string;
+  uploadsDir?: string;
+  /** Fuentes que se prueban (todas por defecto, en este orden: catálogo, zip, API). */
+  sources?: readonly RepairSource[];
+  /**
+   * Usa solo el número de pieza y el SKU (que son la referencia de Bihr) y no el código del
+   * fabricante, que en la API de Bihr puede dar la foto de otra pieza con ese mismo número.
+   */
+  exactCodes?: boolean;
+  /**
+   * Nombres de fichero que comparten varios productos (ver `contestedFileBases`): evita una
+   * consulta por producto cuando se reparan muchos seguidos.
+   */
+  contested?: ReadonlySet<string>;
+  /**
+   * Si la referencia no está en un índice del zip de hace más de un minuto, se vuelve a leer el índice
+   * (por defecto sí). El trabajo en bloque lo desactiva: con miles de productos repetiría la lectura cada minuto.
+   */
+  refreshStaleIndex?: boolean;
+}
+
+/**
+ * Nombres de fichero (SKU saneado) que dan dos o más productos. Una sola consulta que recorre
+ * la tabla: para un trabajo en bloque, en lugar de una comprobación por producto.
+ */
+export async function contestedFileBases(): Promise<Set<string>> {
+  const { rows } = await pool.query(
+    `SELECT regexp_replace(sku, '[^A-Za-z0-9._-]', '_', 'g') AS base FROM products
+     WHERE sku IS NOT NULL GROUP BY 1 HAVING count(*) > 1`);
+  return new Set(rows.map((r: any) => String(r.base)));
+}
+
 /**
  * Descarga las fotos del producto y reescribe `images` con las copias locales.
  * Si no se consigue ni la primera, la ficha queda como estaba.
- * `zipBase` y `uploadsDir` solo cambian en las pruebas.
  */
-export async function repairProductImages(productId: number, opts: { zipBase?: string; uploadsDir?: string } = {}): Promise<RepairResult> {
+export async function repairProductImages(productId: number, opts: RepairOptions = {}): Promise<RepairResult> {
   if (repairing.has(productId)) throw new Error('Ya se están descargando las fotos de este producto');
   repairing.add(productId);
   try {
     const uploadsDir = opts.uploadsDir || UPLOADS_DIR;
     const optimizedDir = path.join(uploadsDir, 'optimized');
+    const useSource = (source: RepairSource) => !opts.sources || opts.sources.includes(source);
     const deadlineAt = Date.now() + REPAIR_BUDGET_MS;
     /** Tiempo que se le puede dar a la siguiente descarga sin pasarse del total. */
     const budget = (capMs: number): number => {
@@ -337,9 +484,11 @@ export async function repairProductImages(productId: number, opts: { zipBase?: s
     const safeSku = safeSkuForFile(p.sku);
     if (!safeSku) throw new Error('El producto no tiene SKU');
     // Dos SKU distintos pueden dar el mismo nombre de fichero (se cambian los símbolos por «_»).
-    const { rows: clash } = await pool.query(
-      `SELECT 1 FROM products WHERE id <> $2 AND regexp_replace(sku, '[^A-Za-z0-9._-]', '_', 'g') = $1 LIMIT 1`, [safeSku, productId]);
-    const fileBase = clash.length > 0 ? `${safeSku}_id${productId}` : safeSku;
+    const clashes = opts.contested
+      ? opts.contested.has(safeSku)
+      : (await pool.query(
+        `SELECT 1 FROM products WHERE id <> $2 AND regexp_replace(sku, '[^A-Za-z0-9._-]', '_', 'g') = $1 LIMIT 1`, [safeSku, productId])).rows.length > 0;
+    const fileBase = clashes ? `${safeSku}_id${productId}` : safeSku;
 
     let current: any = p.images;
     if (typeof current === 'string') { try { current = JSON.parse(current); } catch { /* se queda como texto */ } }
@@ -350,17 +499,24 @@ export async function repairProductImages(productId: number, opts: { zipBase?: s
     const slotCount = Math.min(Math.max(original.length, 1), MAX_PHOTOS);
     const wanted = Array.from({ length: slotCount }, (_, i) => !original[i] || needsPhoto(original[i], uploadsDir));
     if (!wanted.some(Boolean)) {
-      return { saved: 0, attempts: [{ source: 'catalogo', target: 'ficha', ok: true, detail: 'la ficha ya tiene fotos locales que existen; no hay nada que descargar' }] };
+      return { saved: 0, outcome: 'nothing_to_do', attempts: [{ source: 'catalogo', target: 'ficha', ok: true, detail: 'la ficha ya tiene fotos locales que existen; no hay nada que descargar' }] };
     }
     const slots: (Buffer | null)[] = wanted.map(() => null);
     const origin: string[] = wanted.map(() => '');
     const note = (a: RepairAttempt) => { attempts.push(a); return a.ok; };
+    // «Error» es que algo falló (red, API, zip dañado, procesador); que la fuente no tenga la foto no lo es.
+    const none = (): RepairResult => {
+      const failed = attempts.filter((a) => !a.ok).map((a) => ({ a, kind: failureKind(a) })).filter((x) => x.kind !== 'missing');
+      if (failed.length === 0) return { saved: 0, attempts, outcome: 'not_found' };
+      const worst = failed.find((x) => x.kind === 'service') || failed[failed.length - 1];
+      return { saved: 0, attempts, outcome: 'error', errorScope: worst.kind === 'service' ? 'service' : 'product', reason: `${worst.a.source}: ${worst.a.detail}` };
+    };
 
     // 1) URLs de la ficha
     const bihrRedirect = (to: URL) => to.protocol === 'https:' && BIHR_REDIRECT_HOST.test(to.hostname);
     for (let i = 0; i < slotCount; i++) {
       const src = imageSrc(original[i]);
-      if (!wanted[i] || !isBihrRemote(src)) continue;
+      if (!useSource('catalogo') || !wanted[i] || !isBihrRemote(src)) continue;
       try {
         slots[i] = asPhoto((await fetchRemoteImage(src, budget(15_000), { allowRedirect: bihrRedirect })).data);
         origin[i] = shortUrl(src);
@@ -371,9 +527,11 @@ export async function repairProductImages(productId: number, opts: { zipBase?: s
     }
 
     // 2) zip de la marca
-    const codes = Array.from(new Set([p.part_number, p.sku, p.supplier_code].map((c) => String(c || '').trim()).filter(Boolean)));
+    const codes = Array.from(new Set((opts.exactCodes ? [p.part_number, p.sku] : [p.part_number, p.sku, p.supplier_code])
+      .map((c) => String(c || '').trim()).filter(Boolean)));
     const missing = () => slots.some((s, i) => wanted[i] && !s);
-    if (missing() && p.brand) {
+    if (useSource('zip') && missing() && !p.brand) note({ source: 'zip', target: 'marca', ok: false, detail: NO_BRAND });
+    if (useSource('zip') && missing() && p.brand) {
       const zipUrl = `${opts.zipBase || BIHR_ZIP_BASE}/${encodeURIComponent(String(p.brand).trim().toUpperCase())}-pictures.zip`;
       try {
         budget(1);
@@ -382,13 +540,13 @@ export async function repairProductImages(productId: number, opts: { zipBase?: s
         let files = await cachedZipIndex(zipUrl);
         const findCode = (list: ZipEntry[]) => codes.find((c) => zipPhotosFor(list, c).size > 0);
         let code = findCode(files);
-        if (!code && cachedAge > 60_000 && cachedAge < ZIP_INDEX_TTL_MS) {
+        if (!code && opts.refreshStaleIndex !== false && cachedAge > 60_000 && cachedAge < ZIP_INDEX_TTL_MS) {
           // El índice es de hace rato: si no está la referencia, se vuelve a leer una vez (como mucho cada minuto).
           files = await cachedZipIndex(zipUrl, 0);
           code = findCode(files);
         }
         note({ source: 'zip', target: shortUrl(zipUrl), ok: true, detail: `${files.length} ficheros en el índice` });
-        if (!code) note({ source: 'zip', target: codes.join(', '), ok: false, detail: 'ninguna de las referencias está en el zip' });
+        if (!code) note({ source: 'zip', target: codes.join(', '), ok: false, detail: NOT_IN_ZIP });
         else {
           const photos = zipPhotosFor(files, code);
           for (let i = 0; i < slotCount; i++) {
@@ -410,7 +568,7 @@ export async function repairProductImages(productId: number, opts: { zipBase?: s
     }
 
     // 3) API de Bihr (una sola foto)
-    if (wanted[0] && !slots[0]) {
+    if (useSource('api') && wanted[0] && !slots[0]) {
       for (const code of codes) {
         try {
           slots[0] = asPhoto(await bihrApiImage(code, budget(20_000)));
@@ -425,7 +583,7 @@ export async function repairProductImages(productId: number, opts: { zipBase?: s
     }
 
     // Guardado: si la primera foto hacía falta, es imprescindible; si falla el procesador, la ficha no se toca.
-    if (!slots.some(Boolean) || (wanted[0] && !slots[0])) return { saved: 0, attempts };
+    if (!slots.some(Boolean) || (wanted[0] && !slots[0])) return none();
     const images: any[] = [];
     let saved = 0;
     for (let i = 0; i < Math.max(slotCount, original.length); i++) {
@@ -438,18 +596,18 @@ export async function repairProductImages(productId: number, opts: { zipBase?: s
           continue;
         } catch (err: any) {
           note({ source: 'catalogo', target: `foto ${i + 1}`, ok: false, detail: `procesador de imágenes: ${explain(err)}` });
-          if (i === 0 && wanted[0]) return { saved: 0, attempts };
+          if (i === 0 && wanted[0]) return none();
         }
       }
       if (original[i]) images.push(original[i]);
     }
-    if (saved === 0) return { saved: 0, attempts };
+    if (saved === 0) return none();
     // Solo se escribe si la ficha no ha cambiado mientras se descargaba (p. ej. otro guardado desde el panel).
     const upd = await pool.query(
       `UPDATE products SET images = $2::jsonb WHERE id = $1 AND images::text IS NOT DISTINCT FROM $3::text`,
       [productId, JSON.stringify(images), p.images_raw ?? null]);
     if (!upd.rowCount) throw new Error('La ficha cambió mientras se descargaban las fotos; vuelve a intentarlo');
-    return { saved, attempts };
+    return { saved, attempts, outcome: 'saved' };
   } finally {
     repairing.delete(productId);
   }

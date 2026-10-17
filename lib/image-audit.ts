@@ -182,6 +182,9 @@ export async function getImageAudit(opts: { refresh?: boolean; uploadsDir?: stri
   return inFlight;
 }
 
+/** Descarta el resultado guardado: la siguiente consulta vuelve a recorrer el catálogo. */
+export function invalidateImageAudit(): void { cached = null; }
+
 /** Tras descargar las fotos de un producto: vuelve a mirar solo ese producto y corrige el resultado guardado. */
 export async function recheckProductImages(productId: number, uploadsDir = UPLOADS_DIR): Promise<void> {
   if (!cached) return;
