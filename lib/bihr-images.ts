@@ -42,12 +42,34 @@ export interface RepairAttempt { source: 'catalogo' | 'zip' | 'api'; target: str
  * `not_found`: la fuente funcionó pero no tiene la foto; `error`: alguna fuente falló.
  */
 export type RepairOutcome = 'saved' | 'nothing_to_do' | 'not_found' | 'error';
-export interface RepairResult { saved: number; attempts: RepairAttempt[]; outcome: RepairOutcome }
+export interface RepairResult {
+  saved: number;
+  attempts: RepairAttempt[];
+  outcome: RepairOutcome;
+  /** Con `error`: si falla la propia fuente (red, API, procesador) o solo la foto de este producto. */
+  errorScope?: 'product' | 'service';
+  /** Con `error`: el intento fallido que lo explica, p. ej. «api: HTTP 500». */
+  reason?: string;
+}
 export type RepairSource = RepairAttempt['source'];
 const NOT_IN_ZIP = 'ninguna de las referencias está en el zip';
 const NO_BRAND = 'el producto no tiene marca; no se sabe qué zip usar';
 /** Respuestas de una fuente que funcionó pero no tiene la foto (no son un fallo). */
 const NOT_FOUND_DETAILS = new Set([NOT_IN_ZIP, NO_BRAND]);
+
+/**
+ * Qué significa un intento fallido: `missing` (la fuente funciona pero no tiene la foto), `product`
+ * (la foto está pero no sirve: dañada, no es una imagen, el procesador la rechaza) o `service`
+ * (falla la propia fuente: red, tiempo, 5xx, 429, autenticación, API en pausa, procesador caído).
+ */
+export type FailureKind = 'missing' | 'product' | 'service';
+const PRODUCT_FAILURE = /dañada \(CRC\)|no coincide con el del zip|no se pudo descomprimir|más grande de lo que dice|imagen demasiado grande|la respuesta no es una imagen|fichero cifrado|fichero ZIP64|compresión .* no admitida|Imagen no válida/;
+export function failureKind(a: Pick<RepairAttempt, 'source' | 'detail'>): FailureKind {
+  if (NOT_FOUND_DETAILS.has(a.detail) || a.detail === 'HTTP 404') return 'missing';
+  // La API de Bihr contesta con algo que no es una foto cuando no tiene la de ese producto.
+  if (a.source === 'api' && /^(respuesta demasiado pequeña|imagen demasiado grande|la respuesta no es una imagen)$/.test(a.detail)) return 'missing';
+  return PRODUCT_FAILURE.test(a.detail) ? 'product' : 'service';
+}
 
 const inflateRaw = promisify(zlib.inflateRaw) as (buf: Buffer, opts: zlib.ZlibOptions) => Promise<Buffer>;
 const repairing = new Set<number>();
@@ -293,7 +315,10 @@ async function apiGate(): Promise<void> {
   }
 }
 
-/** Tras 5 fallos seguidos (red, 5xx, 429) la API se deja en paz 5 minutos; un 404 no cuenta: es «no tengo esa foto». */
+/**
+ * Tras 5 fallos seguidos (red, 5xx, 429, autenticación) la API se deja en paz 5 minutos. Un 404 no es un fallo
+ * («no tengo esa foto») y, como un 200, demuestra que la API responde: reinicia la cuenta.
+ */
 const API_FAILURE_LIMIT = 5;
 const API_PAUSE_MS = 5 * 60_000;
 let apiFailures = 0;
@@ -301,8 +326,18 @@ let apiPausedUntil = 0;
 const apiFailed = () => { if (++apiFailures >= API_FAILURE_LIMIT) apiPausedUntil = Date.now() + API_PAUSE_MS; };
 
 async function bihrApiImage(code: string, timeoutMs: number, retry = true, backoff = 0): Promise<Buffer> {
-  if (apiPausedUntil > Date.now()) throw new Error('la API de Bihr no responde bien; se vuelve a probar en unos minutos');
-  const token = await bihrApiToken();
+  if (apiPausedUntil) {
+    if (apiPausedUntil > Date.now()) throw new Error('la API de Bihr no responde bien; se vuelve a probar en unos minutos');
+    apiPausedUntil = 0; // pasó la pausa: vuelve a tener sus cinco intentos
+    apiFailures = 0;
+  }
+  let token: string;
+  try {
+    token = await bihrApiToken();
+  } catch (err) {
+    apiFailed(); // sin esto cada producto pediría un token nuevo aunque Bihr rechace el acceso
+    throw err;
+  }
   await apiGate();
   let r: Response;
   try {
@@ -321,13 +356,13 @@ async function bihrApiImage(code: string, timeoutMs: number, retry = true, backo
   }
   if (r.status === 429 && backoff < 3) {
     r.body?.cancel().catch(() => {});
-    apiFailed();
     await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** backoff));
     return bihrApiImage(code, timeoutMs, retry, backoff + 1);
   }
   if (!r.ok) {
     r.body?.cancel().catch(() => {});
-    if (r.status !== 404) apiFailed();
+    if (r.status === 404) apiFailures = 0;
+    else apiFailed();
     throw new Error(`HTTP ${r.status}`);
   }
   apiFailures = 0;
@@ -406,6 +441,11 @@ export interface RepairOptions {
    * consulta por producto cuando se reparan muchos seguidos.
    */
   contested?: ReadonlySet<string>;
+  /**
+   * Si la referencia no está en un índice del zip de hace más de un minuto, se vuelve a leer el índice
+   * (por defecto sí). El trabajo en bloque lo desactiva: con miles de productos repetiría la lectura cada minuto.
+   */
+  refreshStaleIndex?: boolean;
 }
 
 /**
@@ -464,12 +504,13 @@ export async function repairProductImages(productId: number, opts: RepairOptions
     const slots: (Buffer | null)[] = wanted.map(() => null);
     const origin: string[] = wanted.map(() => '');
     const note = (a: RepairAttempt) => { attempts.push(a); return a.ok; };
-    // «Error» es que una fuente falló (red, zip dañado, procesador); que no tenga la foto no lo es.
-    // Los fallos de la API de Bihr no cuentan: es la última fuente y sus avisos ya van en `attempts`.
-    const none = (): RepairResult => ({
-      saved: 0, attempts,
-      outcome: attempts.some((a) => !a.ok && a.source !== 'api' && !NOT_FOUND_DETAILS.has(a.detail) && !(a.source === 'zip' && a.detail === 'HTTP 404')) ? 'error' : 'not_found',
-    });
+    // «Error» es que algo falló (red, API, zip dañado, procesador); que la fuente no tenga la foto no lo es.
+    const none = (): RepairResult => {
+      const failed = attempts.filter((a) => !a.ok).map((a) => ({ a, kind: failureKind(a) })).filter((x) => x.kind !== 'missing');
+      if (failed.length === 0) return { saved: 0, attempts, outcome: 'not_found' };
+      const worst = failed.find((x) => x.kind === 'service') || failed[failed.length - 1];
+      return { saved: 0, attempts, outcome: 'error', errorScope: worst.kind === 'service' ? 'service' : 'product', reason: `${worst.a.source}: ${worst.a.detail}` };
+    };
 
     // 1) URLs de la ficha
     const bihrRedirect = (to: URL) => to.protocol === 'https:' && BIHR_REDIRECT_HOST.test(to.hostname);
@@ -499,7 +540,7 @@ export async function repairProductImages(productId: number, opts: RepairOptions
         let files = await cachedZipIndex(zipUrl);
         const findCode = (list: ZipEntry[]) => codes.find((c) => zipPhotosFor(list, c).size > 0);
         let code = findCode(files);
-        if (!code && cachedAge > 60_000 && cachedAge < ZIP_INDEX_TTL_MS) {
+        if (!code && opts.refreshStaleIndex !== false && cachedAge > 60_000 && cachedAge < ZIP_INDEX_TTL_MS) {
           // El índice es de hace rato: si no está la referencia, se vuelve a leer una vez (como mucho cada minuto).
           files = await cachedZipIndex(zipUrl, 0);
           code = findCode(files);

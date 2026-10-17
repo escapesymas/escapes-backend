@@ -20,7 +20,7 @@ vi.mock('./image-sandbox.js', async (importOriginal) => ({
   processImage: vi.fn(async (buf: Buffer, o: { width: number }) => ({ data: Buffer.from(`webp-${o.width}-${buf.length}`) })),
 }));
 
-import { repairProductImages } from './bihr-images.js';
+let repairProductImages: typeof import('./bihr-images.js').repairProductImages;
 
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(400, 7)]);
 let uploads: string;
@@ -32,7 +32,10 @@ const product = (code: string) => ({
 });
 const repair = (sources: ('api')[] = ['api']) => repairProductImages(7, { uploadsDir: uploads, sources, exactCodes: true });
 
-beforeEach(() => {
+beforeEach(async () => {
+  // La API de Bihr guarda estado (ritmo, cuenta de fallos, pausa): cada prueba empieza con el módulo limpio.
+  vi.resetModules();
+  ({ repairProductImages } = await import('./bihr-images.js'));
   uploads = fs.mkdtempSync(path.join(os.tmpdir(), 'bihr-api-'));
   process.env.BIHR_USERNAME = 'user';
   process.env.BIHR_MACKEY = 'key';
@@ -102,6 +105,32 @@ describe('API de Bihr', () => {
     const paused = await repair();
     expect(imageCalls).toHaveLength(5);
     expect(paused.attempts.find((a) => a.source === 'api')?.detail).toContain('se vuelve a probar en unos minutos');
-    expect(paused.outcome).toBe('not_found'); // los fallos de la API no cuentan como fallo de la descarga
+    expect(paused).toMatchObject({ outcome: 'error', errorScope: 'service' }); // la API caída no es «no tiene la foto»
+  }, 20_000);
+
+  it('un 404 demuestra que la API responde: reinicia la cuenta de fallos', async () => {
+    db.product = product('Y');
+    imageStatus = () => 500;
+    for (let i = 0; i < 4; i++) await repair();
+    imageStatus = () => 404;
+    expect((await repair()).outcome).toBe('not_found');
+    imageStatus = () => 500;
+    imageCalls.length = 0;
+    for (let i = 0; i < 4; i++) await repair();
+    expect(imageCalls).toHaveLength(4); // sigue sin estar pausada: no se llegó a cinco seguidos
+  }, 20_000);
+
+  it('si Bihr rechaza el acceso se deja de pedir token tras cinco intentos', async () => {
+    db.product = product('Z');
+    let tokenCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: any) => {
+      if (String(input).endsWith('/Authentication/Token')) { tokenCalls++; return new Response('no', { status: 401 }); }
+      throw new Error('no debería pedir fotos sin token');
+    }));
+    for (let i = 0; i < 8; i++) {
+      const r = await repair();
+      expect(r).toMatchObject({ outcome: 'error', errorScope: 'service' });
+    }
+    expect(tokenCalls).toBe(5);
   }, 20_000);
 });

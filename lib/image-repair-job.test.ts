@@ -16,9 +16,10 @@ import type { RepairResult, RepairOutcome } from './bihr-images.js';
 const item = (id: number, brand: string, stock = 1): ImageAuditItem => ({
   id, sku: `SKU${id}`, name: `Producto ${id}`, brand, stock, familyCode: '', problem: 'foto_remota', photos: 1, firstSrc: 'api.mybihr.com/x',
 });
-const result = (outcome: RepairOutcome, detail = 'HTTP 500'): RepairResult => ({
+const result = (outcome: RepairOutcome, detail = 'HTTP 500', errorScope: 'product' | 'service' = 'service'): RepairResult => ({
   saved: outcome === 'saved' ? 1 : 0, outcome,
   attempts: outcome === 'error' ? [{ source: 'zip', target: 'zip', ok: false, detail }] : [],
+  ...(outcome === 'error' ? { errorScope, reason: `zip: ${detail}` } : {}),
 });
 
 const contested = new Set(['DUP']);
@@ -62,7 +63,7 @@ describe('descarga en bloque', () => {
     expect(s.brands.RST).toMatchObject({ total: 2, done: 2, saved: 1, notFound: 1 });
     expect(s.brands.FLY).toMatchObject({ total: 3, done: 3, saved: 1, failed: 1, skipped: 1, lastError: 'zip: HTTP 500' });
     expect(s.recentErrors).toEqual([{ id: 3, sku: 'SKU3', brand: 'FLY', message: 'zip: HTTP 500' }]);
-    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['zip', 'api'], exactCodes: true, contested });
+    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['zip', 'api'], exactCodes: true, contested, refreshStaleIndex: false });
     expect(deps.bust).toHaveBeenCalledTimes(1);
     expect(mocks.invalidate).toHaveBeenCalledTimes(1);
     expect(s.finishedAt).toBeTruthy();
@@ -75,7 +76,7 @@ describe('descarga en bloque', () => {
     await startRepairJob({ scope: 'all', useApi: false, concurrency: 1 }, deps);
     await finished();
     expect(order).toEqual([2, 1]);
-    expect(deps.repair).toHaveBeenCalledWith(2, { sources: ['zip'], exactCodes: true, contested });
+    expect(deps.repair).toHaveBeenCalledWith(2, { sources: ['zip'], exactCodes: true, contested, refreshStaleIndex: false });
     expect(deps.bust).not.toHaveBeenCalled(); // no se guardó ninguna foto
     expect(getRepairJobState()).toMatchObject({ scope: 'all', useApi: false, notFound: 2 });
   });
@@ -113,9 +114,37 @@ describe('descarga en bloque', () => {
     await finished();
     const s = getRepairJobState();
     expect(s.status).toBe('done');
-    expect(s.brands.MALA).toMatchObject({ done: 8, failed: 5, skipped: 3 });
+    expect(s.brands.MALA).toMatchObject({ done: 8, failed: 5, skipped: 3, gaveUp: true });
     expect(s.brands.BUENA).toMatchObject({ saved: 2 });
+    expect(s.brands.BUENA.gaveUp).toBeUndefined();
     expect(deps.repair).toHaveBeenCalledTimes(7);
+    // No acaba como si nada: dice qué marca se quedó a medias.
+    expect(s.message).toBe('Terminado, pero se dejó a medias la marca MALA por fallos seguidos. Vuelve a lanzar la descarga para reintentarlas.');
+  });
+
+  it('una foto dañada de un producto no cuenta para dejar la marca ni para parar el trabajo', async () => {
+    const deps = makeDeps(Array.from({ length: 60 }, (_, i) => item(i + 1, 'A')), async () => result('error', 'la foto del zip está dañada (CRC)', 'product'));
+    await startRepairJob({ concurrency: 1 }, deps);
+    await finished();
+    const s = getRepairJobState();
+    expect(s).toMatchObject({ status: 'done', done: 60, failed: 60, skipped: 0, message: undefined });
+    expect(s.brands.A.gaveUp).toBeUndefined();
+    expect(deps.repair).toHaveBeenCalledTimes(60);
+    expect(s.recentErrors.at(-1)?.message).toBe('zip: la foto del zip está dañada (CRC)');
+  });
+
+  it('si se para mientras carga la lista no empieza ni toca la auditoría', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const deps = makeDeps([item(1, 'A')], async () => result('saved'), { loadItems: vi.fn(async () => { await gate; return [item(1, 'A')]; }) });
+    await startRepairJob({}, deps);
+    expect(stopRepairJob().status).toBe('stopping');
+    release();
+    await finished();
+    expect(getRepairJobState()).toMatchObject({ status: 'stopped', done: 0, total: 0, message: 'Parado a petición' });
+    expect(deps.repair).not.toHaveBeenCalled();
+    expect(deps.contested).not.toHaveBeenCalled();
+    expect(mocks.invalidate).not.toHaveBeenCalled();
   });
 
   it('se para solo tras 40 fallos seguidos de marcas distintas', async () => {

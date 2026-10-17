@@ -31,7 +31,7 @@ vi.mock('./image-sandbox.js', async (importOriginal) => ({
   }),
 }));
 
-import { readZipIndex, readZipEntry, zipPhotosFor, repairProductImages, contestedFileBases } from './bihr-images.js';
+import { readZipIndex, readZipEntry, zipPhotosFor, repairProductImages, contestedFileBases, failureKind } from './bihr-images.js';
 
 interface ZipFile { name: string; data: Buffer; store?: boolean; declaredSize?: number; crc?: number }
 
@@ -210,6 +210,7 @@ describe('reparar las fotos de un producto', () => {
       images, images_raw: images === null ? null : JSON.stringify(images), ...over };
   };
   const repair = () => repairProductImages(244141, { zipBase: base, uploadsDir: uploads });
+  const repairZipOnly = () => repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['zip'] });
 
   beforeEach(() => {
     uploads = fs.mkdtempSync(path.join(os.tmpdir(), 'bihr-repair-'));
@@ -304,20 +305,45 @@ describe('reparar las fotos de un producto', () => {
     db.product = product({ images: [{ src: '/uploads/optimized/buena.webp' }] });
     expect((await repair()).outcome).toBe('nothing_to_do');
     db.product = product({ sku: 'NOESTA', part_number: 'NOESTA' });
-    const missing = await repair();
+    const missing = await repairZipOnly();
     expect(missing).toMatchObject({ saved: 0, outcome: 'not_found' });
     db.product = product({ brand: 'gone', images: [] });
-    expect((await repair()).outcome).toBe('not_found'); // la marca no tiene zip (HTTP 404): no es un fallo
+    expect((await repairZipOnly()).outcome).toBe('not_found'); // la marca no tiene zip (HTTP 404): no es un fallo
     db.product = product({ brand: 'crc', sku: 'MAL', part_number: 'MAL' });
-    expect((await repair()).outcome).toBe('error'); // la foto del zip está dañada
+    const damaged = await repairZipOnly();
+    expect(damaged).toMatchObject({ outcome: 'error', errorScope: 'product' }); // la foto del zip está dañada: es de este producto
+    expect(damaged.reason).toContain('CRC');
     sandbox.fail = true;
     db.product = product();
-    expect((await repair()).outcome).toBe('error'); // el procesador de imágenes no responde
+    expect(await repair()).toMatchObject({ outcome: 'error', errorScope: 'service' }); // el procesador de imágenes no responde
+  });
+
+  it('si la API no se puede usar (sin credenciales) lo dice como error de la fuente, no como «no tiene la foto»', async () => {
+    db.product = product({ sku: 'NOESTA', part_number: 'NOESTA', images: [] });
+    const r = await repair(); // zip sin esa referencia y la API sin credenciales
+    expect(r).toMatchObject({ outcome: 'error', errorScope: 'service', reason: 'api: sin credenciales de la API de Bihr' });
+  });
+
+  it('failureKind separa lo que no está, lo que no sirve y lo que falla', () => {
+    const k = (source: 'zip' | 'api' | 'catalogo', detail: string) => failureKind({ source, detail });
+    expect(k('zip', 'HTTP 404')).toBe('missing');
+    expect(k('zip', 'ninguna de las referencias está en el zip')).toBe('missing');
+    expect(k('api', 'HTTP 404')).toBe('missing');
+    expect(k('api', 'respuesta demasiado pequeña')).toBe('missing');
+    expect(k('zip', 'la foto del zip está dañada (CRC)')).toBe('product');
+    expect(k('catalogo', 'procesador de imágenes: Imagen no válida')).toBe('product');
+    expect(k('api', 'HTTP 500')).toBe('service');
+    expect(k('api', 'HTTP 429')).toBe('service');
+    expect(k('api', 'la API de Bihr no responde bien; se vuelve a probar en unos minutos')).toBe('service');
+    expect(k('api', 'autenticación rechazada (HTTP 401)')).toBe('service');
+    expect(k('zip', 'sin respuesta a tiempo')).toBe('service');
+    expect(k('zip', 'zip de más de 4 GB (ZIP64), no se puede leer por rangos')).toBe('service');
+    expect(k('catalogo', 'procesador de imágenes: HTTP 503')).toBe('service');
   });
 
   it('un producto sin marca no tiene zip que mirar y se dice', async () => {
     db.product = product({ brand: null });
-    const r = await repair();
+    const r = await repairZipOnly();
     expect(r.outcome).toBe('not_found');
     expect(r.attempts.find((a) => a.source === 'zip')?.detail).toContain('no tiene marca');
   });

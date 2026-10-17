@@ -22,7 +22,11 @@ import { cacheBust } from './cache.js';
 export type RepairJobScope = 'stock' | 'all';
 export type RepairJobStatus = 'idle' | 'running' | 'stopping' | 'done' | 'stopped' | 'error';
 
-export interface BrandStats { total: number; done: number; saved: number; notFound: number; failed: number; skipped: number; lastError?: string }
+export interface BrandStats {
+  total: number; done: number; saved: number; notFound: number; failed: number; skipped: number; lastError?: string;
+  /** Se dejó a medias por fallos seguidos: los productos que quedaban cuentan como saltados. */
+  gaveUp?: boolean;
+}
 export interface RepairJobError { id: number; sku: string; brand: string; message: string }
 export interface RepairJobState {
   status: RepairJobStatus;
@@ -74,6 +78,7 @@ const MIN_FREE_BYTES = 2 * 1024 ** 3;
 const DISK_CHECK_EVERY = 25;
 const BUST_EVERY_SAVED = 200;
 const BUST_EVERY_MS = 60_000;
+const BUST_TIMEOUT_MS = 30_000;
 const MAX_RECENT_ERRORS = 20;
 
 const defaultDeps: RepairJobDeps = {
@@ -134,6 +139,13 @@ export function orderQueue(items: ImageAuditItem[]): ImageAuditItem[] {
 
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+/** Para que una llamada que no contesta no deje el trabajo en «en marcha» para siempre. */
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what}: sin respuesta en ${ms / 1000} s`)), ms); });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** Lanza la descarga en bloque y devuelve enseguida; el trabajo sigue en segundo plano. */
 export async function startRepairJob(
   opts: { scope?: unknown; useApi?: unknown; concurrency?: unknown } = {},
@@ -156,8 +168,17 @@ export async function startRepairJob(
 }
 
 async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobDeps): Promise<void> {
+  const stoppedBeforeStart = () => {
+    if (!ctl.stop) return false;
+    job.status = 'stopped';
+    job.message = 'Parado a petición';
+    job.finishedAt = new Date().toISOString();
+    return true;
+  };
   const items = await deps.loadItems(job.scope);
+  if (stoppedBeforeStart()) return;
   const contested = await deps.contested();
+  if (stoppedBeforeStart()) return;
   const queue = orderQueue(items);
   job.total = queue.length;
   for (const item of queue) {
@@ -186,7 +207,7 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     savedSinceBust = 0;
     lastBustAt = Date.now();
     const done: Promise<void> = (busting ?? Promise.resolve())
-      .then(() => deps.bust())
+      .then(() => withTimeout(deps.bust(), BUST_TIMEOUT_MS, 'vaciar la caché'))
       .catch((e) => console.error('[IMAGE REPAIR JOB] no se pudo vaciar la caché:', e?.message))
       .finally(() => { if (busting === done) busting = null; });
     busting = done;
@@ -208,7 +229,7 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     let result: RepairResult | null = null;
     let thrown: string | null = null;
     try {
-      result = await deps.repair(item.id, { sources, exactCodes: true, contested });
+      result = await deps.repair(item.id, { sources, exactCodes: true, contested, refreshStaleIndex: false });
     } catch (err) {
       thrown = messageOf(err);
     }
@@ -227,13 +248,16 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
       case 'not_found': job.notFound++; b.notFound++; streak = 0; brandStreak.set(item.brand, 0); break;
       default: {
         job.failed++; b.failed++;
-        const why = result!.attempts.filter((a) => !a.ok).map((a) => `${a.source}: ${a.detail}`).pop() || 'error desconocido';
+        const why = result!.reason || result!.attempts.filter((a) => !a.ok).map((a) => `${a.source}: ${a.detail}`).pop() || 'error desconocido';
         fail(item, why);
+        // Que la foto de este producto no sirva (dañada, el procesador la rechaza) no dice nada de la fuente.
+        if (result!.errorScope === 'product') break;
         streak++;
         const brandFails = (brandStreak.get(item.brand) || 0) + 1;
         brandStreak.set(item.brand, brandFails);
         if (brandFails >= BRAND_FAILURE_LIMIT && !deadBrands.has(item.brand)) {
           deadBrands.add(item.brand);
+          b.gaveUp = true;
           console.warn(`[IMAGE REPAIR JOB] se deja la marca ${item.brand}: ${brandFails} fallos seguidos (${why})`);
         }
       }
@@ -271,6 +295,13 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
   job.finishedAt = new Date().toISOString();
   if (fatal) { job.status = 'error'; job.message = fatal; }
   else if (ctl.stop) { job.status = 'stopped'; job.message = 'Parado a petición'; }
-  else { job.status = 'done'; job.message = undefined; }
+  else {
+    job.status = 'done';
+    const gaveUp = Object.keys(job.brands).filter((name) => job.brands[name].gaveUp);
+    const names = gaveUp.length > 5 ? `${gaveUp.slice(0, 5).join(', ')} y ${gaveUp.length - 5} más` : gaveUp.join(', ');
+    job.message = gaveUp.length
+      ? `Terminado, pero ${gaveUp.length === 1 ? 'se dejó a medias la marca' : 'se dejaron a medias las marcas'} ${names} por fallos seguidos. Vuelve a lanzar la descarga para reintentarlas.`
+      : undefined;
+  }
   console.log(`[IMAGE REPAIR JOB] ${job.status}: ${job.done}/${job.total} · con foto ${job.saved} · sin foto en Bihr ${job.notFound} · fallos ${job.failed} · saltados ${job.skipped}`);
 }
