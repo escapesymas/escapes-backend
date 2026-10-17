@@ -54,3 +54,11 @@ Edge cases to handle:
 - brand names with spaces (e.g. `FLY RACING`, `TROY LEE DESIGNS`) — URL-encode the
   space as `%20`.
 - SKUs that aren't in the brand's zip (e.g. if Bihr moved them) — log and skip.
+## TLS de static.bihr.pro (2026-10-17)
+
+Desde el contenedor del backend, `static.bihr.pro` falla con `UNABLE_TO_VERIFY_LEAF_SIGNATURE`:
+el servidor no manda el certificado intermedio y Node (a diferencia de los navegadores) no lo
+busca. `lib/range-http.ts` hace lo que hace un navegador: ante ese error lee la dirección
+«CA Issuers» del certificado, descarga el intermedio y reintenta verificando la cadena entera
+contra las raíces de Mozilla. No se desactiva ninguna comprobación. Lo usa «Descargar fotos de
+Bihr» (`lib/bihr-images.ts`); `scripts/download-images-from-zip.ts` sigue usando `fetch`.

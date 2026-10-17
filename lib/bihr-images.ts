@@ -21,6 +21,7 @@ import { randomUUID } from 'crypto';
 import { pool } from '../db.js';
 import { fetchRemoteImage, REMOTE_IMAGE_MAX_BYTES } from './remote-image.js';
 import { processImage, detectImageType } from './image-sandbox.js';
+import { httpGet } from './range-http.js';
 
 export const BIHR_ZIP_BASE = 'https://static.bihr.pro/eBihr/Pictures';
 const BIHR_API_BASE = process.env.BIHR_API_BASE || 'https://api.bihr.net';
@@ -33,6 +34,7 @@ const ZIP_UA = 'EscapesYMas-Bihr-Image-Downloader/4.0';
 /** Tiempo máximo de toda la reparación; el proxy del panel corta a los 120 s. */
 const REPAIR_BUDGET_MS = 55_000;
 const ZIP64 = 0xffffffff;
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
 export interface RepairAttempt { source: 'catalogo' | 'zip' | 'api'; target: string; ok: boolean; detail: string }
 export interface RepairResult { saved: number; attempts: RepairAttempt[] }
@@ -50,6 +52,7 @@ function explain(err: any): string {
   if (code === 'ENOTFOUND') return 'no se encuentra el servidor (DNS)';
   if (code === 'ECONNREFUSED') return 'conexión rechazada';
   if (code === 'ECONNRESET' || code === 'UND_ERR_SOCKET') return 'conexión cortada por el servidor';
+  if (/^UNABLE_TO_(VERIFY|GET)/.test(code)) return `el certificado del servidor no se puede verificar (${code}); no se pudo completar la cadena de certificados`;
   if (/CERT|TLS|SSL/.test(code)) return `error de certificado (${code})`;
   if (err?.message === 'fetch failed') return `fallo de red${code ? ` (${code})` : ''}`;
   return err?.message || String(err);
@@ -74,37 +77,42 @@ type ByteRange = { start: number; end: number } | { suffix: number };
  */
 async function rangeFetch(zipUrl: string, range: ByteRange, timeoutMs: number): Promise<Buffer> {
   const header = 'suffix' in range ? `bytes=-${range.suffix}` : `bytes=${range.start}-${range.end}`;
-  const signal = AbortSignal.timeout(timeoutMs);
+  const expected = 'suffix' in range ? range.suffix : range.end - range.start + 1;
   let current = zipUrl;
-  let r: Response;
   for (let hop = 0; ; hop++) {
-    r = await fetch(current, { headers: { 'User-Agent': ZIP_UA, Range: header }, redirect: 'manual', signal });
-    if (![301, 302, 303, 307, 308].includes(r.status)) break;
-    r.body?.cancel().catch(() => {});
-    const location = r.headers.get('location');
-    const next = location ? new URL(location, current) : null;
-    if (!next || hop >= 3) throw new Error(`redirección ${r.status} sin destino`);
-    if (next.host !== new URL(zipUrl).host && !(next.protocol === 'https:' && BIHR_REDIRECT_HOST.test(next.hostname))) {
-      throw new Error(`redirección a ${next.host} no permitida`);
-    }
-    current = next.toString();
-  }
-  if (r.status === 206) {
-    if (!('suffix' in range)) {
-      const from = /^bytes (\d+)-/.exec(r.headers.get('content-range') || '')?.[1];
-      if (from === undefined || Number(from) !== range.start) {
-        r.body?.cancel().catch(() => {});
-        throw new Error('el servidor devolvió otro trozo del zip');
+    const r = await httpGet(current, {
+      headers: { 'User-Agent': ZIP_UA, Range: header },
+      timeoutMs,
+      onResponse: (status, headers) => {
+        if (REDIRECT_STATUS.has(status)) return 0;
+        if (status === 206) {
+          if (!('suffix' in range) && Number(/^bytes (\d+)-/.exec(String(headers['content-range'] || ''))?.[1] ?? -1) !== range.start) {
+            throw new Error('el servidor devolvió otro trozo del zip');
+          }
+          return expected + 1024;
+        }
+        if (status === 200) {
+          if (Number(headers['content-length'] || Infinity) > 4 * 1024 * 1024) throw new Error('el servidor no admite Range');
+          return 4 * 1024 * 1024;
+        }
+        throw new Error(`HTTP ${status}`);
+      },
+    });
+    if (REDIRECT_STATUS.has(r.status)) {
+      const location = r.headers.location;
+      const next = location ? new URL(location, current) : null;
+      if (!next || hop >= 3) throw new Error(`redirección ${r.status} sin destino`);
+      if (next.host !== new URL(zipUrl).host && !(next.protocol === 'https:' && BIHR_REDIRECT_HOST.test(next.hostname))) {
+        throw new Error(`redirección a ${next.host} no permitida`);
       }
+      current = next.toString();
+      continue;
     }
-    return Buffer.from(await r.arrayBuffer());
+    if (r.status === 200) {
+      return 'suffix' in range ? r.body.subarray(Math.max(0, r.body.length - range.suffix)) : r.body.subarray(range.start, range.end + 1);
+    }
+    return r.body;
   }
-  if (r.status === 200 && Number(r.headers.get('content-length') || Infinity) <= 4 * 1024 * 1024) {
-    const whole = Buffer.from(await r.arrayBuffer());
-    return 'suffix' in range ? whole.subarray(Math.max(0, whole.length - range.suffix)) : whole.subarray(range.start, range.end + 1);
-  }
-  r.body?.cancel().catch(() => {});
-  throw new Error(r.status === 200 ? 'el servidor no admite Range' : `HTTP ${r.status}`);
 }
 
 /** Lee el directorio central del zip (sin ZIP64) y lista sus ficheros. */
