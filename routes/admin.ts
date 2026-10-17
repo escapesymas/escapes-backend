@@ -165,7 +165,10 @@ adminRouter.post('/admin/products/:id(\\d+)/repair-images', requireAdmin, async 
   const id = parseInt(req.params.id, 10);
   try {
     const result = await repairProductImages(id);
-    if (result.saved > 0) await cacheBust('cache:products');
+    if (result.saved > 0) {
+      // Listados, compatibilidades por moto y sugerencias del buscador guardan las fotos de la ficha.
+      await Promise.all([cacheBust('cache:products'), cacheBust('compat:prod'), cacheBust('cache:suggest')]);
+    }
     console.log(`[REPAIR IMAGES] producto ${id}: ${result.saved} fotos guardadas (${req.user?.email || req.user?.id || 'admin'})`);
     return res.json(result);
   } catch (err: any) {

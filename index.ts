@@ -4794,8 +4794,12 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         // Handle images: only update when content is provided; preserve existing if empty array sent
         let imgsToSet: string | undefined | null = undefined;
         if (b.images !== undefined) {
-          if (Array.isArray(b.images) && b.images.length > 0) {
-            imgsToSet = JSON.stringify(b.images);
+          // Una foto sin `src` ni `url` no sirve para nada: no puede borrar las que ya hay.
+          const usableImages = Array.isArray(b.images)
+            ? b.images.filter((im: any) => (typeof im === 'string' ? im.trim() : im?.src || im?.url))
+            : [];
+          if (usableImages.length > 0) {
+            imgsToSet = JSON.stringify(usableImages);
           } else {
             const existing = await db.execute(sql`SELECT images FROM products WHERE id = ${productId}`);
             if (existing.rows.length > 0 && existing.rows[0].images) {

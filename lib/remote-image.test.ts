@@ -10,6 +10,8 @@ beforeAll(async () => {
   // Como el CDN de Bihr: 403 si no llega una cabecera de navegador.
   server = http.createServer((req, res) => {
     if (req.url === '/gone') { res.statusCode = 404; return res.end('nope'); }
+    if (req.url === '/jump-ok') { res.statusCode = 302; res.setHeader('Location', '/ok.png'); return res.end(); }
+    if (req.url === '/jump-out') { res.statusCode = 302; res.setHeader('Location', 'http://127.0.0.2:1/interno.png'); return res.end(); }
     if (req.headers['user-agent'] !== REMOTE_IMAGE_HEADERS['User-Agent']) { res.statusCode = 403; return res.end('blocked'); }
     res.setHeader('Content-Type', 'image/png');
     res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
@@ -29,5 +31,12 @@ describe('fetchRemoteImage', () => {
 
   it('incluye el código HTTP cuando falla', async () => {
     await expect(fetchRemoteImage(`${base}/gone`, 5_000)).rejects.toThrow('No se pudo descargar la imagen (404)');
+  });
+
+  it('con allowRedirect solo sigue las redirecciones que se le permiten', async () => {
+    const same = (to: URL) => to.host === new URL(base).host;
+    const ok = await fetchRemoteImage(`${base}/jump-ok`, 5_000, { allowRedirect: same });
+    expect(ok.data.length).toBe(4);
+    await expect(fetchRemoteImage(`${base}/jump-out`, 5_000, { allowRedirect: same })).rejects.toThrow('no permitida');
   });
 });
