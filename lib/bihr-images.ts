@@ -299,10 +299,10 @@ function bihrApiToken(): Promise<string> {
 }
 
 /**
- * La API de Bihr limita las peticiones (429 si van muy seguidas): todas las llamadas del proceso
- * salen de una en una, con al menos 250 ms entre una y otra.
+ * La API de Bihr limita las peticiones a 1 por segundo y servicio (429 si van más seguidas): todas las
+ * llamadas del proceso salen de una en una, con algo más de un segundo entre una y otra.
  */
-const API_MIN_GAP_MS = 250;
+const API_MIN_GAP_MS = 1_100;
 let apiChain: Promise<void> = Promise.resolve();
 let apiLastCallAt = 0;
 

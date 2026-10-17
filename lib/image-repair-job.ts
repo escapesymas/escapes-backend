@@ -76,6 +76,8 @@ export interface RepairJobDeps {
   bust(): Promise<void>;
   /** Espacio libre en el disco de las fotos, o null si no se sabe. */
   freeBytes(): Promise<number | null>;
+  /** Esperas antes de reintentar un producto cuando la API de Bihr no responde (ms). */
+  outageWaitsMs?: number[];
 }
 
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
@@ -95,6 +97,11 @@ const MAX_RECENT_ERRORS = 20;
 const CATALOG_LOAD_TIMEOUT_MS = 5 * 60_000;
 /** Productos por llamada a Products/Details. */
 const DETAILS_BATCH = 20;
+/**
+ * Si la API de Bihr (o su acceso) no responde, no es culpa de la marca ni del producto: se espera y se
+ * reintenta el mismo producto (unos 14 min en total). Así una caída de Bihr no hace dejar marcas enteras.
+ */
+const OUTAGE_WAITS_MS = [15_000, 30_000, 60_000, 120_000, 300_000, 300_000];
 
 const defaultDeps: RepairJobDeps = {
   async loadItems(scope) {
@@ -287,6 +294,18 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     return done;
   };
 
+  /** La API de Bihr no respondió (Products/Details o su acceso): fallo de Bihr, no de la marca ni del producto. */
+  const apiOutage = (r: RepairResult) => {
+    if (r.outcome !== 'error' || r.errorScope !== 'service') return false;
+    const worst = r.attempts.find((a) => !a.ok && `${a.source}: ${a.detail}` === r.reason);
+    return worst?.source === 'detalles' && worst.target === 'Products/Details';
+  };
+  /** Espera que se corta si se pide parar. */
+  const pause = async (ms: number) => {
+    const until = Date.now() + ms;
+    while (!ctl.stop && Date.now() < until) await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
+  };
+
   const fail = (item: ImageAuditItem, message: string) => {
     const b = job.brands[item.brand];
     b.lastError = message;
@@ -301,11 +320,23 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
 
     let result: RepairResult | null = null;
     let thrown: string | null = null;
-    try {
-      result = await deps.repair(item.id, { sources, exactCodes: true, contested, catalogUrls, detailsLookup: detailsLookupFor(index), refreshStaleIndex: false });
-    } catch (err) {
-      thrown = messageOf(err);
+    const waits = deps.outageWaitsMs ?? OUTAGE_WAITS_MS;
+    for (let attempt = 0; ; attempt++) {
+      result = null; thrown = null;
+      try {
+        result = await deps.repair(item.id, { sources, exactCodes: true, contested, catalogUrls, detailsLookup: detailsLookupFor(index), refreshStaleIndex: false });
+      } catch (err) {
+        thrown = messageOf(err);
+      }
+      if (!result || !apiOutage(result) || attempt >= waits.length || ctl.stop) break;
+      const wait = waits[attempt];
+      job.message = `La API de Bihr no responde (${result.reason}); se reintenta en ${Math.round(wait / 1000)} s…`;
+      if (attempt === 0) console.warn(`[IMAGE REPAIR JOB] la API de Bihr no responde (${result.reason}); se reintenta`);
+      await pause(wait);
+      // La tanda guardada tiene el error: se vuelve a pedir.
+      detailsChunks.delete(Math.floor(index / DETAILS_BATCH));
     }
+    if (job.message?.startsWith('La API de Bihr no responde')) job.message = catalogNote;
 
     if (thrown !== null) {
       if (/Ya se están descargando/.test(thrown)) { job.skipped++; b.skipped++; return; }
@@ -329,6 +360,8 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
         // Que la foto de este producto no sirva (dañada, el procesador la rechaza) no dice nada de la fuente.
         if (result!.errorScope === 'product') break;
         streak++;
+        // Bihr siguió sin responder tras las esperas: cuenta para parar el trabajo, no para dejar la marca.
+        if (apiOutage(result!)) break;
         const brandFails = (brandStreak.get(item.brand) || 0) + 1;
         brandStreak.set(item.brand, brandFails);
         if (brandFails >= BRAND_FAILURE_LIMIT && !deadBrands.has(item.brand)) {

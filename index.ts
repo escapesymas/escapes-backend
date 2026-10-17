@@ -8,9 +8,7 @@ import util from 'util';
 const execPromise = util.promisify(exec);
 import path from 'path';
 import cors from 'cors';
-import pkg from 'pg';
-const { Pool } = pkg;
-import { drizzle } from 'drizzle-orm/node-postgres';
+import { pool as sharedPool, db as sharedDb } from './db.js';
 import { sql, eq, desc, and, type SQL } from 'drizzle-orm';
 import {
   pgTable, serial, text, varchar, timestamp, integer
@@ -238,12 +236,10 @@ for (const [key, value] of allVars) {
 // ================================================================
 // BASE DE DATOS (PostgreSQL localhost en VPS)
 // ================================================================
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: false
-});
-
-const db = drizzle(pool);
+// Pool compartido (db.ts): keepalive y manejador de errores de conexiones ociosas.
+// Un pool propio aquí sin ese manejador tumbaba la API con cada «read ETIMEDOUT».
+const pool = sharedPool;
+const db = sharedDb;
 
 // Startup Database Alignment for Accounting Columns
 (async () => {

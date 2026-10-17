@@ -9,8 +9,13 @@ if (!connectionString) {
 }
 
 const pool = connectionString
-  ? new Pool({ connectionString, max: 2 })
+  ? new Pool({ connectionString, max: 2, keepAlive: true, idleTimeoutMillis: 30_000 })
   : null as any;
+
+// Sin manejador, un cliente ocioso que pierde la conexión (read ETIMEDOUT) tumba la API.
+pool?.on('error', (err: Error) => {
+  console.error('[SERVER TRACKING] Error en una conexión ociosa del pool:', err.message);
+});
 
 const db = pool ? drizzle(pool) : null;
 

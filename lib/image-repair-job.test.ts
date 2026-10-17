@@ -211,6 +211,54 @@ describe('descarga en bloque', () => {
     expect(s.message).toBe('Terminado, pero se dejó a medias la marca MALA por fallos seguidos. Vuelve a lanzar la descarga para reintentarlas.');
   });
 
+  describe('caídas de la API de Bihr', () => {
+    // Lo que devuelve la ficha cuando Products/Details (o pedir el token) no responde.
+    const outage = (): RepairResult => ({
+      saved: 0, outcome: 'error', errorScope: 'service', reason: 'detalles: sin respuesta a tiempo',
+      attempts: [{ source: 'detalles', target: 'Products/Details', ok: false, detail: 'sin respuesta a tiempo' }],
+    });
+
+    it('espera y reintenta el mismo producto sin dejar la marca, y vuelve a pedir la tanda', async () => {
+      const items = Array.from({ length: 8 }, (_, i) => item(i + 1, 'RST'));
+      let calls = 0;
+      const productPictures = vi.fn(async () => new Map<string, string[]>());
+      const deps = makeDeps(items, async (id, opts) => {
+        await opts.detailsLookup!([`SKU${id}`]);
+        return ++calls <= 6 ? outage() : result('saved'); // Bihr no responde las 6 primeras veces
+      }, { productPictures, outageWaitsMs: [0, 0, 0, 0, 0, 0, 0] });
+      await startRepairJob({ concurrency: 1 }, deps);
+      await finished();
+      const s = getRepairJobState();
+      expect(s).toMatchObject({ status: 'done', saved: 8, failed: 0, skipped: 0, message: undefined });
+      expect(s.brands.RST.gaveUp).toBeUndefined();
+      expect(deps.repair).toHaveBeenCalledTimes(14);
+      expect(productPictures).toHaveBeenCalledTimes(7); // cada reintento vuelve a pedir la tanda
+    });
+
+    it('si Bihr sigue sin responder cuenta el fallo para parar el trabajo, pero no deja la marca', async () => {
+      const items = Array.from({ length: 6 }, (_, i) => item(i + 1, 'RST'));
+      const deps = makeDeps(items, async () => outage(), { outageWaitsMs: [0, 0] });
+      await startRepairJob({ concurrency: 1 }, deps);
+      await finished();
+      const s = getRepairJobState();
+      expect(s.brands.RST).toMatchObject({ done: 6, failed: 6, skipped: 0 });
+      expect(s.brands.RST.gaveUp).toBeUndefined();
+      expect(deps.repair).toHaveBeenCalledTimes(18); // 1 + 2 reintentos por producto
+    });
+
+    it('un fallo al descargar la foto del CDN (no de la API) sigue contando para dejar la marca', async () => {
+      const cdnFail = (): RepairResult => ({
+        saved: 0, outcome: 'error', errorScope: 'service', reason: 'detalles: sin respuesta a tiempo',
+        attempts: [{ source: 'detalles', target: 'api.mybihr.com/medias/x.jpg', ok: false, detail: 'sin respuesta a tiempo' }],
+      });
+      const deps = makeDeps(Array.from({ length: 7 }, (_, i) => item(i + 1, 'MALA')), async () => cdnFail(), { outageWaitsMs: [0] });
+      await startRepairJob({ concurrency: 1 }, deps);
+      await finished();
+      expect(getRepairJobState().brands.MALA).toMatchObject({ failed: 5, skipped: 2, gaveUp: true });
+      expect(deps.repair).toHaveBeenCalledTimes(5);
+    });
+  });
+
   it('una foto dañada de un producto no cuenta para dejar la marca ni para parar el trabajo', async () => {
     const deps = makeDeps(Array.from({ length: 60 }, (_, i) => item(i + 1, 'A')), async () => result('error', 'la foto del zip está dañada (CRC)', 'product'));
     await startRepairJob({ concurrency: 1 }, deps);
