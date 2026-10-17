@@ -221,7 +221,8 @@ describe('reparar las fotos de un producto', () => {
     return { id: 244141, sku: '8010897003', name: 'Gafas SCOTT', brand: 'scott', part_number: '8010897003', supplier_code: null,
       images, images_raw: images === null ? null : JSON.stringify(images), ...over };
   };
-  const repair = () => repairProductImages(244141, { zipBase: base, uploadsDir: uploads });
+  // Sin «detalles»: esa fuente llama a la API v3 y tiene sus propias pruebas más abajo.
+  const repair = () => repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['catalogo', 'zip', 'api'] });
   const repairZipOnly = () => repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['zip'] });
 
   beforeEach(() => {
@@ -339,7 +340,7 @@ describe('reparar las fotos de un producto', () => {
   });
 
   it('failureKind separa lo que no está, lo que no sirve y lo que falla', () => {
-    const k = (source: 'zip' | 'api' | 'catalogo', detail: string) => failureKind({ source, detail });
+    const k = (source: 'zip' | 'api' | 'catalogo' | 'detalles', detail: string) => failureKind({ source, detail });
     expect(k('zip', 'HTTP 404')).toBe('missing');
     expect(k('zip', 'ninguna de las referencias está en el zip')).toBe('missing');
     expect(k('api', 'HTTP 404')).toBe('missing');
@@ -360,6 +361,68 @@ describe('reparar las fotos de un producto', () => {
     expect(k('catalogo', 'No se pudo descargar la imagen (403)')).toBe('service');
     expect(k('catalogo', 'No se pudo descargar la imagen (503)')).toBe('service');
     expect(k('catalogo', 'sin respuesta a tiempo')).toBe('service');
+    expect(k('detalles', 'Bihr no trae fotos de este producto')).toBe('missing');
+    expect(k('detalles', 'No se pudo descargar la imagen (404)')).toBe('missing');
+    expect(k('detalles', 'HTTP 401: nope')).toBe('service');
+    expect(k('detalles', 'HTTP 429')).toBe('service');
+  });
+
+  describe('detalles del producto (Products/Details de Bihr)', () => {
+    const PIC = (n: number) => `https://api.mybihr.com/medias/800Wx800H-8010897003-${n}.jpg?context=c${n}`;
+    const detailed = (lookup: (codes: string[]) => Promise<readonly string[]>, extra: Record<string, any> = {}) =>
+      repairProductImages(244141, { zipBase: base, uploadsDir: uploads, exactCodes: true, detailsLookup: lookup, ...extra });
+
+    it('baja cada foto de su enlace, pidiendo los detalles con el número de pieza y el SKU', async () => {
+      db.product = product({ sku: 'SKU-1', part_number: '8010897003', images: [{ src: '' }, { src: '' }] });
+      remote.responses[PIC(1)] = JPG(1);
+      remote.responses[PIC(2)] = JPG(2);
+      const lookup = vi.fn(async () => [PIC(1), PIC(2), PIC(3)]);
+      const r = await detailed(lookup, { sources: ['detalles'] });
+      expect(lookup).toHaveBeenCalledWith(['8010897003', 'SKU-1']);
+      expect(r).toMatchObject({ saved: 2, outcome: 'saved' });
+      expect(remote.requested).toEqual([PIC(1), PIC(2)]); // la galería tiene dos huecos
+      expect(JSON.parse(db.updates[0][1]).map((i: any) => i.src)).toEqual(['/uploads/optimized/SKU-1_0_800.webp', '/uploads/optimized/SKU-1_1_800.webp']);
+    });
+
+    it('si Bihr no trae fotos de ese producto no es un fallo y se prueban las demás fuentes', async () => {
+      db.product = product({ images: [] });
+      const r = await detailed(async () => [], { sources: ['detalles', 'zip'] });
+      expect(r.outcome).toBe('saved'); // el zip sí la tiene
+      expect(r.attempts[0]).toMatchObject({ source: 'detalles', ok: false, detail: 'Bihr no trae fotos de este producto' });
+      expect(failureKind(r.attempts[0])).toBe('missing');
+    });
+
+    it('si la API falla lo cuenta como fallo de la fuente y sigue con las demás', async () => {
+      db.product = product({ sku: 'NOESTA', part_number: 'NOESTA', images: [] });
+      const r = await detailed(async () => { throw new Error('autenticación rechazada (HTTP 401)'); }, { sources: ['detalles', 'zip'] });
+      expect(r).toMatchObject({ outcome: 'error', errorScope: 'service' });
+      expect(r.reason).toBe('detalles: autenticación rechazada (HTTP 401)');
+      expect(r.attempts.map((a) => a.source)).toEqual(['detalles', 'zip', 'zip']);
+    });
+
+    it('un enlace caducado (404) no es un fallo y no hace falta cuando otra fuente ya trajo la foto', async () => {
+      db.product = product({ images: [] });
+      const r = await detailed(async () => [PIC(1)], { sources: ['detalles', 'zip'] }); // PIC(1) da 404
+      expect(r.outcome).toBe('saved');
+      expect(r.attempts.find((a) => a.source === 'detalles')).toMatchObject({ ok: false, detail: 'No se pudo descargar la imagen (404)' });
+      expect(failureKind(r.attempts[0])).toBe('missing');
+    });
+
+    it('lo que traen los detalles va antes que el enlace del catálogo y el de la ficha', async () => {
+      db.product = product({ images: [{ src: 'https://api.mybihr.com/medias/viejo?context=v' }] });
+      remote.responses[PIC(1)] = JPG(1);
+      const catalogUrls = new Map([['8010897003', 'https://api.mybihr.com/medias/8010897003-1-800Wx800H?context=cat']]);
+      const r = await detailed(async () => [PIC(1)], { sources: ['detalles', 'catalogo'], catalogUrls });
+      expect(r.saved).toBe(1);
+      expect(remote.requested).toEqual([PIC(1)]);
+    });
+
+    it('sin la fuente «detalles» no se llama a la API', async () => {
+      db.product = product({ images: [] });
+      const lookup = vi.fn(async () => [PIC(1)]);
+      await detailed(lookup, { sources: ['zip'] });
+      expect(lookup).not.toHaveBeenCalled();
+    });
   });
 
   describe('enlaces de foto del catálogo de Bihr', () => {

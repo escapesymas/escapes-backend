@@ -3,7 +3,8 @@
  * de Bihr que no se ven (la tienda enseña «Imagen no disponible») y las deja
  * en /uploads/optimized, como hace el descargador (scripts/download-images-from-zip.ts):
  *
- *   1. las URLs de la propia ficha (CDN de Bihr, con la cabecera de /api/image-proxy);
+ *   0. los detalles del producto en la API v3 de Bihr (Products/Details): cada foto trae su enlace actual;
+ *   1. las URLs del catálogo de Bihr y de la propia ficha (CDN de Bihr, con la cabecera de /api/image-proxy);
  *   2. el zip de fotos de la marca (static.bihr.pro), leyendo solo las partes
  *      que hacen falta con HTTP Range (docs/BIHR_IMAGE_SOURCES.md);
  *   3. la API de Bihr (/Products/Image/{código}).
@@ -22,6 +23,7 @@ import { pool } from '../db.js';
 import { fetchRemoteImage, REMOTE_IMAGE_MAX_BYTES } from './remote-image.js';
 import { processImage, detectImageType } from './image-sandbox.js';
 import { httpGet } from './range-http.js';
+import { urlMatchesCode } from './bihr-catalog-pictures.js';
 
 export const BIHR_ZIP_BASE = 'https://static.bihr.pro/eBihr/Pictures';
 const BIHR_API_BASE = process.env.BIHR_API_BASE || 'https://api.bihr.net';
@@ -36,7 +38,7 @@ const REPAIR_BUDGET_MS = 55_000;
 const ZIP64 = 0xffffffff;
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
-export interface RepairAttempt { source: 'catalogo' | 'zip' | 'api'; target: string; ok: boolean; detail: string }
+export interface RepairAttempt { source: 'detalles' | 'catalogo' | 'zip' | 'api'; target: string; ok: boolean; detail: string }
 /**
  * `saved`: se guardó alguna foto; `nothing_to_do`: la ficha ya tiene fotos que existen;
  * `not_found`: la fuente funcionó pero no tiene la foto; `error`: alguna fuente falló.
@@ -55,7 +57,8 @@ export type RepairSource = RepairAttempt['source'];
 const NOT_IN_ZIP = 'ninguna de las referencias está en el zip';
 const NO_BRAND = 'el producto no tiene marca; no se sabe qué zip usar';
 /** Respuestas de una fuente que funcionó pero no tiene la foto (no son un fallo). */
-const NOT_FOUND_DETAILS = new Set([NOT_IN_ZIP, NO_BRAND]);
+const NO_DETAILS_PICTURES = 'Bihr no trae fotos de este producto';
+const NOT_FOUND_DETAILS = new Set([NOT_IN_ZIP, NO_BRAND, NO_DETAILS_PICTURES]);
 
 /**
  * Qué significa un intento fallido: `missing` (la fuente funciona pero no tiene la foto), `product`
@@ -67,7 +70,7 @@ const PRODUCT_FAILURE = /^No se pudo descargar la imagen \(400\)$|dañada \(CRC\
 export function failureKind(a: Pick<RepairAttempt, 'source' | 'detail'>): FailureKind {
   if (NOT_FOUND_DETAILS.has(a.detail) || a.detail === 'HTTP 404') return 'missing';
   // El enlace de la ficha o del catálogo ya no existe (fetchRemoteImage dice «(404)»); un 400 es un enlace roto.
-  if (a.source === 'catalogo' && /^No se pudo descargar la imagen \((404|410)\)$/.test(a.detail)) return 'missing';
+  if ((a.source === 'catalogo' || a.source === 'detalles') && /^No se pudo descargar la imagen \((404|410)\)$/.test(a.detail)) return 'missing';
   // La API de Bihr contesta con algo que no es una foto cuando no tiene la de ese producto.
   if (a.source === 'api' && /^(respuesta demasiado pequeña|imagen demasiado grande|la respuesta no es una imagen)$/.test(a.detail)) return 'missing';
   return PRODUCT_FAILURE.test(a.detail) ? 'product' : 'service';
@@ -327,7 +330,11 @@ let apiFailures = 0;
 let apiPausedUntil = 0;
 const apiFailed = () => { if (++apiFailures >= API_FAILURE_LIMIT) apiPausedUntil = Date.now() + API_PAUSE_MS; };
 
-async function bihrApiImage(code: string, timeoutMs: number, retry = true, backoff = 0): Promise<Buffer> {
+/**
+ * Llamada a la API de Bihr con token, ritmo (apiGate), reintento si el token está revocado, espera si hay 429 y
+ * la cuenta de fallos seguidos. Devuelve la respuesta sea cual sea su código: quien llama lee el cuerpo o lo cancela.
+ */
+async function bihrApiFetch(url: string, init: { method?: string; headers?: Record<string, string>; body?: string }, timeoutMs: number, retry = true, backoff = 0): Promise<Response> {
   if (apiPausedUntil) {
     if (apiPausedUntil > Date.now()) throw new Error('la API de Bihr no responde bien; se vuelve a probar en unos minutos');
     apiPausedUntil = 0; // pasó la pausa: vuelve a tener sus cinco intentos
@@ -343,10 +350,7 @@ async function bihrApiImage(code: string, timeoutMs: number, retry = true, backo
   await apiGate();
   let r: Response;
   try {
-    r = await fetch(`${BIHR_API_BASE}/api/v2.1/Products/Image/${encodeURIComponent(code)}`, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    r = await fetch(url, { ...init, headers: { ...init.headers, Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs) });
   } catch (err) {
     apiFailed();
     throw err;
@@ -354,24 +358,69 @@ async function bihrApiImage(code: string, timeoutMs: number, retry = true, backo
   if ((r.status === 401 || r.status === 403) && retry) {
     r.body?.cancel().catch(() => {});
     apiToken = null; // el token puede haberse revocado antes de caducar
-    return bihrApiImage(code, timeoutMs, false, backoff);
+    return bihrApiFetch(url, init, timeoutMs, false, backoff);
   }
   if (r.status === 429 && backoff < 3) {
     r.body?.cancel().catch(() => {});
     await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** backoff));
-    return bihrApiImage(code, timeoutMs, retry, backoff + 1);
+    return bihrApiFetch(url, init, timeoutMs, retry, backoff + 1);
   }
+  if (r.ok || r.status === 404) apiFailures = 0;
+  else apiFailed();
+  return r;
+}
+
+async function bihrApiImage(code: string, timeoutMs: number): Promise<Buffer> {
+  const r = await bihrApiFetch(`${BIHR_API_BASE}/api/v2.1/Products/Image/${encodeURIComponent(code)}`, {}, timeoutMs);
   if (!r.ok) {
     r.body?.cancel().catch(() => {});
-    if (r.status === 404) apiFailures = 0;
-    else apiFailed();
     throw new Error(`HTTP ${r.status}`);
   }
-  apiFailures = 0;
   const buf = Buffer.from(await r.arrayBuffer());
   if (buf.length < 200) throw new Error('respuesta demasiado pequeña');
   if (buf.length > REMOTE_IMAGE_MAX_BYTES) throw new Error('imagen demasiado grande');
   return buf;
+}
+
+/**
+ * Fotos de los productos según `Products/Details` de la API v3 de Bihr: cada foto con su propio enlace
+ * (el `context` firmado lleva la ruta del fichero). Devuelve, por código (en minúsculas), los enlaces de sus
+ * fotos con la principal primero. Solo se aceptan los de dominios de Bihr cuyo fichero lleve el código del producto.
+ */
+export async function bihrProductPictures(partNumbers: readonly string[], timeoutMs = 20_000): Promise<Map<string, string[]>> {
+  const requested = Array.from(new Set(partNumbers.map((c) => String(c || '').trim()).filter(Boolean)));
+  const found = new Map<string, string[]>();
+  if (requested.length === 0) return found;
+  const wanted = new Set(requested.map((c) => c.toLowerCase()));
+  const r = await bihrApiFetch(`${BIHR_API_BASE}/api/v3/Products/Details`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ productCriteria: requested.map((partNumber) => ({ partNumber })), language: 'es' }),
+  }, timeoutMs);
+  if (r.status === 404) { r.body?.cancel().catch(() => {}); return found; }
+  if (!r.ok) {
+    const text = (await r.text().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 120);
+    throw new Error(`HTTP ${r.status}${text ? `: ${text}` : ''}`);
+  }
+  let data: any;
+  try { data = await r.json(); } catch { throw new Error('Products/Details: la respuesta no es JSON'); }
+  // La documentación enseña un producto; con varios códigos puede venir una lista, suelta o dentro de un objeto.
+  const wrapped = data && typeof data === 'object' && !Array.isArray(data) && !('partNumber' in data)
+    ? Object.values(data).find((v) => Array.isArray(v)) as any[] | undefined : undefined;
+  const items: any[] = Array.isArray(data) ? data : wrapped ? wrapped : data && typeof data === 'object' ? [data] : [];
+  for (const item of items) {
+    const codes = [item?.partNumber, item?.oldPartNumber].map((c) => String(c ?? '').trim()).filter(Boolean);
+    const pictures: any[] = Array.isArray(item?.pictures) ? item.pictures : [];
+    const ordered = [...pictures.filter((p) => p?.isDefault), ...pictures.filter((p) => !p?.isDefault)];
+    const urls: string[] = [];
+    for (const pic of ordered) {
+      const url = typeof pic?.url === 'string' ? pic.url.trim() : '';
+      if (url && isBihrRemote(url) && codes.some((c) => urlMatchesCode(url, c)) && !urls.includes(url)) urls.push(url);
+    }
+    if (urls.length === 0) continue;
+    for (const c of codes) if (wanted.has(c.toLowerCase()) && !found.has(c.toLowerCase())) found.set(c.toLowerCase(), urls);
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------- guardado
@@ -449,6 +498,12 @@ export interface RepairOptions {
    */
   catalogUrls?: ReadonlyMap<string, string>;
   /**
+   * Enlaces de las fotos del producto en Products/Details de Bihr, por orden, a partir de sus códigos
+   * (número de pieza y SKU). Por defecto una llamada a la API por producto; el trabajo en bloque pide
+   * varios productos en una sola llamada.
+   */
+  detailsLookup?: (codes: string[]) => Promise<readonly string[]>;
+  /**
    * Si la referencia no está en un índice del zip de hace más de un minuto, se vuelve a leer el índice
    * (por defecto sí). El trabajo en bloque lo desactiva: con miles de productos repetiría la lectura cada minuto.
    */
@@ -519,10 +574,38 @@ export async function repairProductImages(productId: number, opts: RepairOptions
       return { saved: 0, attempts, outcome: 'error', errorScope: worst.kind === 'service' ? 'service' : 'product', reason: `${worst.a.source}: ${worst.a.detail}` };
     };
 
-    // 1) Enlaces del catálogo de Bihr y de la ficha
+    // 0) Detalles del producto en la API v3 de Bihr: cada foto con su enlace actual
     const bihrRedirect = (to: URL) => to.protocol === 'https:' && BIHR_REDIRECT_HOST.test(to.hostname);
+    const codes = Array.from(new Set((opts.exactCodes ? [p.part_number, p.sku] : [p.part_number, p.sku, p.supplier_code])
+      .map((c) => String(c || '').trim()).filter(Boolean)));
+    if (useSource('detalles') && wanted.some(Boolean)) {
+      try {
+        const lookup = opts.detailsLookup || (async (cs: string[]) => {
+          const found = await bihrProductPictures(cs, budget(20_000));
+          for (const c of cs) { const urls = found.get(c.toLowerCase()); if (urls?.length) return urls; }
+          return [];
+        });
+        const urls = await lookup(codes);
+        if (urls.length === 0) note({ source: 'detalles', target: 'Products/Details', ok: false, detail: NO_DETAILS_PICTURES });
+        for (let i = 0; i < slotCount; i++) {
+          const url = urls[i];
+          if (!wanted[i] || !url || !isBihrRemote(url)) continue;
+          try {
+            slots[i] = asPhoto((await fetchRemoteImage(url, budget(15_000), { allowRedirect: bihrRedirect })).data);
+            origin[i] = shortUrl(url);
+            note({ source: 'detalles', target: shortUrl(url), ok: true, detail: `${slots[i]!.length} bytes` });
+          } catch (err: any) {
+            note({ source: 'detalles', target: shortUrl(url), ok: false, detail: explain(err) });
+          }
+        }
+      } catch (err: any) {
+        note({ source: 'detalles', target: 'Products/Details', ok: false, detail: explain(err) });
+      }
+    }
+
+    // 1) Enlaces del catálogo de Bihr y de la ficha
     for (let i = 0; i < slotCount; i++) {
-      if (!useSource('catalogo') || !wanted[i]) continue;
+      if (!useSource('catalogo') || !wanted[i] || slots[i]) continue;
       const stored = imageSrc(original[i]);
       const candidates: { url: string; label: string }[] = [];
       const fresh = i === 0 ? opts.catalogUrls?.get(String(p.sku).trim()) : undefined;
@@ -541,8 +624,6 @@ export async function repairProductImages(productId: number, opts: RepairOptions
     }
 
     // 2) zip de la marca
-    const codes = Array.from(new Set((opts.exactCodes ? [p.part_number, p.sku] : [p.part_number, p.sku, p.supplier_code])
-      .map((c) => String(c || '').trim()).filter(Boolean)));
     const missing = () => slots.some((s, i) => wanted[i] && !s);
     if (useSource('zip') && missing() && !p.brand) note({ source: 'zip', target: 'marca', ok: false, detail: NO_BRAND });
     if (useSource('zip') && missing() && p.brand) {
