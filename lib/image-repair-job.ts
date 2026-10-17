@@ -5,8 +5,9 @@
  * productos de la auditoría, uno tras otro y en segundo plano:
  *   - primero los productos con stock y, si se pide, después el resto;
  *   - agrupados por marca, para que el índice del zip de cada marca se lea una sola vez;
- *   - fuentes: el zip de la marca y, si no está ahí, la API de Bihr (más lenta: una petición cada 250 ms);
- *     la URL remota de la ficha no se prueba porque Bihr devuelve 404 (docs/BIHR_IMAGE_SOURCES.md);
+ *   - fuentes: el enlace de la foto en el catálogo JSON de Bihr guardado en el servidor (lib/bihr-catalog-pictures.ts)
+ *     o el de la ficha, luego el zip de la marca y, si no está ahí, la API de Bihr (más lenta: una petición cada 250 ms);
+ *     los enlaces caducados (404) no cuentan como fallo: se pasa a la fuente siguiente;
  *   - solo con el número de pieza y el SKU, nunca con el código del fabricante (puede dar la foto de otra pieza).
  *
  * El estado vive en memoria: si se despliega una versión nueva el trabajo se corta, pero basta con
@@ -18,6 +19,7 @@ import path from 'path';
 import { getImageAudit, filterAuditItems, invalidateImageAudit, type ImageAuditItem } from './image-audit.js';
 import { repairProductImages, contestedFileBases, type RepairOptions, type RepairResult, type RepairSource } from './bihr-images.js';
 import { cacheBust } from './cache.js';
+import { loadCatalogPictures, type CatalogPictures } from './bihr-catalog-pictures.js';
 
 export type RepairJobScope = 'stock' | 'all';
 export type RepairJobStatus = 'idle' | 'running' | 'stopping' | 'done' | 'stopped' | 'error';
@@ -40,6 +42,8 @@ export interface RepairJobState {
   done: number;
   /** Con foto nueva. */
   saved: number;
+  /** De ellos, los que salieron de un enlace del catálogo de Bihr o de la ficha. */
+  savedFromLinks: number;
   /** La fuente funcionó pero no tiene la foto. */
   notFound: number;
   /** Alguna fuente falló (red, zip dañado, procesador de imágenes…). */
@@ -47,6 +51,8 @@ export interface RepairJobState {
   /** Ya tenían foto, otro proceso los estaba tratando o su marca se dejó de intentar. */
   skipped: number;
   currentBrand: string;
+  /** Lo que trae el catálogo de Bihr guardado en el servidor (null: no hay catálogo o no se pudo leer; sin definir: aún no se ha mirado). */
+  catalog?: { modifiedAt: string; refs: number; withPictures: number; unmatched: number; forQueue: number; pictureFields: string[] } | null;
   brands: Record<string, BrandStats>;
   recentErrors: RepairJobError[];
   /** Qué está haciendo o por qué se paró. */
@@ -60,6 +66,8 @@ export class RepairJobBusy extends Error {
 export interface RepairJobDeps {
   loadItems(scope: RepairJobScope): Promise<ImageAuditItem[]>;
   contested(): Promise<Set<string>>;
+  /** Enlaces de foto del catálogo de Bihr para esos SKU; null si no hay catálogo guardado. */
+  catalogPictures(skus: string[]): Promise<CatalogPictures | null>;
   repair(id: number, opts: RepairOptions): Promise<RepairResult>;
   /** Vacía las cachés de la tienda para que se vean las fotos nuevas. */
   bust(): Promise<void>;
@@ -80,6 +88,8 @@ const BUST_EVERY_SAVED = 200;
 const BUST_EVERY_MS = 60_000;
 const BUST_TIMEOUT_MS = 30_000;
 const MAX_RECENT_ERRORS = 20;
+/** Leer el catálogo guardado (cientos de MB) tarda segundos; si pasa de aquí, se sigue sin él. */
+const CATALOG_LOAD_TIMEOUT_MS = 5 * 60_000;
 
 const defaultDeps: RepairJobDeps = {
   async loadItems(scope) {
@@ -87,6 +97,7 @@ const defaultDeps: RepairJobDeps = {
     return filterAuditItems(audit.items, { onlyInStock: scope === 'stock' });
   },
   contested: contestedFileBases,
+  catalogPictures: (skus) => loadCatalogPictures(skus),
   repair: repairProductImages,
   async bust() {
     await Promise.all([cacheBust('cache:products'), cacheBust('compat:prod'), cacheBust('cache:suggest')]);
@@ -103,7 +114,7 @@ const defaultDeps: RepairJobDeps = {
 
 const idleState = (): RepairJobState => ({
   status: 'idle', scope: 'stock', useApi: true, concurrency: DEFAULT_CONCURRENCY,
-  total: 0, done: 0, saved: 0, notFound: 0, failed: 0, skipped: 0, currentBrand: '', brands: {}, recentErrors: [],
+  total: 0, done: 0, saved: 0, savedFromLinks: 0, notFound: 0, failed: 0, skipped: 0, currentBrand: '', brands: {}, recentErrors: [],
 });
 
 let state: RepairJobState = idleState();
@@ -188,7 +199,31 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
   job.message = queue.length === 0 ? 'No hay productos que descargar' : undefined;
   console.log(`[IMAGE REPAIR JOB] empieza: ${queue.length} productos (${job.scope}), concurrencia ${job.concurrency}, API ${job.useApi ? 'sí' : 'no'}`);
 
-  const sources: RepairSource[] = job.useApi ? ['zip', 'api'] : ['zip'];
+  // Enlaces actuales de las fotos en el catálogo de Bihr guardado; si no se pueden leer, se sigue sin ellos.
+  let catalogUrls: ReadonlyMap<string, string> | undefined;
+  let catalogNote: string | undefined;
+  if (queue.length > 0) {
+    job.message = 'Leyendo el catálogo de Bihr guardado…';
+    try {
+      const catalog = await withTimeout(deps.catalogPictures(queue.map((i) => i.sku)), CATALOG_LOAD_TIMEOUT_MS, 'leer el catálogo de Bihr');
+      if (catalog) {
+        catalogUrls = catalog.urls;
+        job.catalog = { modifiedAt: catalog.modifiedAt, refs: catalog.refs, withPictures: catalog.withPictures, unmatched: catalog.unmatched, forQueue: catalog.urls.size, pictureFields: catalog.pictureFields };
+        console.log(`[IMAGE REPAIR JOB] catálogo de Bihr (${catalog.modifiedAt}): ${catalog.refs} referencias, ${catalog.withPictures} con foto (${catalog.unmatched} descartadas), ${catalog.urls.size} de la cola`);
+      } else {
+        job.catalog = null;
+        console.warn('[IMAGE REPAIR JOB] no hay catálogo de Bihr guardado; solo se usan los enlaces de las fichas');
+      }
+    } catch (err) {
+      job.catalog = null;
+      console.error('[IMAGE REPAIR JOB] no se pudo leer el catálogo de Bihr guardado:', messageOf(err));
+      catalogNote = `No se pudo leer el catálogo de Bihr guardado (${messageOf(err)}); se usaron solo los enlaces de las fichas.`;
+    }
+    if (stoppedBeforeStart()) return;
+    job.message = catalogNote;
+  }
+
+  const sources: RepairSource[] = job.useApi ? ['catalogo', 'zip', 'api'] : ['catalogo', 'zip'];
   const deadBrands = new Set<string>();
   const brandStreak = new Map<string, number>();
   let streak = 0;
@@ -229,7 +264,7 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     let result: RepairResult | null = null;
     let thrown: string | null = null;
     try {
-      result = await deps.repair(item.id, { sources, exactCodes: true, contested, refreshStaleIndex: false });
+      result = await deps.repair(item.id, { sources, exactCodes: true, contested, catalogUrls, refreshStaleIndex: false });
     } catch (err) {
       thrown = messageOf(err);
     }
@@ -243,7 +278,10 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
       return;
     }
     switch (result!.outcome) {
-      case 'saved': job.saved++; b.saved++; streak = 0; brandStreak.set(item.brand, 0); savedSinceBust++; break;
+      case 'saved':
+        job.saved++; b.saved++;
+        if (result!.attempts.some((a) => a.source === 'catalogo' && a.ok)) job.savedFromLinks++;
+        streak = 0; brandStreak.set(item.brand, 0); savedSinceBust++; break;
       case 'nothing_to_do': job.skipped++; b.skipped++; streak = 0; break;
       case 'not_found': job.notFound++; b.notFound++; streak = 0; brandStreak.set(item.brand, 0); break;
       default: {
@@ -299,9 +337,10 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     job.status = 'done';
     const gaveUp = Object.keys(job.brands).filter((name) => job.brands[name].gaveUp);
     const names = gaveUp.length > 5 ? `${gaveUp.slice(0, 5).join(', ')} y ${gaveUp.length - 5} más` : gaveUp.join(', ');
-    job.message = gaveUp.length
+    const gaveUpNote = gaveUp.length
       ? `Terminado, pero ${gaveUp.length === 1 ? 'se dejó a medias la marca' : 'se dejaron a medias las marcas'} ${names} por fallos seguidos. Vuelve a lanzar la descarga para reintentarlas.`
       : undefined;
+    job.message = [gaveUpNote, catalogNote].filter(Boolean).join(' ') || undefined;
   }
   console.log(`[IMAGE REPAIR JOB] ${job.status}: ${job.done}/${job.total} · con foto ${job.saved} · sin foto en Bihr ${job.notFound} · fallos ${job.failed} · saltados ${job.skipped}`);
 }

@@ -31,6 +31,18 @@ vi.mock('./image-sandbox.js', async (importOriginal) => ({
   }),
 }));
 
+// Fotos remotas del catálogo: cada prueba dice qué contesta cada enlace (por defecto, 404).
+const remote = vi.hoisted(() => ({ responses: {} as Record<string, Buffer | number>, requested: [] as string[] }));
+vi.mock('./remote-image.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./remote-image.js')>()),
+  fetchRemoteImage: vi.fn(async (url: string) => {
+    remote.requested.push(url);
+    const r = remote.responses[url];
+    if (Buffer.isBuffer(r)) return { data: r, mime: 'image/jpeg' };
+    throw new Error(`No se pudo descargar la imagen (${r ?? 404})`);
+  }),
+}));
+
 import { readZipIndex, readZipEntry, zipPhotosFor, repairProductImages, contestedFileBases, failureKind } from './bihr-images.js';
 
 interface ZipFile { name: string; data: Buffer; store?: boolean; declaredSize?: number; crc?: number }
@@ -221,6 +233,8 @@ describe('reparar las fotos de un producto', () => {
     db.updateRows = 1;
     db.updates.length = 0;
     sandbox.fail = false;
+    remote.responses = {};
+    remote.requested.length = 0;
     delete process.env.BIHR_USERNAME;
     delete process.env.BIHR_MACKEY;
     // La prueba usa /SCOTT-pictures.zip del servidor de arriba.
@@ -339,6 +353,90 @@ describe('reparar las fotos de un producto', () => {
     expect(k('zip', 'sin respuesta a tiempo')).toBe('service');
     expect(k('zip', 'zip de más de 4 GB (ZIP64), no se puede leer por rangos')).toBe('service');
     expect(k('catalogo', 'procesador de imágenes: HTTP 503')).toBe('service');
+    // Enlaces de fotos del catálogo (fetchRemoteImage): caducado = no está; roto = esa foto; bloqueo o caída = la fuente.
+    expect(k('catalogo', 'No se pudo descargar la imagen (404)')).toBe('missing');
+    expect(k('catalogo', 'No se pudo descargar la imagen (410)')).toBe('missing');
+    expect(k('catalogo', 'No se pudo descargar la imagen (400)')).toBe('product');
+    expect(k('catalogo', 'No se pudo descargar la imagen (403)')).toBe('service');
+    expect(k('catalogo', 'No se pudo descargar la imagen (503)')).toBe('service');
+    expect(k('catalogo', 'sin respuesta a tiempo')).toBe('service');
+  });
+
+  describe('enlaces de foto del catálogo de Bihr', () => {
+    const FRESH = 'https://api.mybihr.com/medias/8010897003-1-800Wx800H?context=nuevo';
+    const STORED = 'https://api.mybihr.com/medias/8010897003-1-800Wx800H?context=viejo';
+    const catalogUrls = new Map([['8010897003', FRESH]]);
+    const catalogOnly = (extra: Record<string, any> = {}) =>
+      repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['catalogo'], catalogUrls, ...extra });
+
+    it('prueba el enlace del catálogo antes que el de la ficha y guarda su foto', async () => {
+      db.product = product({ images: [{ src: STORED, alt: 'vieja' }] });
+      remote.responses[FRESH] = JPG(1);
+      remote.responses[STORED] = JPG(2);
+      const r = await catalogOnly();
+      expect(r.outcome).toBe('saved');
+      expect(remote.requested).toEqual([FRESH]);
+      expect(r.attempts).toEqual([{ source: 'catalogo', target: 'api.mybihr.com/medias/8010897003-1-800Wx800H (catálogo de Bihr)', ok: true, detail: `${JPG(1).length} bytes` }]);
+      expect(JSON.parse(db.updates[0][1])[0]).toMatchObject({ src: '/uploads/optimized/8010897003_0_800.webp', originalUrl: 'api.mybihr.com/medias/8010897003-1-800Wx800H' });
+    });
+
+    it('si el enlace del catálogo ya no existe, prueba el de la ficha', async () => {
+      db.product = product({ images: [{ src: STORED }] });
+      remote.responses[STORED] = JPG(2);
+      const r = await catalogOnly();
+      expect(r.outcome).toBe('saved');
+      expect(remote.requested).toEqual([FRESH, STORED]);
+      expect(r.attempts.map((a) => a.ok)).toEqual([false, true]);
+      expect(r.attempts[0].target).toContain('(catálogo de Bihr)');
+      expect(r.attempts[1].target).toContain('(ficha)');
+    });
+
+    it('sirve para productos sin foto guardada (sin enlace en la ficha)', async () => {
+      db.product = product({ images: [{ src: '', alt: 'vacía' }] });
+      remote.responses[FRESH] = JPG(1);
+      const r = await catalogOnly();
+      expect(r.saved).toBe(1);
+      expect(remote.requested).toEqual([FRESH]);
+    });
+
+    it('un enlace caducado (404) no es un fallo: la ficha queda como estaba y cuenta como «no encontrada»', async () => {
+      db.product = product({ images: [] });
+      const r = await catalogOnly();
+      expect(r.outcome).toBe('not_found');
+      expect(db.updates).toHaveLength(0);
+    });
+
+    it('un bloqueo del servidor de fotos (403) sí es un fallo de la fuente', async () => {
+      db.product = product({ images: [] });
+      remote.responses[FRESH] = 403;
+      const r = await catalogOnly();
+      expect(r).toMatchObject({ outcome: 'error', errorScope: 'service' });
+      expect(r.reason).toContain('(403)');
+    });
+
+    it('si no es una foto (una página con 200) no se guarda', async () => {
+      db.product = product({ images: [] });
+      remote.responses[FRESH] = Buffer.from('<html>error</html>');
+      const r = await catalogOnly();
+      expect(r.outcome).toBe('error');
+      expect(r.errorScope).toBe('product');
+      expect(db.updates).toHaveLength(0);
+    });
+
+    it('solo usa la foto del catálogo para la primera foto y solo de dominios de Bihr', async () => {
+      db.product = product({ images: [] });
+      const other = new Map([['8010897003', 'https://otra-web.example/foto.jpg']]);
+      const r = await catalogOnly({ catalogUrls: other });
+      expect(remote.requested).toEqual([]);
+      expect(r.outcome).toBe('not_found');
+    });
+
+    it('sin la fuente «catalogo» no toca ningún enlace', async () => {
+      db.product = product({ images: [{ src: STORED }] });
+      remote.responses[FRESH] = JPG(1);
+      await repairProductImages(244141, { zipBase: base, uploadsDir: uploads, sources: ['zip'], catalogUrls });
+      expect(remote.requested).toEqual([]);
+    });
   });
 
   it('un producto sin marca no tiene zip que mirar y se dice', async () => {

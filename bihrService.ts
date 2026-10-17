@@ -6,6 +6,7 @@ import { pool } from './db.js';
 import { repriceProducts, pricingAuto, refreshDto2, applyPromotions } from './lib/pricing.js';
 import { refreshCompatModels } from './lib/compat.js';
 import { enrichCatalog } from './lib/catalog-enrich.js';
+import { LATEST_CATALOG_JSON } from './lib/bihr-catalog-pictures.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -305,7 +306,7 @@ export async function getBihrOrderStatus(ticketId: string) {
  * Lógica para solicitar la generación asíncrona, descargar e importar el catálogo
  */
 /** Último catálogo JSON de Bihr descargado (lo usa el enriquecimiento manual). */
-export const LATEST_CATALOG_JSON = process.env.BIHR_LATEST_CATALOG_JSON || '/app/server/uploads/bihr-catalog-latest.json';
+export { LATEST_CATALOG_JSON };
 
 export async function syncBihrCatalog(catalogType: 'HardPart' | 'RiderGear' | 'Prices' = 'HardPart'): Promise<boolean> {
   const token = await getBihrToken();
