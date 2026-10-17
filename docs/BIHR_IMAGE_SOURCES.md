@@ -62,3 +62,18 @@ busca. `lib/range-http.ts` hace lo que hace un navegador: ante ese error lee la 
 «CA Issuers» del certificado, descarga el intermedio y reintenta verificando la cadena entera
 contra las raíces de Mozilla. No se desactiva ninguna comprobación. Lo usa «Descargar fotos de
 Bihr» (`lib/bihr-images.ts`); `scripts/download-images-from-zip.ts` sigue usando `fetch`.
+
+## Fotos por producto: API v3 `Products/Details` (2026-10-17)
+
+`POST https://api.bihr.net/api/v3/Products/Details` con `{"productCriteria":[{"partNumber":"1008266"}],"language":"es"}`
+(Bearer; se usa el token de la v2.1, por confirmar en producción) devuelve por producto `pictures: [{isDefault, url}]`: todas sus fotos, cada una con
+su enlace actual (`https://api.mybihr.com/medias/800Wx800H-{código}-{n}.jpg?context=…`). Acepta varios números de pieza
+en una sola llamada. Es la fuente de la descarga en bloque (`bihrProductPictures` en `lib/bihr-images.ts`, de 20 en 20) y la
+primera que prueba el botón de la ficha.
+
+El `context` firmado lleva la ruta del fichero: **cambiar solo la referencia del enlace sirve la foto del producto
+original** (probado con 1008253 → 1008245: la misma foto, 45.150 bytes), así que no se pueden construir enlaces. Los
+enlaces de los CSV antiguos caducan (404); el catálogo JSON (`DefaultPicture`, `lib/bihr-catalog-pictures.ts`) trae el actual.
+Solo se aceptan enlaces cuyo fichero lleve el código del producto.
+
+El zip de una marca puede pasar de 4 GB (RST): no se lee por rangos (ZIP64) y la descarga en bloque ya no lo usa.

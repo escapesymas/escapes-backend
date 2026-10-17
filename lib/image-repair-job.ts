@@ -4,20 +4,21 @@
  * Es el botón «Descargar fotos de Bihr» de la ficha (lib/bihr-images.ts) aplicado a todos los
  * productos de la auditoría, uno tras otro y en segundo plano:
  *   - primero los productos con stock y, si se pide, después el resto;
- *   - agrupados por marca, para que el índice del zip de cada marca se lea una sola vez;
- *   - fuentes: el enlace de la foto en el catálogo JSON de Bihr guardado en el servidor (lib/bihr-catalog-pictures.ts)
- *     o el de la ficha, luego el zip de la marca y, si no está ahí, la API de Bihr (más lenta: una petición cada 250 ms);
- *     los enlaces caducados (404) no cuentan como fallo: se pasa a la fuente siguiente;
+ *   - agrupados por marca, para dejar de intentar una marca si falla varias veces seguidas;
+ *   - fuentes: la API v3 de Bihr (Products/Details, pedidos de 20 en 20: cada foto trae su enlace actual) y, si no
+ *     da fotos, el enlace del catálogo JSON de Bihr guardado en el servidor (lib/bihr-catalog-pictures.ts) o el de la
+ *     ficha. Ya no se usan el zip de la marca (hay zips de más de 4 GB que no se pueden leer por partes) ni la API v2
+ *     de imágenes (404 para todo). Los enlaces caducados (404) no cuentan como fallo;
  *   - solo con el número de pieza y el SKU, nunca con el código del fabricante (puede dar la foto de otra pieza).
  *
  * El estado vive en memoria: si se despliega una versión nueva el trabajo se corta, pero basta con
  * volver a lanzarlo, porque cada vuelta solo recoge los productos que siguen sin imagen.
- * Se para solo si hay fallos seguidos (algo no va: red, procesador de imágenes) o queda poco disco.
+ * Se para solo si hay fallos seguidos (algo no va: red, la API, procesador de imágenes) o queda poco disco.
  */
 import fs from 'fs';
 import path from 'path';
 import { getImageAudit, filterAuditItems, invalidateImageAudit, type ImageAuditItem } from './image-audit.js';
-import { repairProductImages, contestedFileBases, type RepairOptions, type RepairResult, type RepairSource } from './bihr-images.js';
+import { repairProductImages, contestedFileBases, bihrProductPictures, type RepairOptions, type RepairResult, type RepairSource } from './bihr-images.js';
 import { cacheBust } from './cache.js';
 import { loadCatalogPictures, type CatalogPictures } from './bihr-catalog-pictures.js';
 
@@ -46,7 +47,7 @@ export interface RepairJobState {
   savedFromLinks: number;
   /** La fuente funcionó pero no tiene la foto. */
   notFound: number;
-  /** Alguna fuente falló (red, zip dañado, procesador de imágenes…). */
+  /** Alguna fuente falló (red, API de Bihr, procesador de imágenes…). */
   failed: number;
   /** Ya tenían foto, otro proceso los estaba tratando o su marca se dejó de intentar. */
   skipped: number;
@@ -66,6 +67,8 @@ export class RepairJobBusy extends Error {
 export interface RepairJobDeps {
   loadItems(scope: RepairJobScope): Promise<ImageAuditItem[]>;
   contested(): Promise<Set<string>>;
+  /** Fotos de varios productos de una vez (Products/Details de Bihr): código en minúsculas → enlaces. */
+  productPictures(codes: string[]): Promise<Map<string, string[]>>;
   /** Enlaces de foto del catálogo de Bihr para esos SKU; null si no hay catálogo guardado. */
   catalogPictures(skus: string[]): Promise<CatalogPictures | null>;
   repair(id: number, opts: RepairOptions): Promise<RepairResult>;
@@ -78,7 +81,7 @@ export interface RepairJobDeps {
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
 export const DEFAULT_CONCURRENCY = 3;
 const MAX_CONCURRENCY = 6;
-/** Fallos seguidos de una misma marca antes de dejarla (su zip no responde). */
+/** Fallos seguidos de una misma marca antes de dejarla (la fuente no responde para ella). */
 const BRAND_FAILURE_LIMIT = 5;
 /** Fallos seguidos, de cualquier marca, antes de parar todo. */
 const GLOBAL_FAILURE_LIMIT = 40;
@@ -90,6 +93,8 @@ const BUST_TIMEOUT_MS = 30_000;
 const MAX_RECENT_ERRORS = 20;
 /** Leer el catálogo guardado (cientos de MB) tarda segundos; si pasa de aquí, se sigue sin él. */
 const CATALOG_LOAD_TIMEOUT_MS = 5 * 60_000;
+/** Productos por llamada a Products/Details. */
+const DETAILS_BATCH = 20;
 
 const defaultDeps: RepairJobDeps = {
   async loadItems(scope) {
@@ -97,6 +102,7 @@ const defaultDeps: RepairJobDeps = {
     return filterAuditItems(audit.items, { onlyInStock: scope === 'stock' });
   },
   contested: contestedFileBases,
+  productPictures: (codes) => bihrProductPictures(codes),
   catalogPictures: (skus) => loadCatalogPictures(skus),
   repair: repairProductImages,
   async bust() {
@@ -223,7 +229,39 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     job.message = catalogNote;
   }
 
-  const sources: RepairSource[] = job.useApi ? ['catalogo', 'zip', 'api'] : ['catalogo', 'zip'];
+  const sources: RepairSource[] = job.useApi ? ['detalles', 'catalogo'] : ['catalogo'];
+
+  // Products/Details se pide por tandas de 20 productos de la cola (una llamada en vez de veinte). Solo se guardan las
+  // tandas cercanas a la que se está tratando, para no acumular los enlaces de toda la cola.
+  type DetailsChunk = { asked: Set<string>; result: Promise<Map<string, string[]> | Error> };
+  const detailsChunks = new Map<number, DetailsChunk>();
+  const detailsChunk = (chunk: number): DetailsChunk => {
+    let c = detailsChunks.get(chunk);
+    if (!c) {
+      const skus = queue.slice(chunk * DETAILS_BATCH, (chunk + 1) * DETAILS_BATCH).map((i) => i.sku.trim()).filter(Boolean);
+      c = {
+        asked: new Set(skus.map((x) => x.toLowerCase())),
+        result: deps.productPictures(skus).catch((err) => (err instanceof Error ? err : new Error(String(err)))),
+      };
+      detailsChunks.set(chunk, c);
+    }
+    return c;
+  };
+  const detailsLookupFor = (index: number): RepairOptions['detailsLookup'] => async (codes) => {
+    const chunk = Math.floor(index / DETAILS_BATCH);
+    for (const old of [...detailsChunks.keys()]) if (old < chunk - 2) detailsChunks.delete(old);
+    const c = detailsChunk(chunk);
+    const loaded = await c.result;
+    if (loaded instanceof Error) throw loaded;
+    for (const code of codes) { const urls = loaded.get(code.toLowerCase()); if (urls?.length) return urls; }
+    // Los códigos que no iban en la tanda (el número de pieza no es el SKU) se piden aparte.
+    const extra = codes.filter((code) => !c.asked.has(code.toLowerCase()));
+    if (extra.length > 0) {
+      const found = await deps.productPictures(extra);
+      for (const code of extra) { const urls = found.get(code.toLowerCase()); if (urls?.length) return urls; }
+    }
+    return [];
+  };
   const deadBrands = new Set<string>();
   const brandStreak = new Map<string, number>();
   let streak = 0;
@@ -256,7 +294,7 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     if (job.recentErrors.length > MAX_RECENT_ERRORS) job.recentErrors.shift();
   };
 
-  const handle = async (item: ImageAuditItem) => {
+  const handle = async (item: ImageAuditItem, index: number) => {
     const b = job.brands[item.brand];
     job.currentBrand = item.brand;
     if (deadBrands.has(item.brand)) { job.skipped++; b.skipped++; return; }
@@ -264,7 +302,7 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     let result: RepairResult | null = null;
     let thrown: string | null = null;
     try {
-      result = await deps.repair(item.id, { sources, exactCodes: true, contested, catalogUrls, refreshStaleIndex: false });
+      result = await deps.repair(item.id, { sources, exactCodes: true, contested, catalogUrls, detailsLookup: detailsLookupFor(index), refreshStaleIndex: false });
     } catch (err) {
       thrown = messageOf(err);
     }
@@ -304,9 +342,10 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
 
   const worker = async () => {
     while (!ctl.stop && next < queue.length) {
-      const item = queue[next++];
+      const index = next++;
+      const item = queue[index];
       try {
-        await handle(item);
+        await handle(item, index);
       } catch (err) {
         // Un fallo inesperado de la propia cola (no de la descarga) no debe dejar el trabajo a medias en silencio.
         console.error('[IMAGE REPAIR JOB] fallo inesperado:', err);
