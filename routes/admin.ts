@@ -9,6 +9,7 @@ import { enrichCatalog, type EnrichStats } from '../lib/catalog-enrich.js';
 import { refreshCompatModels } from '../lib/compat.js';
 import { LATEST_CATALOG_JSON } from '../bihrService.js';
 import { cacheBust } from '../lib/cache.js';
+import { repairProductImages } from '../lib/bihr-images.js';
 
 export const adminRouter = Router();
 
@@ -156,3 +157,19 @@ adminRouter.post('/admin/catalog/enrich', requireAdmin, async (_req: any, res: a
 });
 
 adminRouter.get('/admin/catalog/enrich', requireAdmin, (_req: any, res: any) => res.json(enrichState));
+
+// POST /api/admin/products/:id/repair-images
+// Vuelve a descargar las fotos del proveedor de UN producto y las guarda en local.
+// Devuelve qué fuentes se probaron y qué contestó cada una (para ver el motivo si no hay foto).
+adminRouter.post('/admin/products/:id(\\d+)/repair-images', requireAdmin, async (req: any, res: any) => {
+  const id = parseInt(req.params.id, 10);
+  try {
+    const result = await repairProductImages(id);
+    if (result.saved > 0) await cacheBust('cache:products');
+    console.log(`[REPAIR IMAGES] producto ${id}: ${result.saved} fotos guardadas (${req.user?.email || req.user?.id || 'admin'})`);
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[REPAIR IMAGES ERROR]:', err.message);
+    return res.status(/Ya se están/.test(err.message) ? 409 : 500).json({ error: err.message });
+  }
+});
