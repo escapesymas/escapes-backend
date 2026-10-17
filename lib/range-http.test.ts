@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import http from 'http';
 import https from 'https';
 import fs from 'fs';
@@ -6,7 +6,7 @@ import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import type { AddressInfo } from 'net';
-import { httpGet } from './range-http.js';
+import { httpGet, resetHttpGetCaches } from './range-http.js';
 
 const hasOpenssl = (() => { try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
 
@@ -18,6 +18,9 @@ describe.skipIf(!hasOpenssl)('httpGet con certificado intermedio que falta', () 
   let dir: string;
   let aia: http.Server;
   let site: https.Server;
+  let evilSite: https.Server;
+  let evilUrl = '';
+  let evilHits = 0;
   let siteUrl = '';
   let rootPem = '';
   let aiaHits = 0;
@@ -28,6 +31,7 @@ describe.skipIf(!hasOpenssl)('httpGet con certificado intermedio que falta', () 
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tls-chain-'));
     aia = http.createServer((req, res) => {
       if (req.url === '/inter.der') { aiaHits++; return res.end(fs.readFileSync(path.join(dir, 'inter.der'))); }
+      if (req.url === '/evil.der') { evilHits++; return res.end(fs.readFileSync(path.join(dir, 'evil-root.der'))); }
       res.statusCode = 404; res.end();
     });
     await new Promise<void>((resolve) => aia.listen(0, '127.0.0.1', resolve));
@@ -50,21 +54,53 @@ describe.skipIf(!hasOpenssl)('httpGet con certificado intermedio que falta', () 
       (_req, res) => res.end('foto'));
     await new Promise<void>((resolve) => site.listen(0, '127.0.0.1', resolve));
     siteUrl = `https://127.0.0.1:${(site.address() as AddressInfo).port}/x`;
+
+    // Atacante: su propia raíz autofirmada, una hoja para 127.0.0.1 firmada por ella (sin mandar la raíz)
+    // y una dirección «CA Issuers» que sirve esa raíz.
+    fs.writeFileSync(path.join(dir, 'evil-leaf.ext'),
+      `basicConstraints=CA:FALSE\nsubjectAltName=IP:127.0.0.1\nauthorityInfoAccess=caIssuers;URI:http://127.0.0.1:${aiaPort}/evil.der\n`);
+    sh('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'evil-root.key', '-out', 'evil-root.pem', '-days', '2', '-subj', '/CN=Evil Root',
+      '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign');
+    sh('req', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'evil-leaf.key', '-out', 'evil-leaf.csr', '-subj', '/CN=127.0.0.1');
+    sh('x509', '-req', '-in', 'evil-leaf.csr', '-CA', 'evil-root.pem', '-CAkey', 'evil-root.key', '-CAcreateserial', '-out', 'evil-leaf.pem', '-days', '2', '-extfile', 'evil-leaf.ext');
+    sh('x509', '-in', 'evil-root.pem', '-outform', 'der', '-out', 'evil-root.der');
+    evilSite = https.createServer(
+      { key: fs.readFileSync(path.join(dir, 'evil-leaf.key')), cert: fs.readFileSync(path.join(dir, 'evil-leaf.pem')) },
+      (_req, res) => res.end('FORGED'));
+    await new Promise<void>((resolve) => evilSite.listen(0, '127.0.0.1', resolve));
+    evilUrl = `https://127.0.0.1:${(evilSite.address() as AddressInfo).port}/x`;
   });
 
-  afterAll(() => { site?.close(); aia?.close(); });
+  afterAll(() => { site?.close(); evilSite?.close(); aia?.close(); });
+
+  beforeEach(() => { resetHttpGetCaches(); aiaHits = 0; evilHits = 0; });
+
+  const trust = (extra: Record<string, any> = {}) => ({ timeoutMs: 10_000, onResponse: okOnly, extraRoots: [rootPem], allowPrivateAia: true, ...extra });
 
   it('descarga el intermedio del certificado y verifica la cadena completa', async () => {
-    const r = await httpGet(siteUrl, { timeoutMs: 10_000, onResponse: okOnly, extraRoots: [rootPem] });
+    const r = await httpGet(siteUrl, trust());
     expect(r.body.toString()).toBe('foto');
     expect(aiaHits).toBe(1);
     // La segunda vez ya se conoce el intermedio.
-    await httpGet(siteUrl, { timeoutMs: 10_000, onResponse: okOnly, extraRoots: [rootPem] });
+    await httpGet(siteUrl, trust());
     expect(aiaHits).toBe(1);
   });
 
-  it('sigue rechazando una cadena que no termina en una raíz de confianza', async () => {
-    await expect(httpGet(siteUrl, { timeoutMs: 10_000, onResponse: okOnly })).rejects.toMatchObject({ code: expect.stringMatching(/^(UNABLE_TO_|SELF_SIGNED|DEPTH_ZERO)/) });
+  it('rechaza una cadena que no termina en una raíz de confianza', async () => {
+    await expect(httpGet(siteUrl, { timeoutMs: 10_000, onResponse: okOnly, allowPrivateAia: true })).rejects.toMatchObject({ code: expect.stringMatching(/^(UNABLE_TO_|SELF_SIGNED|DEPTH_ZERO)/) });
+  });
+
+  it('no se fía de una raíz autofirmada que sirve la propia dirección «CA Issuers» de un atacante', async () => {
+    await expect(httpGet(evilUrl, trust())).rejects.toMatchObject({ code: expect.stringMatching(/^(UNABLE_TO_|SELF_SIGNED|DEPTH_ZERO)/) });
+    expect(evilHits).toBe(1); // se miró la dirección, pero la raíz del atacante no se aceptó
+    // Y no queda nada recordado: otro intento (sin esperar al reintento) tampoco pasa.
+    resetHttpGetCaches();
+    await expect(httpGet(evilUrl, trust())).rejects.toBeDefined();
+  });
+
+  it('no descarga certificados de direcciones locales (la IP de «CA Issuers» es 127.0.0.1)', async () => {
+    await expect(httpGet(siteUrl, trust({ allowPrivateAia: false }))).rejects.toMatchObject({ code: expect.stringMatching(/^UNABLE_TO_/) });
+    expect(aiaHits).toBe(0);
   });
 });
 
