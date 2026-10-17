@@ -13,6 +13,9 @@ const SNIFF_BYTES = 64 * 1024;
 /** Cabeceras de la respuesta que ayudan a saber quién contesta (CDN, caché, redirección). */
 const SHOWN_HEADERS = ['server', 'cf-ray', 'cf-cache-status', 'via', 'x-cache', 'location', 'content-length', 'content-type'] as const;
 
+/** Lo que Cloudflare ve de nuestro servidor (https://api.mybihr.com/cdn-cgi/trace): dirección, país, versión de HTTP… */
+const TRACE_KEYS = ['ip', 'loc', 'colo', 'http', 'tls', 'warp', 'visit_scheme'];
+
 export interface ProbeResult {
   variant: string;
   status?: number;
@@ -51,7 +54,7 @@ export function checkProbeUrl(raw: unknown): { url: URL } | { error: string } {
   return { url };
 }
 
-async function probeOnce(url: URL, variant: string, headers: Record<string, string>): Promise<ProbeResult> {
+async function probeOnce(url: URL | string, variant: string, headers: Record<string, string>): Promise<ProbeResult> {
   try {
     const r = await fetch(url, { headers, redirect: 'manual', signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
     const out: ProbeResult = { variant, status: r.status, contentType: r.headers.get('content-type') || undefined };
@@ -83,8 +86,47 @@ async function probeOnce(url: URL, variant: string, headers: Record<string, stri
   }
 }
 
-export async function probeImageUrl(url: URL): Promise<{ url: string; results: ProbeResult[] }> {
+/** Lo que ve Cloudflare de nuestra conexión; no depende del enlace. */
+async function traceConnection(): Promise<Record<string, string>> {
+  try {
+    const r = await fetch('https://api.mybihr.com/cdn-cgi/trace', { headers: { 'User-Agent': BROWSER_UA }, redirect: 'manual', signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+    const text = (await r.text()).slice(0, 2000);
+    const out: Record<string, string> = { estado: String(r.status) };
+    for (const line of text.split('\n')) {
+      const [k, ...v] = line.split('=');
+      if (TRACE_KEYS.includes(k)) out[k] = v.join('=').trim().slice(0, 80);
+    }
+    return out;
+  } catch (err: any) {
+    return { error: err?.name === 'TimeoutError' ? 'sin respuesta a tiempo' : (err?.cause?.code || err?.message || String(err)) };
+  }
+}
+
+export interface ProbeOutput {
+  url: string;
+  /** Lo que recibió el servidor del enlace, para ver si llegó entero (largo y final). */
+  sent: { length: number; end: string };
+  trace: Record<string, string>;
+  results: ProbeResult[];
+}
+
+export async function probeImageUrl(url: URL): Promise<ProbeOutput> {
   const results: ProbeResult[] = [];
   for (const v of VARIANTS) results.push(await probeOnce(url, v.name, v.headers));
-  return { url: `${url.host}${url.pathname}`, results };
+  const browser = VARIANTS[1].headers;
+  // Sin el parámetro firmado: si cambia la respuesta, el problema está en el `context`.
+  if (url.search) {
+    const bare = new URL(url);
+    bare.search = '';
+    results.push(await probeOnce(bare, 'sin el parámetro context (como un navegador)', browser));
+  }
+  // La forma corta que usa Bihr en su web: /medias/800Wx800H-{código}-{n}.jpg
+  const m = /^\/medias\/([^/]+?)-(\d+)-(\d+Wx\d+H)$/.exec(url.pathname);
+  if (m) {
+    const short = new URL(url);
+    short.search = '';
+    short.pathname = `/medias/${m[3]}-${m[1]}-${m[2]}.jpg`;
+    results.push(await probeOnce(short, 'forma corta (.jpg, como un navegador)', browser));
+  }
+  return { url: `${url.host}${url.pathname}`, sent: { length: url.href.length, end: url.href.slice(-8) }, trace: await traceConnection(), results };
 }
