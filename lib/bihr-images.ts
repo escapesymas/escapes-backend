@@ -63,9 +63,11 @@ const NOT_FOUND_DETAILS = new Set([NOT_IN_ZIP, NO_BRAND]);
  * (falla la propia fuente: red, tiempo, 5xx, 429, autenticación, API en pausa, procesador caído).
  */
 export type FailureKind = 'missing' | 'product' | 'service';
-const PRODUCT_FAILURE = /dañada \(CRC\)|no coincide con el del zip|no se pudo descomprimir|más grande de lo que dice|imagen demasiado grande|la respuesta no es una imagen|fichero cifrado|fichero ZIP64|compresión .* no admitida|Imagen no válida/;
+const PRODUCT_FAILURE = /^No se pudo descargar la imagen \(400\)$|dañada \(CRC\)|no coincide con el del zip|no se pudo descomprimir|más grande de lo que dice|imagen demasiado grande|la respuesta no es una imagen|fichero cifrado|fichero ZIP64|compresión .* no admitida|Imagen no válida/;
 export function failureKind(a: Pick<RepairAttempt, 'source' | 'detail'>): FailureKind {
   if (NOT_FOUND_DETAILS.has(a.detail) || a.detail === 'HTTP 404') return 'missing';
+  // El enlace de la ficha o del catálogo ya no existe (fetchRemoteImage dice «(404)»); un 400 es un enlace roto.
+  if (a.source === 'catalogo' && /^No se pudo descargar la imagen \((404|410)\)$/.test(a.detail)) return 'missing';
   // La API de Bihr contesta con algo que no es una foto cuando no tiene la de ese producto.
   if (a.source === 'api' && /^(respuesta demasiado pequeña|imagen demasiado grande|la respuesta no es una imagen)$/.test(a.detail)) return 'missing';
   return PRODUCT_FAILURE.test(a.detail) ? 'product' : 'service';
@@ -442,6 +444,11 @@ export interface RepairOptions {
    */
   contested?: ReadonlySet<string>;
   /**
+   * SKU → enlace actual de la foto principal en el catálogo de Bihr (lib/bihr-catalog-pictures.ts).
+   * Se prueba antes que el enlace guardado en la ficha, que puede haber caducado.
+   */
+  catalogUrls?: ReadonlyMap<string, string>;
+  /**
    * Si la referencia no está en un índice del zip de hace más de un minuto, se vuelve a leer el índice
    * (por defecto sí). El trabajo en bloque lo desactiva: con miles de productos repetiría la lectura cada minuto.
    */
@@ -512,17 +519,24 @@ export async function repairProductImages(productId: number, opts: RepairOptions
       return { saved: 0, attempts, outcome: 'error', errorScope: worst.kind === 'service' ? 'service' : 'product', reason: `${worst.a.source}: ${worst.a.detail}` };
     };
 
-    // 1) URLs de la ficha
+    // 1) Enlaces del catálogo de Bihr y de la ficha
     const bihrRedirect = (to: URL) => to.protocol === 'https:' && BIHR_REDIRECT_HOST.test(to.hostname);
     for (let i = 0; i < slotCount; i++) {
-      const src = imageSrc(original[i]);
-      if (!useSource('catalogo') || !wanted[i] || !isBihrRemote(src)) continue;
-      try {
-        slots[i] = asPhoto((await fetchRemoteImage(src, budget(15_000), { allowRedirect: bihrRedirect })).data);
-        origin[i] = shortUrl(src);
-        note({ source: 'catalogo', target: shortUrl(src), ok: true, detail: `${slots[i]!.length} bytes` });
-      } catch (err: any) {
-        note({ source: 'catalogo', target: shortUrl(src), ok: false, detail: explain(err) });
+      if (!useSource('catalogo') || !wanted[i]) continue;
+      const stored = imageSrc(original[i]);
+      const candidates: { url: string; label: string }[] = [];
+      const fresh = i === 0 ? opts.catalogUrls?.get(String(p.sku).trim()) : undefined;
+      if (fresh && isBihrRemote(fresh)) candidates.push({ url: fresh, label: 'catálogo de Bihr' });
+      if (isBihrRemote(stored) && stored !== fresh) candidates.push({ url: stored, label: 'ficha' });
+      for (const { url, label } of candidates) {
+        try {
+          slots[i] = asPhoto((await fetchRemoteImage(url, budget(15_000), { allowRedirect: bihrRedirect })).data);
+          origin[i] = shortUrl(url);
+          note({ source: 'catalogo', target: `${shortUrl(url)} (${label})`, ok: true, detail: `${slots[i]!.length} bytes` });
+          break;
+        } catch (err: any) {
+          note({ source: 'catalogo', target: `${shortUrl(url)} (${label})`, ok: false, detail: explain(err) });
+        }
       }
     }
 

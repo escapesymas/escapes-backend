@@ -28,6 +28,7 @@ function makeDeps(items: ImageAuditItem[], repair: RepairJobDeps['repair'], over
   return {
     loadItems: vi.fn(async (scope) => (scope === 'stock' ? items.filter((i) => i.stock > 0) : items)),
     contested: vi.fn(async () => contested),
+    catalogPictures: vi.fn(async () => null),
     repair: vi.fn(repair),
     bust: vi.fn(async () => {}),
     freeBytes: vi.fn(async () => 50 * 1024 ** 3),
@@ -63,7 +64,7 @@ describe('descarga en bloque', () => {
     expect(s.brands.RST).toMatchObject({ total: 2, done: 2, saved: 1, notFound: 1 });
     expect(s.brands.FLY).toMatchObject({ total: 3, done: 3, saved: 1, failed: 1, skipped: 1, lastError: 'zip: HTTP 500' });
     expect(s.recentErrors).toEqual([{ id: 3, sku: 'SKU3', brand: 'FLY', message: 'zip: HTTP 500' }]);
-    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['zip', 'api'], exactCodes: true, contested, refreshStaleIndex: false });
+    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['catalogo', 'zip', 'api'], exactCodes: true, contested, refreshStaleIndex: false });
     expect(deps.bust).toHaveBeenCalledTimes(1);
     expect(mocks.invalidate).toHaveBeenCalledTimes(1);
     expect(s.finishedAt).toBeTruthy();
@@ -76,9 +77,42 @@ describe('descarga en bloque', () => {
     await startRepairJob({ scope: 'all', useApi: false, concurrency: 1 }, deps);
     await finished();
     expect(order).toEqual([2, 1]);
-    expect(deps.repair).toHaveBeenCalledWith(2, { sources: ['zip'], exactCodes: true, contested, refreshStaleIndex: false });
+    expect(deps.repair).toHaveBeenCalledWith(2, { sources: ['catalogo', 'zip'], exactCodes: true, contested, refreshStaleIndex: false });
     expect(deps.bust).not.toHaveBeenCalled(); // no se guardó ninguna foto
     expect(getRepairJobState()).toMatchObject({ scope: 'all', useApi: false, notFound: 2 });
+  });
+
+  it('usa los enlaces del catálogo de Bihr guardado y cuenta las fotos que salen de enlaces', async () => {
+    const urls = new Map([['SKU1', 'https://api.mybihr.com/medias/SKU1-1-800Wx800H?context=x']]);
+    const catalog = { urls, refs: 10, withPictures: 8, unmatched: 1, pictureFields: ['DefaultPicture'], modifiedAt: '2026-10-10T00:00:00.000Z' };
+    const viaLink: RepairResult = { saved: 1, outcome: 'saved', attempts: [{ source: 'catalogo', target: 'api.mybihr.com/medias/SKU1-1-800Wx800H (catálogo de Bihr)', ok: true, detail: '45150 bytes' }] };
+    const deps = makeDeps([item(1, 'V PARTS'), item(2, 'V PARTS')], async (id) => (id === 1 ? viaLink : result('saved')), { catalogPictures: vi.fn(async () => catalog) });
+    await startRepairJob({ concurrency: 1 }, deps);
+    await finished();
+    expect(deps.catalogPictures).toHaveBeenCalledWith(['SKU1', 'SKU2']);
+    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['catalogo', 'zip', 'api'], exactCodes: true, contested, catalogUrls: urls, refreshStaleIndex: false });
+    expect(getRepairJobState()).toMatchObject({
+      status: 'done', saved: 2, savedFromLinks: 1,
+      catalog: { modifiedAt: '2026-10-10T00:00:00.000Z', refs: 10, withPictures: 8, unmatched: 1, forQueue: 1, pictureFields: ['DefaultPicture'] },
+    });
+    expect(getRepairJobState().message).toBeUndefined();
+  });
+
+  it('si el catálogo guardado no se puede leer, sigue con zip y API y lo dice al acabar', async () => {
+    const deps = makeDeps([item(1, 'A')], async () => result('saved'), { catalogPictures: vi.fn(async () => { throw new Error('memoria'); }) });
+    await startRepairJob({}, deps);
+    await finished();
+    const s = getRepairJobState();
+    expect(s).toMatchObject({ status: 'done', saved: 1, catalog: null });
+    expect(s.message).toContain('No se pudo leer el catálogo de Bihr guardado (memoria)');
+    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['catalogo', 'zip', 'api'], exactCodes: true, contested, refreshStaleIndex: false });
+  });
+
+  it('sin catálogo guardado usa solo los enlaces de las fichas', async () => {
+    const deps = makeDeps([item(1, 'A')], async () => result('not_found'));
+    await startRepairJob({}, deps);
+    await finished();
+    expect(getRepairJobState()).toMatchObject({ status: 'done', catalog: null, message: undefined });
   });
 
   it('solo hay un trabajo a la vez y se puede lanzar otro cuando acaba', async () => {
