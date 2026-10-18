@@ -251,7 +251,10 @@ async function run(job: RepairJobState, ctl: { stop: boolean }, deps: RepairJobD
     job.message = catalogNote;
   }
 
-  const sources: RepairSource[] = job.useApi ? ['detalles', 'catalogo'] : ['catalogo'];
+  // El zip de la marca, como último recurso: hay productos cuyo enlace de Bihr (API y catálogos) apunta a un fichero
+  // que ya no existe, pero la foto sigue en el zip (p. ej. la corona PBR 1108842001). Solo se lee si no hay otra
+  // foto, y su índice se guarda por marca; las marcas con zip ilegible (RST, más de 4 GB) dan error y se dejan.
+  const sources: RepairSource[] = job.useApi ? ['detalles', 'catalogo', 'zip'] : ['catalogo', 'zip'];
 
   // Products/Details se pide por tandas de 20 productos de la cola (una llamada en vez de veinte). Solo se guardan las
   // tandas cercanas a la que se está tratando, para no acumular los enlaces de toda la cola.

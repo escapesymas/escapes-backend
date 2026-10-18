@@ -65,20 +65,20 @@ describe('descarga en bloque', () => {
     expect(s.brands.RST).toMatchObject({ total: 2, done: 2, saved: 1, notFound: 1 });
     expect(s.brands.FLY).toMatchObject({ total: 3, done: 3, saved: 1, failed: 1, skipped: 1, lastError: 'zip: HTTP 500' });
     expect(s.recentErrors).toEqual([{ id: 3, sku: 'SKU3', brand: 'FLY', message: 'zip: HTTP 500' }]);
-    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['detalles', 'catalogo'], exactCodes: true, contested, detailsLookup: expect.any(Function), refreshStaleIndex: false });
+    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['detalles', 'catalogo', 'zip'], exactCodes: true, contested, detailsLookup: expect.any(Function), refreshStaleIndex: false });
     expect(deps.bust).toHaveBeenCalledTimes(1);
     expect(mocks.invalidate).toHaveBeenCalledTimes(1);
     expect(s.finishedAt).toBeTruthy();
     expect(s.message).toBeUndefined();
   });
 
-  it('sin API usa solo los enlaces que ya se conocen, y «todos» incluye los agotados al final', async () => {
+  it('sin API usa los enlaces que ya se conocen y el zip de la marca, y «todos» incluye los agotados al final', async () => {
     const order: number[] = [];
     const deps = makeDeps([item(1, 'A', 0), item(2, 'A', 5)], async (id) => { order.push(id); return result('not_found'); });
     await startRepairJob({ scope: 'all', useApi: false, concurrency: 1 }, deps);
     await finished();
     expect(order).toEqual([2, 1]);
-    expect(deps.repair).toHaveBeenCalledWith(2, { sources: ['catalogo'], exactCodes: true, contested, detailsLookup: expect.any(Function), refreshStaleIndex: false });
+    expect(deps.repair).toHaveBeenCalledWith(2, { sources: ['catalogo', 'zip'], exactCodes: true, contested, detailsLookup: expect.any(Function), refreshStaleIndex: false });
     expect(deps.bust).not.toHaveBeenCalled(); // no se guardó ninguna foto
     expect(getRepairJobState()).toMatchObject({ scope: 'all', useApi: false, notFound: 2 });
   });
@@ -91,7 +91,7 @@ describe('descarga en bloque', () => {
     await startRepairJob({ concurrency: 1 }, deps);
     await finished();
     expect(deps.catalogPictures).toHaveBeenCalledWith(['SKU1', 'SKU2']);
-    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['detalles', 'catalogo'], exactCodes: true, contested, catalogUrls: urls, detailsLookup: expect.any(Function), refreshStaleIndex: false });
+    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['detalles', 'catalogo', 'zip'], exactCodes: true, contested, catalogUrls: urls, detailsLookup: expect.any(Function), refreshStaleIndex: false });
     expect(getRepairJobState()).toMatchObject({
       status: 'done', saved: 2, savedFromLinks: 1,
       catalog: { modifiedAt: '2026-10-10T00:00:00.000Z', refs: 10, withPictures: 8, unmatched: 1, forQueue: 1, pictureFields: ['DefaultPicture'] },
@@ -106,7 +106,7 @@ describe('descarga en bloque', () => {
     const s = getRepairJobState();
     expect(s).toMatchObject({ status: 'done', saved: 1, catalog: null });
     expect(s.message).toContain('No se pudo leer el catálogo de Bihr guardado (memoria)');
-    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['detalles', 'catalogo'], exactCodes: true, contested, detailsLookup: expect.any(Function), refreshStaleIndex: false });
+    expect(deps.repair).toHaveBeenCalledWith(1, { sources: ['detalles', 'catalogo', 'zip'], exactCodes: true, contested, detailsLookup: expect.any(Function), refreshStaleIndex: false });
   });
 
   it('sin catálogo guardado usa solo los enlaces de las fichas', async () => {
