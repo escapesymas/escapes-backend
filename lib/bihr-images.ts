@@ -14,6 +14,7 @@
  * funcionan (ficheros locales que existen, otras webs) se dejan como están.
  * Devuelve qué se intentó y qué contestó cada fuente, para ver el motivo si no hay foto.
  */
+import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
@@ -432,10 +433,18 @@ export async function bihrProductPictures(partNumbers: readonly string[], timeou
  * se queda ningún temporal y los ficheros que ya había no se tocan.
  */
 async function saveVariants(photo: Buffer, fileBase: string, index: number, optimizedDir: string): Promise<void> {
-  const variants = await Promise.all(SIZES.map(async (size) => ({
-    size,
-    data: (await processImage(photo, { width: size, fit: 'inside', quality: 85, formats: ['jpeg', 'png', 'webp', 'gif'] })).data,
-  })));
+  // La foto de fuera solo se abre una vez, en el procesador aislado (la de 800). Las de 400 y 200 se sacan aquí
+  // de esa WebP, que ya está limpia y sin metadatos (sharp en el backend vale para lo que ya pasó por el
+  // procesador). Antes eran tres procesos por foto y la descarga en bloque iba a la mitad o menos con 2 núcleos.
+  const largest = await processImage(photo, { width: SIZES[0], fit: 'inside', quality: 85, formats: ['jpeg', 'png', 'webp', 'gif'] });
+  const variants: { size: number; data: Buffer }[] = [{ size: SIZES[0], data: largest.data }];
+  for (const size of SIZES.slice(1)) {
+    const data = await sharp(largest.data, { failOn: 'error', animated: false })
+      .resize({ width: size, fit: 'inside', withoutEnlargement: true })
+      .webp({ quality: 85, effort: 2 })
+      .toBuffer();
+    variants.push({ size, data });
+  }
   await fs.promises.mkdir(optimizedDir, { recursive: true });
   const staged: { tmp: string; file: string }[] = [];
   try {

@@ -31,6 +31,19 @@ vi.mock('./image-sandbox.js', async (importOriginal) => ({
   }),
 }));
 
+// Las medidas de 400 y 200 se sacan con sharp de la WebP que devuelve el procesador.
+vi.mock('sharp', () => ({
+  default: vi.fn((input: Buffer) => {
+    let width = 0;
+    const chain = {
+      resize: (o: { width: number }) => { width = o.width; return chain; },
+      webp: () => chain,
+      toBuffer: async () => Buffer.from(`webp-${width}-de-${input.length}`),
+    };
+    return chain;
+  }),
+}));
+
 // Fotos remotas del catálogo: cada prueba dice qué contesta cada enlace (por defecto, 404).
 const remote = vi.hoisted(() => ({ responses: {} as Record<string, Buffer | number>, requested: [] as string[] }));
 vi.mock('./remote-image.js', async (importOriginal) => ({

@@ -15,6 +15,19 @@ vi.mock('../db.js', () => ({
     }),
   },
 }));
+// Las medidas de 400 y 200 se sacan con sharp de la WebP que devuelve el procesador.
+vi.mock('sharp', () => ({
+  default: vi.fn((input: Buffer) => {
+    let width = 0;
+    const chain = {
+      resize: (o: { width: number }) => { width = o.width; return chain; },
+      webp: () => chain,
+      toBuffer: async () => Buffer.from(`webp-${width}-de-${input.length}`),
+    };
+    return chain;
+  }),
+}));
+
 vi.mock('./image-sandbox.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./image-sandbox.js')>()),
   processImage: vi.fn(async (buf: Buffer, o: { width: number }) => ({ data: Buffer.from(`webp-${o.width}-${buf.length}`) })),

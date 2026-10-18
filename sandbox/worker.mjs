@@ -57,7 +57,8 @@ try {
       position: 'centre',
       withoutEnlargement: opts.ajuste === 'inside',
     })
-    .webp({ quality: opts.calidad, effort: 4 })
+    // effort 2: bastante menos CPU (el servidor tiene 2 núcleos) a cambio de ficheros un poco más grandes.
+    .webp({ quality: opts.calidad, effort: 2 })
     .toBuffer({ resolveWithObject: true });
 } catch {
   fail('imagen no válida');
