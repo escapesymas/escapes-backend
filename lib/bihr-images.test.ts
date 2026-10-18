@@ -365,7 +365,8 @@ describe('reparar las fotos de un producto', () => {
     expect(k('api', 'la API de Bihr no responde bien; se vuelve a probar en unos minutos')).toBe('service');
     expect(k('api', 'autenticación rechazada (HTTP 401)')).toBe('service');
     expect(k('zip', 'sin respuesta a tiempo')).toBe('service');
-    expect(k('zip', 'zip de más de 4 GB (ZIP64), no se puede leer por rangos')).toBe('service');
+    // Zip demasiado grande para leerlo por rangos: para esa marca no hay zip (no es una caída de la fuente).
+    expect(k('zip', 'zip de más de 4 GB (ZIP64), no se puede leer por rangos')).toBe('missing');
     expect(k('catalogo', 'procesador de imágenes: HTTP 503')).toBe('service');
     // Enlaces de fotos del catálogo (fetchRemoteImage): caducado = no está; roto = esa foto; bloqueo o caída = la fuente.
     expect(k('catalogo', 'No se pudo descargar la imagen (404)')).toBe('missing');

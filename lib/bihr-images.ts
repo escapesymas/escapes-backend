@@ -71,6 +71,9 @@ export type FailureKind = 'missing' | 'product' | 'service';
 const PRODUCT_FAILURE = /^No se pudo descargar la imagen \(400\)$|dañada \(CRC\)|no coincide con el del zip|no se pudo descomprimir|más grande de lo que dice|imagen demasiado grande|la respuesta no es una imagen|fichero cifrado|fichero ZIP64|compresión .* no admitida|Imagen no válida/;
 export function failureKind(a: Pick<RepairAttempt, 'source' | 'detail'>): FailureKind {
   if (NOT_FOUND_DETAILS.has(a.detail) || a.detail === 'HTTP 404') return 'missing';
+  // Un zip de marca de más de 4 GB (RST) no se puede leer por rangos: para esa marca el zip no existe a efectos
+  // prácticos. Antes contaba como fallo de la fuente y, al usar el zip de último recurso, se dejaba la marca entera.
+  if (a.source === 'zip' && /\(ZIP64\), no se puede leer por rangos/.test(a.detail)) return 'missing';
   // El enlace de la ficha o del catálogo ya no existe (fetchRemoteImage dice «(404)»); un 400 es un enlace roto.
   if ((a.source === 'catalogo' || a.source === 'detalles') && /^No se pudo descargar la imagen \((404|410)\)$/.test(a.detail)) return 'missing';
   // La API de Bihr contesta con algo que no es una foto cuando no tiene la de ese producto.
