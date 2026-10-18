@@ -8,7 +8,7 @@
 import { storePolicies } from '../chatbot/index.js';
 import { getSupportSettings, hoursText } from './live-chat.js';
 import {
-  NICHE_CONTEXT, GeneratedCopy, geminiGenerateText, minimaxGenerateText, repairJson,
+  NICHE_CONTEXT, GeneratedCopy, geminiGenerateText, minimaxGenerateText, repairJson, withoutSupplier,
   geminiGenerateImage, minimaxGenerateImage, normalizeHashtags,
 } from './socialContentAI.js';
 
@@ -32,7 +32,7 @@ function parseCampaign(text: string): GeneratedCopy & { slides: Slide[] } {
   if (!m) throw new Error('La IA no devolvió el formato esperado');
   let parsed: any;
   try { parsed = JSON.parse(m[0]); } catch { parsed = JSON.parse(repairJson(m[0])); }
-  const str = (v: any) => (Array.isArray(v) ? v.join('\n') : String(v || '')).trim();
+  const str = (v: any) => withoutSupplier((Array.isArray(v) ? v.join('\n') : String(v || '')).trim());
   const slides: Slide[] = (Array.isArray(parsed.slides) ? parsed.slides : [])
     .map((x: any) => ({ title: str(x?.title).slice(0, 80), text: str(x?.text).slice(0, 220), scene: str(x?.scene).slice(0, 600) }))
     .filter((x: Slide) => x.title && x.scene)

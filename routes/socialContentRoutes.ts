@@ -13,7 +13,7 @@ import { saveBrandLogo } from '../lib/socialPromo.js';
 import { startVideo, VIDEO_MODELS } from '../lib/socialVideo.js';
 import { startInstagramVersion, recomposeInstagram } from '../lib/socialInstagram.js';
 import { pool } from '../db.js';
-import { productBySku, isAngle } from '../lib/socialContentAI.js';
+import { productBySku, isAngle, isSupplierProduct } from '../lib/socialContentAI.js';
 
 export const socialContentRouter = Router();
 
@@ -62,8 +62,10 @@ socialContentRouter.post('/social-content', async (req, res) => {
     if (campaign && !String(topic || '').trim()) {
       return res.status(400).json({ error: 'Escribe de qué trata la publicación de marca' });
     }
-    if (productSku && !(await productBySku(String(productSku)))) {
-      return res.status(400).json({ error: 'Ese producto no existe o no está publicado' });
+    if (productSku) {
+      const product = await productBySku(String(productSku));
+      if (!product) return res.status(400).json({ error: 'Ese producto no existe o no está publicado' });
+      if (isSupplierProduct(product)) return res.status(400).json({ error: 'Los productos de marca Bihr no se publican en redes (es nuestro proveedor). Elige otro' });
     }
     const slot = await createSlot({ scheduledAt, format, topic: text(topic, 500) || undefined, productSku: text(productSku, 80) || undefined, campaign: !!campaign, angle: angle || undefined });
     return res.json({ slot });
@@ -139,8 +141,10 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
     if (scheduledAt !== undefined && !validDate(scheduledAt)) return res.status(400).json({ error: 'Fecha no válida' });
     if (format !== undefined && !FORMATS.includes(format)) return res.status(400).json({ error: 'Formato no válido' });
     if (angle && !isAngle(angle)) return res.status(400).json({ error: 'Enfoque no válido' });
-    if (productSku && !(await productBySku(String(productSku)))) {
-      return res.status(400).json({ error: 'Ese producto no existe o no está publicado' });
+    if (productSku) {
+      const product = await productBySku(String(productSku));
+      if (!product) return res.status(400).json({ error: 'Ese producto no existe o no está publicado' });
+      if (isSupplierProduct(product)) return res.status(400).json({ error: 'Los productos de marca Bihr no se publican en redes (es nuestro proveedor). Elige otro' });
     }
     await updateSlot(id, {
       ...(copy !== undefined && { copy: text(copy, 4000) }),

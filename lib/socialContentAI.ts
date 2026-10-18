@@ -31,7 +31,21 @@ moto de más de 200 marcas: escapes, cascos, ropa técnica, transmisión, frenos
 suspensión, protecciones y mantenimiento. Público: moteros en España,
 tono cercano y experto, nada de humo de marketing. El contenido debe generar
 deseo por el producto con argumentos reales y comprobables (estética y materiales,
-protección y comodidad del equipamiento, precio). La veracidad va siempre por delante.`;
+protección y comodidad del equipamiento, precio). La veracidad va siempre por delante.
+Nunca menciones a Bihr ni a ningún proveedor o distribuidor: quien vende es Escapes y Más.`;
+
+/** Bihr es nuestro proveedor: no se nombra en ninguna publicación ni se publican sus productos de marca propia. */
+const SUPPLIER_RE = /bihr/i;
+export const isSupplierProduct = (p: { name?: string | null; brand?: string | null }) =>
+  SUPPLIER_RE.test(`${p.brand || ''} ${p.name || ''}`);
+
+/** Quita las frases que nombran al proveedor (por si la IA lo cuela o viene en la descripción del catálogo). */
+export function withoutSupplier(text: string): string {
+  if (!SUPPLIER_RE.test(text)) return text;
+  return text.split('\n')
+    .map((line) => line.split(/(?<=[.!?…])\s+/).filter((sentence) => !SUPPLIER_RE.test(sentence)).join(' '))
+    .join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 export interface SlotProduct {
   id: number;
@@ -157,7 +171,7 @@ function rowToProduct(p: any): SlotProduct {
     .map((i: any) => (typeof i === 'string' ? i : i?.src))
     .filter((s: any) => typeof s === 'string' && s)
     .slice(0, 6);
-  const description = String(p.description || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200);
+  const description = withoutSupplier(String(p.description || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()).slice(0, 1200);
   return {
     id: p.id, sku: p.sku, name: p.name, brand: p.brand || '', price, listPrice: list,
     inStock: Number(p.stock) > 0, description, images,
@@ -197,7 +211,8 @@ export async function pickProduct(excludeSkus: string[] = []): Promise<SlotProdu
        SELECT p.id, p.sku, p.name, p.brand, p.price, p.sale_price, p.promo_price, p.stock, p.description, p.images, p.compatibility
        FROM products p
        WHERE p.status = 'published' AND p.price >= $1 AND p.stock >= $3 AND p.duplicate_of IS NULL
-         AND COALESCE(p.brand, '') <> '' AND jsonb_array_length(COALESCE(p.images, '[]'::jsonb)) > 0
+         AND COALESCE(p.brand, '') <> '' AND p.brand !~* 'bihr' AND p.name !~* 'bihr'
+         AND jsonb_array_length(COALESCE(p.images, '[]'::jsonb)) > 0
          AND ($2 = false OR upper(p.brand) NOT IN (SELECT brand FROM recent_brands))
          AND NOT (upper(p.sku) = ANY($4::text[]))
          AND NOT EXISTS (SELECT 1 FROM used u WHERE u.created_at > NOW() - INTERVAL '120 days'
@@ -268,7 +283,7 @@ export function normalizeHashtags(text: string): string {
     if (w.startsWith('#') || !out.length) out.push(w.startsWith('#') ? w : `#${w}`);
     else out[out.length - 1] += w.replace(/[^\p{L}\p{N}_]/gu, '');
   }
-  return out.join(' ');
+  return out.filter((tag) => !SUPPLIER_RE.test(tag)).join(' ');
 }
 
 function parseCopy(text: string): GeneratedCopy {
@@ -279,7 +294,7 @@ function parseCopy(text: string): GeneratedCopy {
   }
   let parsed: any;
   try { parsed = JSON.parse(jsonMatch[0]); } catch { parsed = JSON.parse(repairJson(jsonMatch[0])); }
-  const str = (v: any) => (Array.isArray(v) ? v.join('\n') : String(v || '')).trim();
+  const str = (v: any) => withoutSupplier((Array.isArray(v) ? v.join('\n') : String(v || '')).trim());
   const copy = {
     hook: str(parsed.hook), copy: str(parsed.copy), script: str(parsed.script), hashtags: normalizeHashtags(str(parsed.hashtags)),
     imagePrompt: str(parsed.image_prompt), videoPrompt: str(parsed.video_prompt),

@@ -7,7 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 import { pool } from '../db.js';
-import { generateCopy, generateImages, productBySku, pickProduct, withBestImageFirst, withLoadableImages, SlotProduct, angleFits, pickAngle } from './socialContentAI.js';
+import { generateCopy, generateImages, productBySku, pickProduct, withBestImageFirst, withLoadableImages, SlotProduct, angleFits, pickAngle, isSupplierProduct } from './socialContentAI.js';
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
 import { composeAll, composePromo, composeSlide, composeProductCard } from './socialPromo.js';
 import { generateCampaignCopy, generateScene, Slide } from './socialCampaign.js';
@@ -313,6 +313,7 @@ async function generateSlotContent(id: number) {
     // Siempre sobre un producto real: el elegido o uno de las marcas destacadas.
     let product = slot.product_sku ? await productBySku(slot.product_sku) : null;
     if (slot.product_sku && !product) throw new Error(`El producto ${slot.product_sku} no existe o no está publicado`);
+    if (product && isSupplierProduct(product)) throw new Error('Los productos de marca Bihr no se publican en redes (es nuestro proveedor). Elige otro producto');
     if (product) {
       const photos = product.images.length;
       product = await withLoadableImages(product);
