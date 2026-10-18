@@ -544,9 +544,13 @@ async function processPricesCatalog(catalog: any, catalogType: string, startTime
   }
   updateCatalogSyncState({ status: 'completed', catalogType, startTime, endTime: new Date().toISOString(), inserted: 0, updated });
 
-  // Último paso de la actualización del catálogo (productos → compatibilidades →
-  // precios): avisar a los clientes de las piezas nuevas para sus motos.
-  import('./lib/moto-alerts.js')
+  // Últimos pasos de la actualización del catálogo (productos → compatibilidades → precios):
+  // ocultar los descatalogados sin stock en Bihr y avisar a los clientes de las piezas nuevas
+  // para sus motos (después, para no avisar de productos que se acaban de ocultar).
+  import('./lib/bihr-discontinued.js')
+    .then((m) => m.syncDiscontinued())
+    .catch((e) => console.error('[BIHR SERVICE] Error con los descatalogados:', e))
+    .then(() => import('./lib/moto-alerts.js'))
     .then((m) => m.runMotoAlerts('catalogo'))
     .catch((e) => console.error('[BIHR SERVICE] Error con los avisos de piezas nuevas:', e));
 }

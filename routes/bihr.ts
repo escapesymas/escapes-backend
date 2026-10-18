@@ -1,7 +1,10 @@
 import { Router } from 'express';
+import { pool } from '../db.js';
 import { getLiveStockLevel, getLiveStockValue, checkProductsInfo, createBihrOrder } from '../bihrService.js';
 import { syncBihrStock, lastBihrStockSync } from '../lib/bihr-stock-sync.js';
 import { requireAdmin } from '../utils.js';
+import { requireAdminRole } from '../lib/agent-auth.js';
+import { syncDiscontinued, lastDiscontinuedSync } from '../lib/bihr-discontinued.js';
 
 export const bihrRouter = Router();
 
@@ -74,4 +77,18 @@ bihrRouter.post('/admin/sync-bihr-stock', requireAdmin, async (_req: any, res: a
 // GET /api/admin/sync-bihr-stock/status
 bihrRouter.get('/admin/sync-bihr-stock/status', requireAdmin, async (_req: any, res: any) => {
   return res.json(lastBihrStockSync() || { status: 'idle' });
+});
+
+// POST /api/admin/bihr/descatalogados — oculta ya los descatalogados de Bihr sin stock (y recupera los reactivados).
+bihrRouter.post('/admin/bihr/descatalogados', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  syncDiscontinued().catch((e) => console.error('[BIHR DESCATALOGADOS ROUTE ERROR]', e));
+  return res.json({ message: 'Revisión de descatalogados iniciada en segundo plano', last: lastDiscontinuedSync() });
+});
+
+// GET /api/admin/bihr/descatalogados — resultado de la última revisión.
+bihrRouter.get('/admin/bihr/descatalogados', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  const { rows: [r] } = await pool.query(`SELECT count(*)::int AS n FROM products WHERE status = 'descatalogado'`);
+  return res.json({ last: lastDiscontinuedSync(), hiddenNow: r?.n ?? 0 });
 });

@@ -6172,6 +6172,25 @@ setInterval(() => {
   dailyMotoAlerts().catch((e) => console.error('[MOTO ALERTS ERROR]:', e.message));
 }, 10 * 60_000);
 
+// Descatalogados de Bihr sin stock: se ocultan una vez al día a partir de las 7:00 (Bihr actualiza
+// el stock dos veces al día) y tras cada sincronización del catálogo (bihrService).
+async function dailyDiscontinued() {
+  const madrid = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const get = (t: string) => madrid.find((x) => x.type === t)?.value || '';
+  if (parseInt(get('hour')) < 7) return;
+  const today = `${get('year')}-${get('month')}-${get('day')}`;
+  const claim = await pool.query(
+    `INSERT INTO catalog_meta (key, value) VALUES ('bihr_discontinued_daily', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value WHERE catalog_meta.value <> EXCLUDED.value
+     RETURNING value`, [today]);
+  if (!claim.rows.length) return;
+  await (await import('./lib/bihr-discontinued.js')).syncDiscontinued();
+}
+
+setInterval(() => {
+  dailyDiscontinued().catch((e) => console.error('[BIHR DESCATALOGADOS ERROR]:', e.message));
+}, 10 * 60_000);
+
 // ================================================================
 // PERSISTENT CART ENDPOINTS
 // ================================================================
