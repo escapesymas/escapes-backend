@@ -103,7 +103,8 @@ export async function startVideo(id: number, opts: { sourceUrl: string; prompt: 
   if (!slot) throw new Error('Ya se está generando un vídeo para esta publicación');
   try {
     const frame = await firstFrame(opts.sourceUrl);
-    const prompt = `${opts.prompt}\nSin texto en pantalla, sin subtítulos y sin añadir logotipos: el producto debe mantener exactamente su forma, colores y marcas.`;
+    // Veo genera el audio: nunca un motor o un escape inventado, que se tomaría por el sonido real del producto.
+    const prompt = `${opts.prompt}\nSin texto en pantalla, sin subtítulos y sin añadir logotipos: el producto debe mantener exactamente su forma, colores y marcas.\nAudio: solo música o ambiente suave; ningún sonido de motor ni de escape.`;
     const brand = slot.product_sku ? (await productBySku(slot.product_sku))?.brand || null : null;
     if (isMinimax(model)) {
       const taskId = await startMinimaxVideo(model, prompt, frame);

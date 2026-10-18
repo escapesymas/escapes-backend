@@ -13,7 +13,7 @@ import { saveBrandLogo } from '../lib/socialPromo.js';
 import { startVideo, VIDEO_MODELS } from '../lib/socialVideo.js';
 import { startInstagramVersion, recomposeInstagram } from '../lib/socialInstagram.js';
 import { pool } from '../db.js';
-import { productBySku } from '../lib/socialContentAI.js';
+import { productBySku, isAngle } from '../lib/socialContentAI.js';
 
 export const socialContentRouter = Router();
 
@@ -50,21 +50,22 @@ socialContentRouter.get('/social-content', async (req, res) => {
   }
 });
 
-// POST /api/social-content  { scheduledAt, format, topic?, productSku? }
+// POST /api/social-content  { scheduledAt, format, topic?, productSku?, angle? }
 socialContentRouter.post('/social-content', async (req, res) => {
   if (!(await requireAdminRole(req, res))) return;
   try {
-    const { scheduledAt, format, topic, productSku, campaign } = req.body || {};
+    const { scheduledAt, format, topic, productSku, campaign, angle } = req.body || {};
     if (!validDate(scheduledAt) || !FORMATS.includes(format)) {
       return res.status(400).json({ error: 'Indica una fecha válida y el formato (vídeo, foto o carrusel)' });
     }
+    if (angle && !isAngle(angle)) return res.status(400).json({ error: 'Enfoque no válido' });
     if (campaign && !String(topic || '').trim()) {
       return res.status(400).json({ error: 'Escribe de qué trata la publicación de marca' });
     }
     if (productSku && !(await productBySku(String(productSku)))) {
       return res.status(400).json({ error: 'Ese producto no existe o no está publicado' });
     }
-    const slot = await createSlot({ scheduledAt, format, topic: text(topic, 500) || undefined, productSku: text(productSku, 80) || undefined, campaign: !!campaign });
+    const slot = await createSlot({ scheduledAt, format, topic: text(topic, 500) || undefined, productSku: text(productSku, 80) || undefined, campaign: !!campaign, angle: angle || undefined });
     return res.json({ slot });
   } catch (err: any) {
     console.error('[SOCIAL CONTENT CREATE ERROR]:', err.message);
@@ -115,13 +116,13 @@ socialContentRouter.post('/social-content/:id/generate', async (req, res) => {
   }
 });
 
-// PATCH /api/social-content/:id  { copy?, hashtags?, script?, status?, scheduledAt?, topic?, productSku?, format? }
+// PATCH /api/social-content/:id  { copy?, hashtags?, script?, status?, scheduledAt?, topic?, angle?, productSku?, format? }
 socialContentRouter.patch('/social-content/:id', async (req, res) => {
   if (!(await requireAdminRole(req, res))) return;
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ error: 'ID inválido' });
   try {
-    const { copy, hashtags, script, status, scheduledAt, topic, productSku, format, slides, igCopy, igHashtags } = req.body || {};
+    const { copy, hashtags, script, status, scheduledAt, topic, angle, productSku, format, slides, igCopy, igHashtags } = req.body || {};
     // Diapositivas de una publicación de marca: título y texto editables (la escena no).
     let slidesJson: string | undefined;
     if (slides !== undefined) {
@@ -137,6 +138,7 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
     if (status !== undefined && !STATUSES.includes(status)) return res.status(400).json({ error: 'Estado no válido' });
     if (scheduledAt !== undefined && !validDate(scheduledAt)) return res.status(400).json({ error: 'Fecha no válida' });
     if (format !== undefined && !FORMATS.includes(format)) return res.status(400).json({ error: 'Formato no válido' });
+    if (angle && !isAngle(angle)) return res.status(400).json({ error: 'Enfoque no válido' });
     if (productSku && !(await productBySku(String(productSku)))) {
       return res.status(400).json({ error: 'Ese producto no existe o no está publicado' });
     }
@@ -147,6 +149,7 @@ socialContentRouter.patch('/social-content/:id', async (req, res) => {
       ...(status !== undefined && { status }),
       ...(scheduledAt !== undefined && { scheduled_at: scheduledAt }),
       ...(topic !== undefined && { topic: text(topic, 500) || null }),
+      ...(angle !== undefined && { angle: angle || null }),
       ...(productSku !== undefined && { product_sku: text(productSku, 80) || null }),
       ...(format !== undefined && { format }),
       ...(slidesJson !== undefined && { slides: slidesJson }),

@@ -7,7 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 import { pool } from '../db.js';
-import { generateCopy, generateImages, productBySku, pickProduct, withBestImageFirst, withLoadableImages, SlotProduct } from './socialContentAI.js';
+import { generateCopy, generateImages, productBySku, pickProduct, withBestImageFirst, withLoadableImages, SlotProduct, angleFits, pickAngle } from './socialContentAI.js';
 import { sendNotificationToAll, adminUrl } from '../pushService.js';
 import { composeAll, composePromo, composeSlide, composeProductCard } from './socialPromo.js';
 import { generateCampaignCopy, generateScene, Slide } from './socialCampaign.js';
@@ -20,6 +20,8 @@ export interface ContentSlot {
   scheduled_at: string;
   format: 'video' | 'photo' | 'carousel';
   topic: string | null;
+  /** Enfoque (ANGLES de socialContentAI); null = lo elige el generador. */
+  angle: string | null;
   product_sku: string | null;
   copy: string | null;
   hashtags: string | null;
@@ -67,11 +69,12 @@ export async function listSlots(opts: { from?: string; to?: string } = {}): Prom
   return r.rows;
 }
 
-export async function createSlot(input: { scheduledAt: string; format: string; topic?: string; productSku?: string; campaign?: boolean }) {
+export async function createSlot(input: { scheduledAt: string; format: string; topic?: string; productSku?: string; campaign?: boolean; angle?: string }) {
   const r = await pool.query(
-    `INSERT INTO social_content_calendar (scheduled_at, format, topic, product_sku, campaign)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [input.scheduledAt, input.format, input.topic || null, input.campaign ? null : input.productSku || null, !!input.campaign]);
+    `INSERT INTO social_content_calendar (scheduled_at, format, topic, product_sku, campaign, angle)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [input.scheduledAt, input.format, input.topic || null, input.campaign ? null : input.productSku || null, !!input.campaign,
+      input.campaign ? null : input.angle || null]);
   return r.rows[0];
 }
 
@@ -79,7 +82,7 @@ export async function deleteSlot(id: number) {
   await pool.query('DELETE FROM social_content_calendar WHERE id = $1', [id]);
 }
 
-export async function updateSlot(id: number, fields: Partial<Pick<ContentSlot, 'copy' | 'hashtags' | 'script' | 'status' | 'scheduled_at' | 'topic' | 'product_sku' | 'format'>> & { slides?: string }) {
+export async function updateSlot(id: number, fields: Partial<Pick<ContentSlot, 'copy' | 'hashtags' | 'script' | 'status' | 'scheduled_at' | 'topic' | 'angle' | 'product_sku' | 'format'>> & { slides?: string }) {
   const sets: string[] = [];
   const params: any[] = [];
   for (const [k, v] of Object.entries(fields)) {
@@ -286,6 +289,21 @@ async function pickProductWithPhoto(): Promise<SlotProduct | null> {
   throw new Error('No se encontró un producto con fotos descargables; vuelve a intentarlo');
 }
 
+/**
+ * Enfoque de la publicación: el elegido en el panel si encaja con el producto; si no, el que lleva más tiempo
+ * sin usarse. Se guarda en el slot para que el panel lo enseñe y al regenerar se mantenga.
+ */
+async function resolveAngle(slot: any, product: SlotProduct | null): Promise<string> {
+  if (slot.angle && angleFits(slot.angle, product)) return slot.angle;
+  const { rows } = await pool.query(
+    `SELECT angle FROM social_content_calendar
+      WHERE angle IS NOT NULL AND campaign IS NOT TRUE AND id <> $1
+      ORDER BY scheduled_at DESC LIMIT 10`, [slot.id]);
+  const angle = pickAngle(product, rows.map((r) => r.angle));
+  await pool.query('UPDATE social_content_calendar SET angle = $1 WHERE id = $2', [angle, slot.id]);
+  return angle;
+}
+
 /** Genera copy + imágenes para un slot y lo deja en estado "ready". Si falla, vuelve a "draft" con el error. */
 async function generateSlotContent(id: number) {
   const { rows: [slot] } = await pool.query('SELECT * FROM social_content_calendar WHERE id = $1', [id]);
@@ -306,7 +324,8 @@ async function generateSlotContent(id: number) {
     }
     if (product) product = await withBestImageFirst(product);
 
-    const copy = await generateCopy({ format: slot.format, topic: slot.topic, product });
+    const angle = await resolveAngle(slot, product);
+    const copy = await generateCopy({ format: slot.format, topic: slot.topic, product, angle });
 
     // Carrusel de producto: 4 diapositivas con texto (gancho, ficha, precio y llamada a la acción).
     if (slot.format === 'carousel' && product && product.images.length) {

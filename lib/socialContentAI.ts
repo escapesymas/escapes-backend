@@ -30,8 +30,8 @@ export const NICHE_CONTEXT = `Escapes y Más (escapesymas.com) vende recambios, 
 moto de más de 200 marcas: escapes, cascos, ropa técnica, transmisión, frenos,
 suspensión, protecciones y mantenimiento. Público: moteros en España,
 tono cercano y experto, nada de humo de marketing. El contenido debe generar
-deseo por el producto con argumentos reales (sonido y estética del escape,
-protección y comodidad del equipamiento, precio).`;
+deseo por el producto con argumentos reales y comprobables (estética y materiales,
+protección y comodidad del equipamiento, precio). La veracidad va siempre por delante.`;
 
 export interface SlotProduct {
   id: number;
@@ -55,6 +55,73 @@ export interface GeneratedCopy {
   imagePrompt: string;   // para la app de Gemini (Nano Banana Pro) con la foto real adjunta
   videoPrompt: string;   // para Flow/Veo: vídeo vertical de 8 s
   slides?: { title: string; text: string }[];  // carrusel de producto: gancho, producto, precio, llamada a la acción
+}
+
+/**
+ * Enfoques de las publicaciones de producto. En TikTok la promo pura (producto + precio) es lo que menos se ve:
+ * a la competencia le funcionan los consejos, las preguntas sobre un problema real y el contenido para una moto
+ * concreta. Se rotan para que la promo directa sea como mucho una de cada cuatro publicaciones.
+ */
+export const ANGLES: Record<string, { label: string; prompt: string }> = {
+  consejo: {
+    label: 'Consejo útil',
+    prompt: `CONSEJO ÚTIL: el gancho y el guion dan un consejo práctico sobre el uso, el cuidado, la elección o el montaje
+de este tipo de producto, y el producto aparece al final como la opción de la tienda. El consejo tiene que ser de
+conocimiento general y seguro (sin cifras técnicas que no estén en los datos); para datos de una moto concreta
+(pares de apriete, presiones, intervalos) remite al manual del fabricante o a un taller.`,
+  },
+  pregunta: {
+    label: 'Pregunta-problema',
+    prompt: `PREGUNTA-PROBLEMA: empieza con una pregunta sobre un problema o una duda real del motero que este producto
+resuelve según sus datos (no plantees un problema que el producto no resuelva) y después da la respuesta con el producto.`,
+  },
+  tu_moto: {
+    label: 'Para tu moto',
+    prompt: `PARA TU MOTO: el gancho nombra la moto o las motos principales de la lista de compatibles (p. ej. «¿Tienes una …?»)
+y el contenido va dirigido a sus dueños. Usa solo motos de esa lista, con sus años.`,
+  },
+  guia: {
+    label: 'Guía de compra',
+    prompt: `GUÍA DE COMPRA: «qué mirar al elegir» este tipo de producto, con 2 o 3 criterios generales y ciertos, y cómo
+cumple cada uno este producto SOLO con datos de su ficha. Si un criterio no consta en los datos, no lo uses.`,
+  },
+  promo: {
+    label: 'Promo directa',
+    prompt: 'PROMO DIRECTA: el producto, su ventaja principal según los datos y el precio; claro y sin rodeos.',
+  },
+};
+
+export const isAngle = (angle: unknown): angle is string => typeof angle === 'string' && Object.hasOwn(ANGLES, angle);
+
+/** ¿Se puede usar este enfoque con este producto? «Para tu moto» necesita compatibilidades reales. */
+export const angleFits = (angle: string, product: SlotProduct | null) =>
+  isAngle(angle) && (angle !== 'tu_moto' || !!product?.compatibility);
+
+/**
+ * Enfoque para la siguiente publicación: el que lleva más tiempo sin usarse de los que encajan con el producto
+ * (`recent`, los enfoques de las últimas publicaciones, de la más reciente a la más antigua).
+ */
+export function pickAngle(product: SlotProduct | null, recent: string[]): string {
+  const fits = Object.keys(ANGLES).filter((a) => angleFits(a, product));
+  const age = (a: string) => { const i = recent.indexOf(a); return i < 0 ? Infinity : i; };
+  return fits.reduce((best, a) => (age(a) > age(best) ? a : best), fits[0]);
+}
+
+/**
+ * Línea de confianza que va al final de la descripción (como hacen las grandes tiendas), con los datos reales de la
+ * tienda: envío gratis desde el importe configurado, formas de pago y garantía (los mismos que storePolicies).
+ */
+export async function trustLine(): Promise<string> {
+  const parts: string[] = [];
+  try {
+    const { rows: [m] } = await pool.query(
+      `SELECT min(NULLIF(free_shipping_threshold, 0))::numeric AS free FROM shipping_methods WHERE active = 1`);
+    if (m?.free) parts.push(`Envío gratis desde ${Number(m.free).toLocaleString('es-ES')} €`);
+  } catch (err: any) {
+    console.warn('[SOCIAL CONTENT] no se pudo leer el envío gratis:', err.message);
+  }
+  parts.push('Paga con Bizum o a plazos con Klarna', '3 años de garantía');
+  return parts.map((t) => `✅ ${t}`).join(' ');
 }
 
 const euros = (cents: number) => (cents / 100).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -225,8 +292,9 @@ function parseCopy(text: string): GeneratedCopy {
 }
 
 /** Copy, guion, hook y hashtags. Gemini primero; si falla o está saturado, MiniMax. */
-export async function generateCopy(opts: { format: string; topic?: string | null; product: SlotProduct | null }): Promise<GeneratedCopy & { engine: string }> {
+export async function generateCopy(opts: { format: string; topic?: string | null; product: SlotProduct | null; angle?: string | null }): Promise<GeneratedCopy & { engine: string }> {
   const p = opts.product;
+  const angle = p && opts.angle && angleFits(opts.angle, p) ? ANGLES[opts.angle] : null;
   const productBlock = p
     ? `PRODUCTO (datos reales; no inventes características, medidas, homologaciones ni compatibilidades que no estén aquí):
 - Nombre: ${p.name}
@@ -245,8 +313,20 @@ ${await storePolicies()}
 ${productBlock}
 
 Genera contenido para un TikTok de formato "${opts.format}"${opts.topic ? ` con este enfoque: ${opts.topic}` : ''}.
+${angle ? `\nTIPO DE PUBLICACIÓN: ${angle.prompt}\n` : ''}
+VERACIDAD (lo más importante; ante la duda, no lo digas):
+- Todo lo que digas del producto sale de los datos de arriba. No inventes características, medidas, materiales ni usos.
+- No describas cómo suena un escape (ni «ruge», ni «suena brutal», ni decibelios) ni propongas pruebas de sonido:
+  no tenemos grabaciones reales del producto.
+- Homologación, ITV o legalidad: solo si la descripción lo dice expresamente (homologado, E-mark, EC, ECE…). Si no, no hables de ello.
+- Sin cifras inventadas (potencia, peso, ahorro, porcentajes, kilómetros) ni comparaciones con otros productos o con la pieza de serie.
+- Sin testimonios, opiniones, valoraciones, «el más vendido» ni «miles de moteros lo usan». No digas que lo hemos probado.
 
 Reglas:
+- Gancho: piensa varios y quédate con el mejor (una pregunta, un problema real del motero o un dato del producto).
+  Nunca empieces por el nombre del producto ni por «Descubre» o «Presentamos».
+- El sistema añade al final de la descripción una línea con el envío gratis, las formas de pago y la garantía:
+  no repitas esos datos en el copy.
 - Usa solo datos reales de arriba. No prometas plazos de entrega, stock limitado, "últimas unidades" ni descuentos que no aparezcan.
 - Si mencionas el envío, usa exactamente los importes de los datos de la tienda.
 - Formas de pago: tarjeta, Bizum y Klarna; solo Klarna es a plazos (nunca digas «Bizum a plazos»).
@@ -262,20 +342,24 @@ Responde EXCLUSIVAMENTE en JSON válido (sin markdown) con esta forma exacta:
  "script": "guion corto plano por escenas para grabar el vídeo o para el carrusel (3-5 pasos)",
  "hashtags": "6-8 hashtags separados por espacio, mezcla de nicho moto y genéricos de España",
  "image_prompt": "instrucciones en español para generar en la app de Gemini una foto vertical 9:16 de ambiente con la FOTO REAL DEL PRODUCTO ADJUNTA: escena, luz, encuadre; pide conservar exactamente forma, colores y logotipos del producto y no añadir texto",
- "video_prompt": "instrucciones en español para generar en Flow (Veo) un vídeo vertical 9:16 de 8 segundos a partir de la foto del producto: planos, movimiento de cámara, ambiente y sonido (p. ej. el escape al acelerar); sin texto en pantalla y sin cambiar el producto"${opts.format === 'carousel' && p ? `,
+ "video_prompt": "instrucciones en español para generar en Flow (Veo) un vídeo vertical 9:16 de 8 segundos a partir de la foto del producto: planos, movimiento de cámara, ambiente y música; sin sonido de motor ni de escape (no sería el sonido real del producto), sin texto en pantalla y sin cambiar el producto"${opts.format === 'carousel' && p ? `,
  "slides": [
-   {"title": "gancho de 3 a 6 palabras (diapositiva 1, sobre la foto de ambiente)", "text": "una frase corta que conecte con el motero"},
-   {"title": "nombre corto del producto (marca y modelo)", "text": "1 o 2 frases con datos reales del nombre o la descripción (medida, uso, material); nada inventado"},
+   {"title": "gancho de 3 a 6 palabras (diapositiva 1, sobre la foto de ambiente), según el tipo de publicación", "text": "una frase corta que conecte con el motero"},
+   {"title": "nombre corto del producto (marca y modelo)", "text": "1 o 2 frases con datos reales del nombre o la descripción (medida, uso, material), enlazadas con el consejo, la pregunta o los criterios si los hay; nada inventado"},
    {"title": "etiqueta corta para el precio, p. ej. «Precio de oferta» (el precio lo pone el sistema)", "text": "una frase con ventajas reales de compra de los datos de la tienda (descuento por importe, envío gratis desde…)"},
    {"title": "llamada a la acción con «escapesymas.com», 3 a 6 palabras", "text": "una frase corta (pago seguro, garantía…)"}
  ]` : ''}}`;
 
+  let result: GeneratedCopy & { engine: string };
   try {
-    return { ...parseCopy(await geminiGenerateText(prompt)), engine: 'gemini' };
+    result = { ...parseCopy(await geminiGenerateText(prompt)), engine: 'gemini' };
   } catch (err: any) {
     console.warn('[SOCIAL CONTENT] Gemini texto falló, uso MiniMax:', err.message);
-    return { ...parseCopy(await minimaxGenerateText(prompt)), engine: 'minimax' };
+    result = { ...parseCopy(await minimaxGenerateText(prompt)), engine: 'minimax' };
   }
+  // Línea de confianza con datos reales de la tienda, siempre igual (no la escribe la IA).
+  if (p) result.copy = [result.copy, await trustLine()].filter(Boolean).join('\n');
+  return result;
 }
 
 // ---------------------------------------------------------------- imágenes
