@@ -15,6 +15,7 @@
  * volver a lanzarlo, porque cada vuelta solo recoge los productos que siguen sin imagen.
  * Se para solo si hay fallos seguidos (algo no va: red, la API, procesador de imágenes) o queda poco disco.
  */
+import { pool } from '../db.js';
 import fs from 'fs';
 import path from 'path';
 import { getImageAudit, filterAuditItems, invalidateImageAudit, type ImageAuditItem } from './image-audit.js';
@@ -106,7 +107,21 @@ const OUTAGE_WAITS_MS = [15_000, 30_000, 60_000, 120_000, 300_000, 300_000];
 const defaultDeps: RepairJobDeps = {
   async loadItems(scope) {
     const audit = await getImageAudit({ refresh: true });
-    return filterAuditItems(audit.items, { onlyInStock: scope === 'stock' });
+    const items = filterAuditItems(audit.items, { onlyInStock: scope === 'stock' });
+    // También se descargan todas las demás fotos: los productos con la primera foto en local pero alguna
+    // de las siguientes todavía en Bihr (la auditoría solo mira la primera, la que se ve en los listados).
+    const seen = new Set(items.map((i) => i.id));
+    const { rows } = await pool.query(
+      `SELECT id, sku, name, brand, stock, family_code, jsonb_array_length(images) AS n FROM products
+       WHERE status = 'published' AND price > 0 AND jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 1
+         AND EXISTS (SELECT 1 FROM jsonb_array_elements(images) WITH ORDINALITY AS e(img, i)
+                     WHERE e.i > 1 AND coalesce(e.img->>'src', '') ~ '^https?://')
+         ${scope === 'stock' ? 'AND stock > 0' : ''}`);
+    for (const r of rows) {
+      if (seen.has(r.id)) continue;
+      items.push({ id: r.id, sku: r.sku || '', name: r.name || '', brand: r.brand || '', stock: Number(r.stock) || 0, familyCode: r.family_code || '', problem: 'foto_remota', photos: Number(r.n) || 0, firstSrc: '' });
+    }
+    return items;
   },
   contested: contestedFileBases,
   productPictures: (codes) => bihrProductPictures(codes),

@@ -31,7 +31,8 @@ const ALLOWED_IMAGE_HOSTS = new Set(['api.mybihr.com', 'cdn.mybihr.com', 'bihr.n
 const BIHR_REDIRECT_HOST = /(^|\.)(bihr\.pro|bihr\.net|mybihr\.com)$/i;
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
 const SIZES = [800, 400, 200] as const;
-const MAX_PHOTOS = 4;
+/** Todas las fotos de cada producto (Adrián, 18/10/2026); el tope solo frena fichas anómalas. */
+const MAX_PHOTOS = 20;
 const ZIP_UA = 'EscapesYMas-Bihr-Image-Downloader/4.0';
 /** Tiempo máximo de toda la reparación; el proxy del panel corta a los 120 s. */
 const REPAIR_BUDGET_MS = 55_000;
