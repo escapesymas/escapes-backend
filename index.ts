@@ -6242,11 +6242,12 @@ app.post('/api/cart', async (req: any, res: any) => {
       const safeEmail = (userEmail && userEmail !== 'undefined' && userEmail.includes('@')) ? userEmail : null;
       const safeItems = Array.isArray(items) ? items.filter((it: any) => it && (it.id || it.product_id)) : [];
       if (safeEmail && safeItems.length > 0) {
+        // La tienda manda los precios del carrito en euros (1127.3 = 1.127,30 €). Antes se adivinaba la unidad
+        // y los precios de 1.000 € o más, o sin decimales, se tomaban por céntimos (el aviso decía 11,27 €).
         const cartTotalCents = Math.round(safeItems.reduce((acc: number, it: any) => {
-          const rawPrice = typeof it.price === 'number' ? it.price : (parseFloat(it.price) || 0);
-          const cents = rawPrice < 1000 && !Number.isInteger(rawPrice) ? Math.round(rawPrice * 100) : Math.round(rawPrice);
+          const euros = typeof it.price === 'number' ? it.price : (parseFloat(it.price) || 0);
           const qty = Math.max(1, parseInt(it.quantity) || 1);
-          return acc + cents * qty;
+          return acc + Math.round(euros * 100) * qty;
         }, 0));
 
         const existingAbandoned = await db.execute(sql`
