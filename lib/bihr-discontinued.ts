@@ -98,20 +98,45 @@ async function scan(file: string, re: RegExp, onMatch: (m: RegExpExecArray) => v
   while ((m = re.exec(tail))) onMatch(m);
 }
 
+/** Estado de cada referencia en el catálogo «Products» de Bihr. */
+export interface CatalogStatus {
+  /** Productos leídos (referencias principales). */
+  total: number;
+  /** Referencia principal → si está descatalogada. */
+  main: Map<string, boolean>;
+  /** Referencias antiguas (OldPartNumber) de productos descatalogados. */
+  oldDiscontinued: Set<string>;
+}
+
 /**
- * Descatalogados del catálogo «Products». Los descatalogados vienen con una ficha corta
- * (PartNumber, OldPartNumber, … IsDiscontinued: true), así que no hay referencias anidadas de por medio.
+ * Lee el catálogo «Products». Los descatalogados vienen con una ficha corta (PartNumber, OldPartNumber, …
+ * IsDiscontinued: true); los vigentes, con la ficha completa (donde puede haber referencias anidadas de genéricos).
  */
-export async function readDiscontinued(file: string): Promise<{ total: number; discontinued: Set<string> }> {
-  const discontinued = new Set<string>();
+export async function readCatalogStatus(file: string): Promise<CatalogStatus> {
+  const main = new Map<string, boolean>();
+  const oldDiscontinued = new Set<string>();
   let total = 0;
-  let current: string[] = [];
+  let code = '', old = '';
   await scan(file, /"(PartNumber|OldPartNumber)"\s*:\s*"([^"]*)"|"IsDiscontinued"\s*:\s*(true|false)/g, (m) => {
-    if (m[1] === 'PartNumber') { current = [m[2].trim().toLowerCase()]; total++; }
-    else if (m[1] === 'OldPartNumber') { if (m[2].trim()) current.push(m[2].trim().toLowerCase()); }
-    else if (m[3] === 'true') for (const c of current) if (c) discontinued.add(c);
+    if (m[1] === 'PartNumber') {
+      code = m[2].trim().toLowerCase(); old = '';
+      if (code && !main.has(code)) { main.set(code, false); total++; }
+    } else if (m[1] === 'OldPartNumber') old = m[2].trim().toLowerCase();
+    else if (m[3] === 'true' && code) { main.set(code, true); if (old) oldDiscontinued.add(old); }
   });
-  return { total, discontinued };
+  return { total, main, oldDiscontinued };
+}
+
+/**
+ * ¿Bihr tiene descatalogado este producto? Manda su referencia actual: si Bihr la tiene vigente, no lo está
+ * aunque una referencia antigua suya figure como descatalogada (productos renumerados).
+ */
+export function isDiscontinued(codes: string[], status: CatalogStatus): boolean {
+  for (const c of codes) {
+    const known = status.main.get(c);
+    if (known !== undefined) return known;
+  }
+  return codes.some((c) => status.oldDiscontinued.has(c));
 }
 
 /** Stock de cada referencia del catálogo «Stocks». */
@@ -128,12 +153,12 @@ export async function readStocks(file: string): Promise<Map<string, number>> {
 export interface ProductRow { id: number; sku: string | null; part_number: string | null; status: string }
 
 /** Qué productos ocultar y cuáles volver a publicar (sin tocar la BD). */
-export function planDiscontinued(rows: ProductRow[], discontinued: Set<string>, stocks: Map<string, number>) {
+export function planDiscontinued(rows: ProductRow[], status: CatalogStatus, stocks: Map<string, number>) {
   const hide: number[] = [], restore: number[] = [];
   let keptWithStock = 0;
   for (const r of rows) {
     const codes = [r.part_number, r.sku].map((c) => String(c || '').trim().toLowerCase()).filter(Boolean);
-    const isDisc = codes.some((c) => discontinued.has(c));
+    const isDisc = isDiscontinued(codes, status);
     const stock = Math.max(0, ...codes.map((c) => stocks.get(c) ?? 0));
     if (r.status === 'published' && isDisc) {
       if (stock > 0) keptWithStock++; else hide.push(r.id);
@@ -150,9 +175,10 @@ async function doSync(): Promise<DiscontinuedResult> {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bihr-v3-'));
   try {
     const productsFile = await downloadCatalog('Products', dir);
-    const { total, discontinued } = await readDiscontinued(productsFile);
+    const status = await readCatalogStatus(productsFile);
+    const total = status.total;
     result.catalogProducts = total;
-    result.catalogDiscontinued = discontinued.size;
+    result.catalogDiscontinued = [...status.main.values()].filter(Boolean).length;
     if (total < MIN_CATALOG_PRODUCTS) throw new Error(`el catálogo de productos de Bihr parece incompleto (${total} productos)`);
     const stocksFile = await downloadCatalog('Stocks', dir);
     const stocks = await readStocks(stocksFile);
@@ -161,7 +187,7 @@ async function doSync(): Promise<DiscontinuedResult> {
 
     const { rows } = await pool.query<ProductRow>(
       `SELECT id, sku, part_number, status FROM products WHERE status IN ('published', $1)`, [DISCONTINUED_STATUS]);
-    const { hide, restore, keptWithStock } = planDiscontinued(rows, discontinued, stocks);
+    const { hide, restore, keptWithStock } = planDiscontinued(rows, status, stocks);
     if (hide.length > MAX_HIDE_PER_RUN) throw new Error(`se iban a ocultar ${hide.length} productos de golpe; no se toca nada por si es un error`);
     if (hide.length) await pool.query(`UPDATE products SET status = $2, updated_at = NOW() WHERE id = ANY($1) AND status = 'published'`, [hide, DISCONTINUED_STATUS]);
     if (restore.length) await pool.query(`UPDATE products SET status = 'published', updated_at = NOW() WHERE id = ANY($1) AND status = $2`, [restore, DISCONTINUED_STATUS]);
