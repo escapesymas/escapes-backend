@@ -4400,7 +4400,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
               last_activity_at: new Date(), recovery_token: '',
             },
             {
-              siteUrl: PUBLIC_SITE_URL, stage: 1, customerName: firstName || '',
+              siteUrl: PUBLIC_SITE_URL, stage: 1, customerName: firstName || '', quote: await abandonedCartQuote(itemsList, null),
               recoveryUrl: `${PUBLIC_SITE_URL}/?tab=cart${sessionToken ? `&sessionToken=${encodeURIComponent(sessionToken)}` : ''}`,
             },
           );
@@ -6022,7 +6022,37 @@ app.post('/api/orders/finalize', async (req: any, res: any) => {
 // ================================================================
 // ABANDONED CART EMAIL CRON
 // ================================================================
-import { renderAbandonedCartEmail, ABANDONED_COUPON_HOURS } from './templates/abandoned-cart.js';
+import { renderAbandonedCartEmail, ABANDONED_COUPON_HOURS, type AbandonedCartQuote } from './templates/abandoned-cart.js';
+
+/**
+ * Importes del carrito guardado con el mismo cálculo que el pago (precios de hoy, descuento por importe,
+ * cupón y tope de margen), para que el correo enseñe el precio con descuento. Si falla, el correo sale
+ * solo con el total guardado.
+ */
+async function abandonedCartQuote(snapshot: unknown, couponCode: string | null): Promise<AbandonedCartQuote | null> {
+  try {
+    const lines = (Array.isArray(snapshot) ? snapshot : [])
+      .map((it: any) => ({ id: parseInt(it?.id ?? it?.product_id), quantity: Math.max(1, parseInt(it?.quantity) || 1) }))
+      .filter((l) => Number.isInteger(l.id) && l.id > 0);
+    if (!lines.length) return null;
+    const q = await quoteOrder({ cart: lines, country: 'ES', promoCode: couponCode });
+    if (q.items.length === 0) return null;
+    const acc = new Map<number, { cents: number; qty: number }>();
+    for (const it of q.items) {
+      const a = acc.get(it.productId) || { cents: 0, qty: 0 };
+      a.cents += it.price * it.quantity; a.qty += it.quantity;
+      acc.set(it.productId, a);
+    }
+    return {
+      unitPrices: Object.fromEntries([...acc].map(([id, a]) => [id, Math.round(a.cents / a.qty)])),
+      subtotalCents: q.subtotalCents, discountCents: q.discountCents, discountPercent: q.discountPercent,
+      discountCapped: q.discountCapped, shippingCents: q.shippingCents, totalCents: q.totalCents,
+    };
+  } catch (err: any) {
+    console.error('[ABANDONED CART] no se pudo calcular el descuento:', err.message);
+    return null;
+  }
+}
 
 async function processAbandonedCartEmails() {
   try {
@@ -6053,7 +6083,7 @@ async function processAbandonedCartEmails() {
       for (const raw of rows.rows) {
         const row = raw as any;
         const cartTotalCents = Math.round(parseFloat(row.cart_total_cents)) || 0;
-        const discountCents = Math.floor(cartTotalCents * discountPct);
+        let discountCents = Math.floor(cartTotalCents * discountPct);
         try {
           // Recordatorios 2 y 3: cupón real de un solo uso (antes el correo
           // anunciaba un descuento que el checkout no aplicaba).
@@ -6067,6 +6097,8 @@ async function processAbandonedCartEmails() {
                VALUES ($1, 'percent', $2, 1, NOW() + ($3 || ' hours')::interval, 1, 0)`,
               [couponCode, pct, String(hours)]);
           }
+          const quote = await abandonedCartQuote(row.cart_snapshot, couponCode);
+          if (quote) discountCents = quote.discountCents;
           const { subject, html, text } = renderAbandonedCartEmail(
             {
               id: row.id,
@@ -6083,6 +6115,7 @@ async function processAbandonedCartEmails() {
               stage: w.stage,
               couponCode,
               discountPct: Math.round(discountPct * 100),
+              quote,
             }
           );
           await sendMail(row.user_email, subject, text, html);

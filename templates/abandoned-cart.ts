@@ -14,6 +14,23 @@ interface AbandonedCartRow {
   recovery_token: string;
 }
 
+/**
+ * Lo que costaría hoy el carrito con el mismo cálculo que el pago (lib/order-pricing → quoteOrder):
+ * precios actuales, descuento por importe más el del cupón y el tope de margen, y envío a España.
+ */
+export interface AbandonedCartQuote {
+  /** Precio unitario actual por producto (céntimos). */
+  unitPrices: Record<number, number>;
+  subtotalCents: number;
+  discountCents: number;
+  /** Tramo por importe + cupón, en %. */
+  discountPercent: number;
+  /** El descuento se ha recortado para no bajar del margen mínimo. */
+  discountCapped: boolean;
+  shippingCents: number;
+  totalCents: number;
+}
+
 /** Validez del cupón de cada recordatorio, en horas (se muestra en el correo). */
 export const ABANDONED_COUPON_HOURS: Record<2 | 3, number> = { 2: 7 * 24, 3: 48 };
 
@@ -35,6 +52,8 @@ export function renderAbandonedCartEmail(
     customerName?: string;
     /** Enlace alternativo (el envío manual desde el admin usa el carrito de sesión). */
     recoveryUrl?: string;
+    /** Importes reales con el descuento; sin ellos solo se enseña el total guardado del carrito. */
+    quote?: AbandonedCartQuote | null;
   }
 ): { subject: string; html: string; text: string } {
   const siteUrl = options.siteUrl.replace(/\/$/, '');
@@ -62,15 +81,33 @@ export function renderAbandonedCartEmail(
       priceNum = priceNum / 100;
     }
     const slug = item.slug || item.id || '';
+    const current = options.quote?.unitPrices[Number(item.id)];
     return {
       name: String(item.title || item.name || 'Producto'),
       quantity: qty,
-      priceCents: Math.round(priceNum * 100),
+      priceCents: current ?? Math.round(priceNum * 100),
       image: item.image || item.src || '',
       url: slug ? `${siteUrl}/producto/${slug}` : '',
     };
   });
   const more = snapshot.length - items.length;
+
+  // Desglose con el descuento que se aplicará al pagar (cupón + descuento por importe).
+  const q = options.quote;
+  const tierPct = q ? Math.max(0, q.discountPercent - pct) : 0;
+  const discountLabel = !q || q.discountCapped ? 'Descuento'
+    : pct && tierPct ? `Descuento (cupón ${pct} % + ${tierPct} % por importe)`
+    : pct ? `Descuento (cupón ${pct} %)`
+    : `Descuento (${tierPct} % por importe)`;
+  const totalLines: Array<{ label: string; value: string; color?: string }> = [];
+  if (q) {
+    totalLines.push({ label: 'Subtotal', value: eur(q.subtotalCents) });
+    if (q.discountCents > 0) totalLines.push({ label: discountLabel, value: `−${eur(q.discountCents)}`, color: C.ok });
+    totalLines.push({ label: 'Envío (España)', value: q.shippingCents > 0 ? eur(q.shippingCents) : 'Gratis' });
+  }
+  const totalRow = q
+    ? { label: q.discountCents > 0 ? 'Total con descuento' : 'Total', value: eur(q.totalCents) }
+    : { label: 'Total del carrito', value: eur(cart.cart_total_cents) };
 
   const intro = !coupon
     ? 'Hemos guardado los productos que añadiste. Vuelve cuando quieras para completar tu compra antes de que se agoten.'
@@ -85,7 +122,7 @@ export function renderAbandonedCartEmail(
     ${coupon ? highlight(`Tu cupón · ${pct}% de descuento`, coupon) : ''}
     ${itemsTable(items)}
     ${more > 0 ? note(`Y ${more} producto${more === 1 ? '' : 's'} más en tu carrito.`) : ''}
-    ${totalsTable([], { label: 'Total del carrito', value: eur(cart.cart_total_cents) })}
+    ${totalsTable(totalLines, totalRow)}
     ${button(recoveryUrl, coupon ? 'Usar mi descuento' : 'Recuperar mi carrito')}
     ${coupon ? note(`El cupón se aplica solo al volver a tu carrito con este botón (o escríbelo en el checkout). Válido ${validity}, un solo uso. No se acumula sobre productos que ya están en promoción y puede ser menor en los que ya tienen el precio muy ajustado.`) : ''}
     ${fallbackLink(recoveryUrl)}
@@ -97,7 +134,7 @@ export function renderAbandonedCartEmail(
 ${!coupon ? 'Has dejado productos en tu carrito en Escapes y Más.' : `Te regalamos un ${pct}% de descuento para completar tu compra. Tu cupón: ${coupon} (válido ${validity}, un solo uso).`}
 
 ${items.map((i) => `- ${i.quantity} × ${i.name}: ${eur(i.priceCents * i.quantity)}`).join('\n')}
-Total del carrito: ${eur(cart.cart_total_cents)}
+${totalLines.map((l) => `${l.label}: ${l.value}`).join('\n')}${totalLines.length ? '\n' : ''}${totalRow.label}: ${totalRow.value}
 
 Recupera tu carrito aquí: ${recoveryUrl}
 
