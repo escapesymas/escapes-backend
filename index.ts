@@ -652,8 +652,10 @@ app.use('/uploads', (req: any, res: any, next: any) => {
 app.use('/uploads', express.static(uploadDir, {
   dotfiles: 'deny',
   index: false,
-  setHeaders: (res) => {
-    res.set('X-Robots-Tag', 'noindex, nofollow');
+  // Las fotos de producto (optimized/) se dejan indexar: Google Shopping las rechazaba («actualiza tu robots.txt
+  // para Googlebot-Image») por este noindex. Chat, avatares y contenido de redes siguen sin indexarse.
+  setHeaders: (res, filePath) => {
+    if (!filePath.startsWith(path.join(uploadDir, 'optimized') + path.sep)) res.set('X-Robots-Tag', 'noindex, nofollow');
   }
 }));
 
