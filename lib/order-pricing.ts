@@ -9,11 +9,17 @@ import { floorPrice } from './pricing.js';
 
 /** Descuento por importe del pedido (sobre el subtotal con IVA español). */
 export const ORDER_TIERS = [
-  { min: 500, discountPercent: 15, freeShipping: true },
   { min: 300, discountPercent: 10, freeShipping: true },
   { min: 150, discountPercent: 5, freeShipping: false }, // el envío gratis empieza en 200 € (shipping_methods)
 ];
 const DEFAULT_SHIPPING_CENTS = 1999;
+
+/**
+ * Máximo del descuento extra del carrito en porcentaje (tramo por importe + cupones de porcentaje). Lo que
+ * queda por encima es margen para que los asesores del chat negocien (21/10/2026: antes llegaba al 25 %).
+ * Los cupones de importe fijo y de envío gratis no cuentan aquí; todos siguen sujetos al tope de margen.
+ */
+export const MAX_EXTRA_DISCOUNT_PERCENT = 10;
 
 /**
  * Tope de los descuentos extra (tramo por importe + cupón): cada producto puede
@@ -49,7 +55,8 @@ export interface Quote {
   taxNote: string | null;
   taxCents: number;
   totalCents: number;
-  promo: { code: string; valid: boolean; type?: string; minAmount?: number; error?: string } | null;
+  /** `note`: el cupón es válido pero suma menos de lo que dice porque el carrito llega al máximo del 10 %. */
+  promo: { code: string; valid: boolean; type?: string; minAmount?: number; error?: string; note?: string } | null;
   nextTier: { min: number; discountPercent: number; freeShipping: boolean; missingCents: number } | null;
 }
 
@@ -157,7 +164,14 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
     else if (applied?.type === 'free_shipping') shippingCents = 0;
   }
 
-  discountPercent = Math.min(100, Math.max(0, discountPercent));
+  const tierPercent = tier?.discountPercent || 0;
+  if (discountPercent > MAX_EXTRA_DISCOUNT_PERCENT && promo?.valid && promo.type === 'percent') {
+    const adds = Math.max(0, MAX_EXTRA_DISCOUNT_PERCENT - tierPercent);
+    promo.note = adds > 0
+      ? `El descuento del carrito es como máximo del ${MAX_EXTRA_DISCOUNT_PERCENT} %: el cupón suma un ${adds} % al ${tierPercent} % por importe.`
+      : `Tu pedido ya tiene el descuento máximo del carrito (${MAX_EXTRA_DISCOUNT_PERCENT} %): el cupón no suma más.`;
+  }
+  discountPercent = Math.min(MAX_EXTRA_DISCOUNT_PERCENT, Math.max(0, discountPercent));
   const discountable = subtotalCents - promoCents;
   const wanted = Math.min(discountable, Math.round((discountable * discountPercent) / 100) + Math.max(0, fixedCents));
   // El envío que no cobramos (o cobramos por debajo de su coste) sale del mismo margen.

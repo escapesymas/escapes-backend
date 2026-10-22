@@ -4,7 +4,7 @@ import { verifyJWT } from '../utils.js';
 import { minimaxClient, CHAT_MODEL, CHAT_LIMITS } from './minimax.js';
 import { sanitizeUserInput, containsPromptInjection, isOutOfScope } from './sanitize.js';
 import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, extractMotorcycleFromQuery, buildSearchQuery, type CatalogHit } from './catalog.js';
-import { ORDER_TIERS } from '../lib/order-pricing.js';
+import { ORDER_TIERS, MAX_EXTRA_DISCOUNT_PERCENT } from '../lib/order-pricing.js';
 import { pool } from '../db.js';
 import { supportStatus, type SupportStatus } from '../lib/live-chat.js';
 import { isTechSpecQuery, searchMotorcycleTechSpecs } from './webSearch.js';
@@ -47,7 +47,7 @@ export async function storePolicies(): Promise<string> {
     .join(', ');
   const text = `DATOS DE LA TIENDA (úsalos tal cual, no inventes otros):
 - ${shipping}
-- Descuento automático por importe del pedido: ${tiers}. Se aplica solo en el carrito.
+- Descuento automático por importe del pedido: ${tiers}. Se aplica solo en el carrito. Sumando cupones, el descuento del carrito es como máximo del ${MAX_EXTRA_DISCOUNT_PERCENT} %.
 - Los pedidos se preparan en 24-72 horas hábiles tras el pago; los plazos de entrega son orientativos.
 - Pago seguro con Stripe: tarjeta (Visa, Mastercard, American Express), Bizum y Klarna (a plazos).
 - Canarias, Ceuta y Melilla: sin IVA español (pueden aplicar impuestos locales al recibirlo).

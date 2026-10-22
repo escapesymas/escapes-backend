@@ -38,7 +38,7 @@ import { formatOrderNumber } from './lib/email-templates.js';
 import { REFUND_REASONS, REFUNDABLE_STATUSES, REFUND_REASON_MIN, REFUND_REASON_MAX, refundEstimate, refundRequestsByOrder, refundRequestView, type RefundLine } from './lib/refunds.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
-import { quoteOrder, shippingFor } from './lib/order-pricing.js';
+import { quoteOrder, shippingFor, MAX_EXTRA_DISCOUNT_PERCENT } from './lib/order-pricing.js';
 import { repriceProducts, pricingAuto, refreshDto2, applyPromotions, suggestBrandRules, saveBrandRules } from './lib/pricing.js';
 import { isIP } from 'node:net';
 import { catalogRouter } from './routes/catalog.js';
@@ -6088,8 +6088,12 @@ async function processAbandonedCartEmails() {
           // Recordatorios 2 y 3: cupón real de un solo uso (antes el correo
           // anunciaba un descuento que el checkout no aplicaba).
           let couponCode: string | null = null;
-          if (w.stage > 1 && discountPct > 0) {
-            const pct = Math.round(discountPct * 100);
+          // El descuento extra del carrito no pasa del 10 % (tramo + cupón): el cupón solo regala lo que de
+          // verdad suma. Si el carrito ya tiene el 10 % por importe, el recordatorio va sin cupón.
+          const base = w.stage > 1 && discountPct > 0 ? await abandonedCartQuote(row.cart_snapshot, null) : null;
+          const tierPct = base ? base.discountPercent : 0;
+          const pct = Math.max(0, Math.min(Math.round(discountPct * 100), MAX_EXTRA_DISCOUNT_PERCENT - tierPct));
+          if (w.stage > 1 && pct > 0) {
             const hours = ABANDONED_COUPON_HOURS[w.stage as 2 | 3];
             couponCode = `VUELVE${pct}-${crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6)}`;
             await pool.query(
@@ -6114,7 +6118,7 @@ async function processAbandonedCartEmails() {
               siteUrl: PUBLIC_SITE_URL,
               stage: w.stage,
               couponCode,
-              discountPct: Math.round(discountPct * 100),
+              discountPct: pct,
               quote,
             }
           );

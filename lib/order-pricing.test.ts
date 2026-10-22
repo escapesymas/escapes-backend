@@ -21,7 +21,7 @@ vi.mock('./tax.js', () => ({
   taxInTotal: () => 0,
 }));
 
-import { quoteOrder, SHIPPING_REAL_COST_CENTS, EXTRA_DISCOUNT_MIN_MARGIN } from './order-pricing.js';
+import { quoteOrder, SHIPPING_REAL_COST_CENTS, EXTRA_DISCOUNT_MIN_MARGIN, MAX_EXTRA_DISCOUNT_PERCENT } from './order-pricing.js';
 import { floorPrice } from './pricing.js';
 
 /** Margen neto del pedido: ingresos sin IVA − coste − comisión de pago − envío real. */
@@ -44,15 +44,15 @@ describe('quoteOrder: tope de descuentos extra', () => {
   });
 
   it('recorta tramo + cupón para no bajar del margen mínimo (envío gratis incluido)', async () => {
-    // 500 € con coste 320 €: el 15 % del tramo + 10 % de cupón darían pérdidas.
-    db.products = [{ id: 1, price: 50000, sale_price: 0, promo_price: null, stock: 5, cost: 32000 }];
+    // 500 € con coste 360 €: el 10 % (tramo + cupón, ya en el máximo) daría pérdidas.
+    db.products = [{ id: 1, price: 50000, sale_price: 0, promo_price: null, stock: 5, cost: 36000 }];
     db.coupon = { type: 'percent', value: 10, min_amount: 0 };
     const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'VUELVE10-X' });
     expect(q.shippingCents).toBe(0);
     expect(q.discountCapped).toBe(true);
-    const room = 50000 - floorPrice(32000, EXTRA_DISCOUNT_MIN_MARGIN);
+    const room = 50000 - floorPrice(36000, EXTRA_DISCOUNT_MIN_MARGIN);
     expect(q.discountCents).toBe(room - SHIPPING_REAL_COST_CENTS);
-    expect(netMargin(q, 32000)).toBeGreaterThan(0);
+    expect(netMargin(q, 36000)).toBeGreaterThan(0);
   });
 
   it('sin coste conocido no hay descuento extra', async () => {
@@ -76,5 +76,44 @@ describe('quoteOrder: tope de descuentos extra', () => {
     // 50 € con coste 35 € y envío cobrado (19,99 € < 25 € reales): casi no queda margen.
     expect(q.discountCents).toBeLessThan(3000);
     expect(q.discountCapped).toBe(true);
+  });
+});
+
+describe('quoteOrder: máximo del 10 % de descuento extra (margen para los asesores)', () => {
+  beforeEach(() => { db.products = []; db.coupon = null; });
+  const roomy = (price: number) => [{ id: 1, price, sale_price: 0, promo_price: null, stock: 5, cost: Math.round(price * 0.3) }];
+
+  it('el tramo más alto es el 10 % (ya no hay 15 % desde 500 €)', async () => {
+    db.products = roomy(80000);
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }] });
+    expect(q.discountPercent).toBe(10);
+    expect(q.discountCents).toBe(8000);
+    expect(q.nextTier).toBeNull();
+  });
+
+  it('tramo + cupón no pasan del 10 % y se avisa de cuánto suma el cupón', async () => {
+    db.products = roomy(20000); // 5 % por importe
+    db.coupon = { type: 'percent', value: 10, min_amount: 0 };
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'VUELVE10-X' });
+    expect(q.discountPercent).toBe(MAX_EXTRA_DISCOUNT_PERCENT);
+    expect(q.discountCents).toBe(2000);
+    expect(q.promo?.valid).toBe(true);
+    expect(q.promo?.note).toMatch(/suma un 5 %/);
+  });
+
+  it('con el 10 % por importe el cupón de porcentaje no suma nada', async () => {
+    db.products = roomy(40000);
+    db.coupon = { type: 'percent', value: 5, min_amount: 0 };
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'VUELVE5-X' });
+    expect(q.discountCents).toBe(4000);
+    expect(q.promo?.note).toMatch(/no suma más/);
+  });
+
+  it('sin tramo, un cupón del 10 % se aplica entero y sin aviso', async () => {
+    db.products = roomy(10000);
+    db.coupon = { type: 'percent', value: 10, min_amount: 0 };
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'VUELVE10-X' });
+    expect(q.discountCents).toBe(1000);
+    expect(q.promo?.note).toBeUndefined();
   });
 });
