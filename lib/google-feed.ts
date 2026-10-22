@@ -57,6 +57,27 @@ export function feedPrices(price: number, sale: number | null, promo: number | n
   return { price: list, salePrice: effective < list ? effective : null };
 }
 
+/**
+ * Categoría oficial de Google (taxonomy-with-ids.es-ES) según nuestra categoría principal. Ayuda a salir en más
+ * búsquedas y evita que confunda recambios con otras cosas (chiclés o segmentos de pistón con «piezas de armas»).
+ */
+const GOOGLE_CATEGORY: Record<string, number> = {
+  'Escapes': 908,                       // Tubos de escape para vehículos motorizados
+  'Frenos': 2977,                       // Frenos para vehículos motorizados
+  'Motor': 2820,                        // Piezas del motor de vehículos motorizados
+  'Chasis': 8227,                       // Piezas de bastidor y carrocería
+  'Plástica': 8227,
+  'Electricidad': 8231,                 // Sistemas eléctricos y de alimentación
+  'Neumáticos': 6091,                   // Neumáticos para motocicletas
+  'Cascos': 2110,                       // Cascos para motocicletas
+  'Equipamiento piloto': 5547,          // Equipo de protección para motocicletas
+  'Herramientas': 8236,                 // Herramientas específicas y de reparación para vehículos
+  'Lubricantes y limpiadores': 2788,    // Líquidos para vehículos
+};
+/** Piezas para vehículos motorizados: para lo que no encaja en ninguna de arriba. */
+export const DEFAULT_GOOGLE_CATEGORY = 899;
+export const googleCategoryFor = (rootCategory: string) => GOOGLE_CATEGORY[rootCategory.trim()] ?? DEFAULT_GOOGLE_CATEGORY;
+
 const eur = (cents: number) => `${(cents / 100).toFixed(2)} EUR`;
 const srcOf = (img: any): string => (typeof img === 'string' ? img : img?.src || img?.url || '');
 const absolute = (src: string) => (src.startsWith('/') ? `${SITE_URL}${src}` : src);
@@ -77,6 +98,7 @@ export function feedItem(r: FeedRow, categoryPath: (id: number | null) => string
   const { price, salePrice } = feedPrices(r.price, r.sale_price, r.promo_price);
   if (price <= 0) return { skip: 'sin_precio' };
   const title = String(r.name || '').replace(/\s+/g, ' ').trim().slice(0, 150);
+  if (!title) return { skip: 'sin_nombre' };
   const description = plainDescription(r.description) || title;
   const gtin = validGtin(r.barcode);
   const mpn = String(r.supplier_code || '').trim().slice(0, 70);
@@ -97,6 +119,7 @@ export function feedItem(r: FeedRow, categoryPath: (id: number | null) => string
     gtin ? `<g:gtin>${gtin}</g:gtin>` : '',
     mpn ? `<g:mpn>${xml(mpn)}</g:mpn>` : '',
     !gtin && !(brand && mpn) ? '<g:identifier_exists>no</g:identifier_exists>' : '',
+    `<g:google_product_category>${googleCategoryFor(type.split(' > ')[0] || '')}</g:google_product_category>`,
     type ? `<g:product_type>${xml(type)}</g:product_type>` : '',
     Number(r.weight_g) > 0 ? `<g:shipping_weight>${Number(r.weight_g)} g</g:shipping_weight>` : '',
   ].filter(Boolean);

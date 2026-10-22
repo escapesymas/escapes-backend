@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../db.js', () => ({ pool: { query: vi.fn(async () => ({ rows: [] })) } }));
 
-const { feedItem, feedPrices, validGtin, plainDescription } = await import('./google-feed.js');
+const { feedItem, feedPrices, validGtin, plainDescription, googleCategoryFor } = await import('./google-feed.js');
 
 const row = (over: Record<string, unknown> = {}) => ({
   id: 1, sku: '1076063006', name: 'Rueda trasera completa HAAN WHEELS 18x2.50x36T', brand: 'HAAN WHEELS',
@@ -11,6 +11,22 @@ const row = (over: Record<string, unknown> = {}) => ({
   barcode: '4006381333931', supplier_code: 'HAA00018A', weight_g: 4200, category_id: 7, ...over,
 });
 const cat = () => 'Neumáticos y llantas > Llantas';
+
+describe('categoría de Google', () => {
+  it('según la categoría principal; lo demás, piezas para vehículos motorizados', () => {
+    expect(googleCategoryFor('Escapes')).toBe(908);
+    expect(googleCategoryFor('Cascos')).toBe(2110);
+    expect(googleCategoryFor('Motor')).toBe(2820);
+    expect(googleCategoryFor('Equipamiento vehículo')).toBe(899);
+    expect(googleCategoryFor('')).toBe(899);
+    const x = (feedItem(row({ category_id: 1 }) as any, () => 'Motor > Pistones') as { xml: string }).xml;
+    expect(x).toContain('<g:google_product_category>2820</g:google_product_category>');
+  });
+
+  it('sin nombre no entra', () => {
+    expect(feedItem(row({ name: '  ' }) as any, cat)).toEqual({ skip: 'sin_nombre' });
+  });
+});
 
 describe('feed de Google Shopping', () => {
   it('genera el producto con precio, fotos, marca, EAN, referencia y categoría', () => {
