@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { taxInTotal } from './lib/tax.js';
 import express from 'express';
 import fs from 'fs';
+import zlib from 'zlib';
 import os from 'os';
 import { execSync, exec, spawn } from 'child_process';
 import util from 'util';
@@ -6226,6 +6227,50 @@ async function dailyDiscontinued() {
 
 setInterval(() => {
   dailyDiscontinued().catch((e) => console.error('[BIHR DESCATALOGADOS ERROR]:', e.message));
+}, 10 * 60_000);
+
+// ================================================================
+// FEED DE GOOGLE SHOPPING (lib/google-feed.ts)
+// ================================================================
+// Merchant Center lo descarga una vez al día. Se sirve comprimido si el cliente lo admite.
+const feedLimiter = rateLimit({ keyGenerator: clientKey, windowMs: 60 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+app.get(['/feeds/google.xml', '/feeds/google.xml.gz'], feedLimiter, async (req: any, res: any) => {
+  const { FEED_FILE } = await import('./lib/google-feed.js');
+  const stat = await fs.promises.stat(FEED_FILE).catch(() => null);
+  if (!stat) return res.status(503).type('text/plain').send('El feed se está generando; vuelve a intentarlo en unos minutos.');
+  res.setHeader('Last-Modified', stat.mtime.toUTCString());
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  if (req.path.endsWith('.gz')) {
+    res.type('application/gzip');
+    return fs.createReadStream(FEED_FILE).pipe(res);
+  }
+  res.type('application/xml; charset=utf-8');
+  if (/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) {
+    res.setHeader('Content-Encoding', 'gzip');
+    return fs.createReadStream(FEED_FILE).pipe(res);
+  }
+  return fs.createReadStream(FEED_FILE).pipe(zlib.createGunzip()).pipe(res);
+});
+
+/** Una vez al día, a partir de las 8:00 de Madrid (después de ocultar los descatalogados de las 7:00). */
+async function dailyGoogleFeed() {
+  const { buildGoogleFeed, FEED_FILE } = await import('./lib/google-feed.js');
+  const exists = fs.existsSync(FEED_FILE);
+  const madrid = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const get = (t: string) => madrid.find((x) => x.type === t)?.value || '';
+  if (exists && parseInt(get('hour')) < 8) return;
+  const today = `${get('year')}-${get('month')}-${get('day')}`;
+  const claim = await pool.query(
+    `INSERT INTO catalog_meta (key, value) VALUES ('google_feed_daily', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value WHERE catalog_meta.value <> EXCLUDED.value
+     RETURNING value`, [exists ? today : `${today}-inicial`]);
+  if (!claim.rows.length) return;
+  await buildGoogleFeed();
+}
+
+setTimeout(() => dailyGoogleFeed().catch((e) => console.error('[GOOGLE FEED ERROR]:', e.message)), 2 * 60_000);
+setInterval(() => {
+  dailyGoogleFeed().catch((e) => console.error('[GOOGLE FEED ERROR]:', e.message));
 }, 10 * 60_000);
 
 // ================================================================
