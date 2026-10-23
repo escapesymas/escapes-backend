@@ -92,3 +92,41 @@ bihrRouter.get('/admin/bihr/descatalogados', async (req: any, res: any) => {
   const { rows: [r] } = await pool.query(`SELECT count(*)::int AS n FROM products WHERE status = 'descatalogado'`);
   return res.json({ last: lastDiscontinuedSync(), hiddenNow: r?.n ?? 0 });
 });
+
+// GET /api/admin/catalog/descriptions — cómo van las descripciones del fabricante y su traducción
+// (lib/bihr-descriptions.ts y lib/description-translation.ts).
+bihrRouter.get('/admin/catalog/descriptions', async (req: any, res: any) => {
+  if (!(await requireAdminRole(req, res))) return;
+  try {
+    const [products, queue, recent, last] = await Promise.all([
+      pool.query(`
+        SELECT count(*)::int AS total,
+               count(*) FILTER (WHERE stock > 0)::int AS con_stock,
+               count(*) FILTER (WHERE description_source = 'bihr')::int AS del_fabricante,
+               count(*) FILTER (WHERE length(btrim(regexp_replace(coalesce(description, ''), '<[^>]*>', '', 'g'))) < 30)::int AS sin_descripcion,
+               count(*) FILTER (WHERE stock > 0 AND length(btrim(regexp_replace(coalesce(description, ''), '<[^>]*>', '', 'g'))) < 30)::int AS sin_descripcion_con_stock
+          FROM products WHERE status = 'published' AND duplicate_of IS NULL`),
+      pool.query(`
+        SELECT count(*)::int AS total,
+               count(*) FILTER (WHERE html_es IS NOT NULL)::int AS traducidas,
+               count(*) FILTER (WHERE html_es IS NULL AND attempts < 3)::int AS pendientes,
+               count(*) FILTER (WHERE html_es IS NULL AND attempts >= 3)::int AS fallidas,
+               coalesce(sum(cardinality(product_ids)) FILTER (WHERE html_es IS NOT NULL), 0)::int AS fichas_traducidas,
+               coalesce(sum(cardinality(product_ids)) FILTER (WHERE html_es IS NULL), 0)::int AS fichas_pendientes,
+               count(*) FILTER (WHERE translated_at > NOW() - INTERVAL '10 minutes')::int AS ultimos_10_min,
+               max(translated_at) AS ultima
+          FROM description_translations`),
+      pool.query(`
+        SELECT left(regexp_replace(source_html, '<[^>]*>', ' ', 'g'), 160) AS en,
+               left(regexp_replace(html_es, '<[^>]*>', ' ', 'g'), 200) AS es, translated_at
+          FROM description_translations WHERE html_es IS NOT NULL ORDER BY translated_at DESC LIMIT 3`),
+      pool.query(`SELECT value FROM catalog_meta WHERE key = 'bihr_descriptions_last'`),
+    ]);
+    let lastRun = null;
+    try { lastRun = JSON.parse(last.rows[0]?.value || 'null'); } catch { /* sin pasada */ }
+    if (lastRun) delete lastRun.samples;
+    return res.json({ products: products.rows[0], queue: queue.rows[0], recent: recent.rows, lastRun });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
