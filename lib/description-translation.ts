@@ -84,7 +84,17 @@ async function translateRows(rows: Row[]): Promise<number> {
   });
   let answer: Record<string, unknown> | null = null;
   let error = '';
-  try { answer = await ask(payload); if (!answer) error = 'respuesta sin JSON'; } catch (e: any) { error = e?.message || String(e); }
+  // Los fallos de la petición (límite de uso, corte) se reintentan aquí y no gastan los intentos de cada texto.
+  for (let attempt = 0; attempt < 3 && !answer; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, attempt * 5000));
+    try { answer = await ask(payload); if (!answer) error = 'respuesta sin JSON'; } catch (e: any) { error = e?.message || String(e); }
+  }
+  if (!answer) {
+    console.warn('[TRADUCCIÓN DESCRIPCIONES] petición fallida:', error);
+    await pool.query(`UPDATE description_translations SET attempts = greatest(attempts - 1, 0), claimed_at = NULL, error = $2 WHERE hash = ANY($1)`,
+      [rows.map((r) => r.hash), error]);
+    return 0;
+  }
   let done = 0;
   for (let i = 0; i < rows.length; i++) {
     const html = answer ? rebuild(rows[i].source_html, answer[`f${i}`]) : null;

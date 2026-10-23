@@ -44,6 +44,8 @@ describe('párrafo de la IA', () => {
   });
   it('rechaza palabras que se quedan en inglés y acepta el país de fabricación', () => {
     expect(supported(`${ok} Previsto para frequented off-road.`, facts)).toBe(false);
+    expect(supported(`${ok} El tooth count determina la relación.`, facts)).toBe(false);
+    expect(supported(`${ok} Indicado para,off-road.`, facts)).toBe(false);
     expect(supported(`${ok} Fabricado en Italia.`, facts)).toBe(true);
   });
   it('lee la respuesta aunque el modelo repita antes los datos', () => {

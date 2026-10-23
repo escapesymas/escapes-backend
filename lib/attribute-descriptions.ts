@@ -151,7 +151,7 @@ const CLAIMS = ['homolog', 'garant', 'certific', 'impermeab', 'original', 'oem\\
 const BANNED = /\b(mejor|mejores|excepcional|inigualable|perfect[oa]s?|líder|premium|número uno|máxima calidad|alta calidad|la más|el más|garantiza)\b/i;
 
 /** Palabras inglesas que se cuelan al copiar valores del catálogo (solo valen si están en los datos, p. ej. en un modelo). */
-const ENGLISH = /\b(the|and|with|for|from|of|supplied|spare|single|unit|frequented|black|white|front|rear|shocks?|endless)\b/gi;
+const ENGLISH = /\b(the|and|with|for|from|of|supplied|spare|single|unit|frequented|black|white|front|rear|shocks?|endless|tooth|teeth|count|size|pair|chain|brake|clutch|sprocket)\b/gi;
 
 const numbersOf = (s: string) => (s.match(/\d+(?:[.,]\d+)?/g) || []).map((n) => n.replace(',', '.').replace(/\.0+$/, ''));
 
@@ -161,6 +161,8 @@ export function supported(text: unknown, f: Facts): text is string {
   const t = text.trim();
   if (t.length < 60 || t.length > 700) return false;
   if (CJK_RE.test(t) || /bihr/i.test(t) || /[<>]/.test(t) || BANNED.test(t)) return false;
+  // Puntuación suelta que delata un texto roto («para,maxiscooter», «fijo,-homologado»).
+  if (/\b(para|de|del|con|en|y|a|el|la|los|las)\s*,|,-|,\S/i.test(t.replace(/\d,\d/g, ''))) return false;
   const source = JSON.stringify(f).toLowerCase();
   if ((t.match(ENGLISH) || []).some((w) => !new RegExp(`\\b${w}\\b`, 'i').test(JSON.stringify([f.nombre, f.marca])))) return false;
   const allowed = new Set(numbersOf(source));
@@ -291,7 +293,18 @@ export async function generateRows(rows: Row[], write = true): Promise<Array<{ i
   rows.forEach((r, i) => { payload[`f${i}`] = r.facts; });
   let answer: Record<string, unknown> | null = null;
   let error = '';
-  try { answer = await ask(payload); if (!answer) error = 'respuesta sin JSON'; } catch (e: any) { error = e?.message || String(e); }
+  // Los fallos de la petición (límite de uso, corte) se reintentan aquí y no gastan los intentos de cada ficha.
+  for (let attempt = 0; attempt < 3 && !answer; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, attempt * 5000));
+    try { answer = await ask(payload); if (!answer) error = 'respuesta sin JSON'; } catch (e: any) { error = e?.message || String(e); }
+  }
+  if (!answer && write) {
+    console.warn('[DESCRIPCIONES ATRIBUTOS] petición fallida:', error);
+    // No es culpa de las fichas: se devuelven a la cola sin gastar intento.
+    await pool.query(`UPDATE attribute_descriptions SET attempts = greatest(attempts - 1, 0), claimed_at = NULL, error = $2 WHERE product_id = ANY($1)`,
+      [rows.map((r) => r.product_id), error]);
+    return rows.map((r) => ({ id: r.product_id, html: null }));
+  }
   const out: Array<{ id: number; html: string | null }> = [];
   for (let i = 0; i < rows.length; i++) {
     const text = answer?.[`f${i}`];
