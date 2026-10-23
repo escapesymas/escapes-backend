@@ -178,7 +178,7 @@ export function supported(text: unknown, f: Facts, words?: Set<string>): text is
   if (typeof text !== 'string') return false;
   const t = text.trim();
   if (t.length < 60 || t.length > 700) return false;
-  if (CJK_RE.test(t) || /bihr/i.test(t) || /[<>]/.test(t) || BANNED.test(t)) return false;
+  if (CJK_RE.test(t) || /(?!\p{Script=Latin})\p{L}/u.test(t) || /bihr/i.test(t) || /[<>]/.test(t) || BANNED.test(t)) return false;
   // Puntuación suelta que delata un texto roto («para,maxiscooter», «fijo,-homologado»).
   if (/\b(para|de|del|con|en|y|a|el|la|los|las)\s*,|,-|,\S|\||\b(se|para|de|con|en|y)-/i.test(t.replace(/\d,\d/g, ''))) return false;
   const source = JSON.stringify(f).toLowerCase();
@@ -188,7 +188,9 @@ export function supported(text: unknown, f: Facts, words?: Set<string>): text is
   if (!CLAIMS.every((c) => !c.test(t) || c.test(source))) return false;
   if (words?.size) {
     const own = new Set(wordsOf(JSON.stringify(f)));
-    if (wordsOf(t).some((w) => !words.has(w) && !own.has(w))) return false;
+    // También en singular: «alomados» vale si los datos dicen «alomado».
+    const known = (w: string) => [w, w.replace(/es$/, ''), w.replace(/s$/, '')].some((x) => words.has(x) || own.has(x));
+    if (wordsOf(t).some((w) => !known(w))) return false;
   }
   return true;
 }
@@ -331,7 +333,9 @@ export async function generateRows(rows: Row[], write = true): Promise<Array<{ i
   const words = await spanishVocabulary().catch(() => undefined);
   const out: Array<{ id: number; html: string | null }> = [];
   for (let i = 0; i < rows.length; i++) {
-    const text = answer?.[`f${i}`];
+    // Una barra vertical nunca tiene sentido en el párrafo («para|maxiscooter»): se cambia por un espacio.
+    const raw = answer?.[`f${i}`];
+    const text = typeof raw === 'string' ? raw.replace(/\s*\|\s*/g, ' ') : raw;
     const html = supported(text, rows[i].facts, words) ? renderDescription(text, rows[i].facts) : null;
     out.push({ id: rows[i].product_id, html });
     if (!write) continue;

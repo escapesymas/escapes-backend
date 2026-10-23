@@ -53,6 +53,8 @@ describe('párrafo de la IA', () => {
     expect(supported('Kit de cadena AFAM 520XRR3 para off-road con piñón de 14 dientes y corona de 50 dientes de aluminio, con eslabón de clip.', facts, words)).toBe(true);
     expect(supported('Kit de cadena AFAM 520XRR3 para off-road con piñón de 14 dientes y corona de 50 dientes de aluminio. Vanymbaliados por pares.', facts, words)).toBe(false);
     expect(supported(`${ok} Indicado para|off-road.`, facts)).toBe(false);
+    expect(supported(`${ok} Принадлежит al kit.`, facts)).toBe(false);
+    expect(supported('Kit de cadena AFAM 520XRR3 para off-road con piñón de 14 dientes y corona de 50 dientes de aluminio, con eslabones de clip.', facts, words)).toBe(true);
   });
   it('lee la respuesta aunque el modelo repita antes los datos', () => {
     expect(answerObject('{"f0":{"nombre":"X"}}\n\n{"f0":"Párrafo {con llaves} y \\"comillas\\"."}')).toEqual({ f0: 'Párrafo {con llaves} y "comillas".' });
