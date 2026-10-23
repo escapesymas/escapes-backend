@@ -155,19 +155,42 @@ const ENGLISH = /\b(the|and|with|for|from|of|supplied|spare|single|unit|frequent
 
 const numbersOf = (s: string) => (s.match(/\d+(?:[.,]\d+)?/g) || []).map((n) => n.replace(',', '.').replace(/\.0+$/, ''));
 
-/** Comprueba que el párrafo solo diga lo que está en los datos. */
-export function supported(text: unknown, f: Facts): text is string {
+const wordsOf = (s: string) => s.toLowerCase().split(/[^a-záéíóúüñ]+/).filter((w) => w.length >= 4);
+
+/**
+ * Vocabulario español de referencia: palabras que salen en al menos 3 descripciones del fabricante ya en español.
+ * Sirve para cazar erratas e inglés suelto («wearables», «tooth count»). Se recalcula cada 6 horas.
+ */
+let vocab: { words: Set<string>; at: number } | null = null;
+export async function spanishVocabulary(): Promise<Set<string>> {
+  if (vocab && Date.now() - vocab.at < 6 * 3600_000) return vocab.words;
+  const { rows } = await pool.query<{ w: string }>(
+    `SELECT w FROM (SELECT DISTINCT id, w FROM products,
+            regexp_split_to_table(lower(regexp_replace(description, '<[^>]*>', ' ', 'g')), '[^a-záéíóúüñ]+') w
+      WHERE description_source = 'bihr' AND length(w) >= 4) x
+      GROUP BY w HAVING count(*) >= 3`);
+  vocab = { words: new Set(rows.map((r) => r.w)), at: Date.now() };
+  return vocab.words;
+}
+
+/** Comprueba que el párrafo solo diga lo que está en los datos (y, con `words`, que no traiga palabras raras). */
+export function supported(text: unknown, f: Facts, words?: Set<string>): text is string {
   if (typeof text !== 'string') return false;
   const t = text.trim();
   if (t.length < 60 || t.length > 700) return false;
   if (CJK_RE.test(t) || /bihr/i.test(t) || /[<>]/.test(t) || BANNED.test(t)) return false;
   // Puntuación suelta que delata un texto roto («para,maxiscooter», «fijo,-homologado»).
-  if (/\b(para|de|del|con|en|y|a|el|la|los|las)\s*,|,-|,\S/i.test(t.replace(/\d,\d/g, ''))) return false;
+  if (/\b(para|de|del|con|en|y|a|el|la|los|las)\s*,|,-|,\S|\||\b(se|para|de|con|en|y)-/i.test(t.replace(/\d,\d/g, ''))) return false;
   const source = JSON.stringify(f).toLowerCase();
   if ((t.match(ENGLISH) || []).some((w) => !new RegExp(`\\b${w}\\b`, 'i').test(JSON.stringify([f.nombre, f.marca])))) return false;
   const allowed = new Set(numbersOf(source));
   if (numbersOf(t).some((n) => !allowed.has(n))) return false;
-  return CLAIMS.every((c) => !c.test(t) || c.test(source));
+  if (!CLAIMS.every((c) => !c.test(t) || c.test(source))) return false;
+  if (words?.size) {
+    const own = new Set(wordsOf(JSON.stringify(f)));
+    if (wordsOf(t).some((w) => !words.has(w) && !own.has(w))) return false;
+  }
+  return true;
 }
 
 /** HTML final: párrafo de la IA + datos técnicos y piezas del kit, tal cual vienen. */
@@ -305,10 +328,11 @@ export async function generateRows(rows: Row[], write = true): Promise<Array<{ i
       [rows.map((r) => r.product_id), error]);
     return rows.map((r) => ({ id: r.product_id, html: null }));
   }
+  const words = await spanishVocabulary().catch(() => undefined);
   const out: Array<{ id: number; html: string | null }> = [];
   for (let i = 0; i < rows.length; i++) {
     const text = answer?.[`f${i}`];
-    const html = supported(text, rows[i].facts) ? renderDescription(text, rows[i].facts) : null;
+    const html = supported(text, rows[i].facts, words) ? renderDescription(text, rows[i].facts) : null;
     out.push({ id: rows[i].product_id, html });
     if (!write) continue;
     if (!html) {

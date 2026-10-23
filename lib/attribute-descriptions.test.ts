@@ -48,6 +48,12 @@ describe('párrafo de la IA', () => {
     expect(supported(`${ok} Indicado para,off-road.`, facts)).toBe(false);
     expect(supported(`${ok} Fabricado en Italia.`, facts)).toBe(true);
   });
+  it('con vocabulario, rechaza erratas y palabras sueltas en inglés; acepta las de los propios datos', () => {
+    const words = new Set(['corona', 'piñón', 'dientes', 'kit', 'cadena', 'para', 'aluminio', 'suministran', 'pares']);
+    expect(supported('Kit de cadena AFAM 520XRR3 para off-road con piñón de 14 dientes y corona de 50 dientes de aluminio, con eslabón de clip.', facts, words)).toBe(true);
+    expect(supported('Kit de cadena AFAM 520XRR3 para off-road con piñón de 14 dientes y corona de 50 dientes de aluminio. Vanymbaliados por pares.', facts, words)).toBe(false);
+    expect(supported(`${ok} Indicado para|off-road.`, facts)).toBe(false);
+  });
   it('lee la respuesta aunque el modelo repita antes los datos', () => {
     expect(answerObject('{"f0":{"nombre":"X"}}\n\n{"f0":"Párrafo {con llaves} y \\"comillas\\"."}')).toEqual({ f0: 'Párrafo {con llaves} y "comillas".' });
     expect(answerObject('sin json')).toBeNull();
