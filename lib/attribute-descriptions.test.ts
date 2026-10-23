@@ -7,7 +7,7 @@ vi.mock('../db.js', () => ({ pool: { query: vi.fn(async () => ({ rows: [] })) } 
 vi.mock('./cache.js', () => ({ cacheBust: vi.fn(async () => {}) }));
 vi.mock('../chatbot/minimax.js', () => ({ minimaxClient: {}, CHAT_MODEL: 'test' }));
 
-const { buildFacts, supported, renderDescription, readCatalogRecords, worthDescribing } = await import('./attribute-descriptions.js');
+const { buildFacts, supported, renderDescription, readCatalogRecords, worthDescribing, answerObject } = await import('./attribute-descriptions.js');
 
 const rec = {
   PartNumber: '3026777', Title: 'Kit de cadena AFAM 520XRR3 14/50 Reforzado - corona ultraligero', HtmlDescription: '', CountryOfOrigin: 'IT',
@@ -24,7 +24,7 @@ describe('datos del producto', () => {
     expect(facts.uso).toEqual(['off-road']);
     expect(facts.datos).toEqual([['Uso', 'Off-Road'], ['Eslabón de conexión', 'Clip'], ['Material de la corona', 'Aluminio']]);
     expect(facts.incluye).toEqual([[1, 'Cadena AFAM 520XRR3 118 eslabones']]);
-    expect(facts.origen).toBe('Italia');
+    expect(facts.origen).toBe('Fabricado en Italia');
     expect(worthDescribing(facts)).toBe(true);
     expect(worthDescribing(buildFacts({ name: 'Tornillo', brand: 'X', category: 'Frenos', attributes: {} }, undefined, titles))).toBe(false);
   });
@@ -41,6 +41,14 @@ describe('párrafo de la IA', () => {
     expect(supported(`${ok} Homologado para carretera.`, facts)).toBe(false);
     expect(supported(`${ok} La mejor opción del mercado.`, facts)).toBe(false);
     expect(supported(`${ok} Distribuido por Bihr.`, facts)).toBe(false);
+  });
+  it('rechaza palabras que se quedan en inglés y acepta el país de fabricación', () => {
+    expect(supported(`${ok} Previsto para frequented off-road.`, facts)).toBe(false);
+    expect(supported(`${ok} Fabricado en Italia.`, facts)).toBe(true);
+  });
+  it('lee la respuesta aunque el modelo repita antes los datos', () => {
+    expect(answerObject('{"f0":{"nombre":"X"}}\n\n{"f0":"Párrafo {con llaves} y \\"comillas\\"."}')).toEqual({ f0: 'Párrafo {con llaves} y "comillas".' });
+    expect(answerObject('sin json')).toBeNull();
   });
   it('no confunde palabras corrientes con afirmaciones («ofrece» no es «ECE»)', () => {
     expect(supported(`${ok} Ofrece un montaje sencillo.`, facts)).toBe(true);

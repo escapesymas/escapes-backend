@@ -132,7 +132,7 @@ export function buildFacts(p: { name: string; brand: string | null; category: st
   if (incluye.length) facts.incluye = incluye;
   if (nota && nota.length < MIN_DESCRIPTION_TEXT * 4 && !/bihr/i.test(nota)) facts.nota_fabricante = nota;
   const origen = countryName(String(rec?.CountryOfOrigin || ''));
-  if (origen) facts.origen = origen;
+  if (origen) facts.origen = `Fabricado en ${origen}`;
   return facts;
 }
 
@@ -150,6 +150,9 @@ const CLAIMS = ['homolog', 'garant', 'certific', 'impermeab', 'original', 'oem\\
 /** Nunca: publicidad que no se puede comprobar. */
 const BANNED = /\b(mejor|mejores|excepcional|inigualable|perfect[oa]s?|líder|premium|número uno|máxima calidad|alta calidad|la más|el más|garantiza)\b/i;
 
+/** Palabras inglesas que se cuelan al copiar valores del catálogo (solo valen si están en los datos, p. ej. en un modelo). */
+const ENGLISH = /\b(the|and|with|for|from|of|supplied|spare|single|unit|frequented|black|white|front|rear|shocks?|endless)\b/gi;
+
 const numbersOf = (s: string) => (s.match(/\d+(?:[.,]\d+)?/g) || []).map((n) => n.replace(',', '.').replace(/\.0+$/, ''));
 
 /** Comprueba que el párrafo solo diga lo que está en los datos. */
@@ -159,6 +162,7 @@ export function supported(text: unknown, f: Facts): text is string {
   if (t.length < 60 || t.length > 700) return false;
   if (CJK_RE.test(t) || /bihr/i.test(t) || /[<>]/.test(t) || BANNED.test(t)) return false;
   const source = JSON.stringify(f).toLowerCase();
+  if ((t.match(ENGLISH) || []).some((w) => !new RegExp(`\\b${w}\\b`, 'i').test(JSON.stringify([f.nombre, f.marca])))) return false;
   const allowed = new Set(numbersOf(source));
   if (numbersOf(t).some((n) => !allowed.has(n))) return false;
   return CLAIMS.every((c) => !c.test(t) || c.test(source));
@@ -198,7 +202,26 @@ async function ask(payload: Record<string, Facts>): Promise<Record<string, unkno
     reasoning_split: true,
   } as any);
   const text = String(r.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  try { return JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); } catch { return null; }
+  return answerObject(text);
+}
+
+/**
+ * El objeto de respuesta: a veces el modelo repite antes los datos que se le pasaron, así que se toma el último
+ * objeto JSON de primer nivel cuyos valores son todos textos.
+ */
+export function answerObject(text: string): Record<string, unknown> | null {
+  const found: Record<string, unknown>[] = [];
+  let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') { if (depth++ === 0) start = i; }
+    else if (ch === '}' && depth > 0 && --depth === 0) {
+      try { const o = JSON.parse(text.slice(start, i + 1)); if (o && typeof o === 'object' && !Array.isArray(o)) found.push(o); } catch { /* no es JSON */ }
+    }
+  }
+  return found.reverse().find((o) => Object.values(o).every((v) => typeof v === 'string')) || null;
 }
 
 /** Escribe en las fichas sin texto propio (o con uno de este proceso). */
