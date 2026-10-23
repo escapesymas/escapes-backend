@@ -5,11 +5,13 @@
  *   (description_source = 'bihr'), para recoger las mejoras del fabricante. Nunca pisa un texto escrito a mano.
  * - El HTML se limpia: solo etiquetas de texto sin atributos (fuera enlaces, imágenes y estilos), entidades
  *   pasadas a letras y sin frases que nombren al proveedor (regla de Adrián: no se da a conocer).
- * - Las que llegan en inglés se dejan fuera (se cuentan para traducirlas aparte).
+ * - Las que llegan en inglés se apuntan en description_translations; lib/description-translation.ts las traduce
+ *   poco a poco y aquí se usa la traducción en cuanto existe.
  *
  * Va con la descarga diaria del catálogo de descatalogados (lib/bihr-discontinued.ts). Mientras catalog_meta
  * 'bihr_descriptions' no valga 'on' solo calcula qué haría y guarda ejemplos, sin tocar productos.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import readline from 'readline';
 import { pool } from '../db.js';
@@ -117,10 +119,31 @@ export async function readDescriptions(file: string): Promise<Map<string, string
   return out;
 }
 
+/** Huella de una descripción limpia: clave de su traducción. */
+export const descriptionHash = (html: string) => crypto.createHash('sha1').update(html).digest('hex');
+
+/**
+ * Guarda descripciones del proveedor. Se vuelve a comprobar en la propia consulta que no haya un texto escrito
+ * a mano (por si alguien lo ha escrito mientras tanto).
+ */
+export async function writeDescriptions(updates: Array<{ id: number; html: string }>): Promise<void> {
+  if (!updates.length) return;
+  for (let i = 0; i < updates.length; i += BATCH) {
+    const part = updates.slice(i, i + BATCH);
+    await pool.query(
+      `UPDATE products p SET description = u.html, description_source = 'bihr', updated_at = NOW()
+         FROM unnest($1::int[], $2::text[]) AS u(id, html)
+        WHERE p.id = u.id AND p.description IS DISTINCT FROM u.html AND (p.description_source = 'bihr'
+           OR length(btrim(regexp_replace(coalesce(p.description, ''), '<[^>]*>', '', 'g'))) < $3)`,
+      [part.map((u) => u.id), part.map((u) => u.html), MIN_DESCRIPTION_TEXT]);
+  }
+  await Promise.all([cacheBust('cache:products'), cacheBust('cache:suggest')]).catch(() => {});
+}
+
 export interface DescriptionsResult {
   startedAt: string; finishedAt?: string; status: 'running' | 'done' | 'error'; applied: boolean;
   catalogDescriptions?: number; candidates?: number; filled?: number; refreshed?: number;
-  english?: number; tooShort?: number; samples?: Array<{ sku: string; text: string }>; error?: string;
+  english?: number; translated?: number; tooShort?: number; samples?: Array<{ sku: string; text: string }>; error?: string;
 }
 
 /** Rellena las descripciones con el catálogo ya descargado (`file`). Sin 'on' en catalog_meta, solo simula. */
@@ -136,8 +159,12 @@ export async function fillDescriptions(file: string): Promise<DescriptionsResult
     const { rows } = await pool.query<{ id: number; sku: string; part_number: string | null; description: string | null; description_source: string | null; stock: number }>(
       `SELECT id, sku, part_number, description, description_source, stock FROM products
         WHERE status IN ('published', 'descatalogado') AND duplicate_of IS NULL`);
+    const { rows: tr } = await pool.query<{ hash: string; html_es: string }>(
+      `SELECT hash, html_es FROM description_translations WHERE html_es IS NOT NULL`);
+    const translations = new Map(tr.map((t) => [t.hash, t.html_es]));
+    const pending = new Map<string, { html: string; ids: number[]; inStock: boolean }>();
     const updates: Array<{ id: number; html: string; refresh: boolean }> = [];
-    let english = 0, tooShort = 0, candidates = 0;
+    let english = 0, translated = 0, tooShort = 0, candidates = 0;
     const samples: Array<{ sku: string; text: string }> = [];
     for (const r of rows) {
       const ours = r.description_source === 'bihr';
@@ -145,28 +172,39 @@ export async function fillDescriptions(file: string): Promise<DescriptionsResult
       const raw = [r.sku, r.part_number].map((c) => String(c || '').trim().toLowerCase()).map((c) => catalog.get(c)).find(Boolean);
       if (!raw) continue;
       candidates++;
-      const html = cleanDescription(raw);
+      let html = cleanDescription(raw);
       const plain = textOf(html);
       if (plain.length < MIN_DESCRIPTION_TEXT) { tooShort++; continue; }
-      if (looksEnglish(plain)) { english++; continue; }
+      if (looksEnglish(plain)) {
+        const hash = descriptionHash(html);
+        const es = translations.get(hash);
+        if (!es) {
+          english++;
+          const p = pending.get(hash) || { html, ids: [], inStock: false };
+          p.ids.push(r.id); p.inStock ||= r.stock > 0;
+          pending.set(hash, p);
+          continue;
+        }
+        html = es; translated++;
+      }
       if (html === r.description) continue;
       updates.push({ id: r.id, html, refresh: ours });
       if (samples.length < 8 && r.stock > 0 && Math.random() < 0.01) samples.push({ sku: r.sku, text: plain.slice(0, 400) });
     }
-    Object.assign(result, { candidates, english, tooShort, samples, filled: updates.filter((u) => !u.refresh).length, refreshed: updates.filter((u) => u.refresh).length });
+    Object.assign(result, { candidates, english, translated, tooShort, samples, filled: updates.filter((u) => !u.refresh).length, refreshed: updates.filter((u) => u.refresh).length });
 
-    if (result.applied && updates.length) {
-      for (let i = 0; i < updates.length; i += BATCH) {
-        const part = updates.slice(i, i + BATCH);
-        // Se vuelve a comprobar en la propia consulta por si alguien la ha escrito a mano mientras tanto.
+    if (result.applied) {
+      await writeDescriptions(updates);
+      // Las de inglés sin traducir quedan en cola con los productos que las usan (se actualiza la lista).
+      const queue = [...pending.entries()];
+      for (let i = 0; i < queue.length; i += BATCH) {
+        const part = queue.slice(i, i + BATCH);
         await pool.query(
-          `UPDATE products p SET description = u.html, description_source = 'bihr', updated_at = NOW()
-             FROM unnest($1::int[], $2::text[]) AS u(id, html)
-            WHERE p.id = u.id AND (p.description_source = 'bihr'
-               OR length(btrim(regexp_replace(coalesce(p.description, ''), '<[^>]*>', '', 'g'))) < $3)`,
-          [part.map((u) => u.id), part.map((u) => u.html), MIN_DESCRIPTION_TEXT]);
+          `INSERT INTO description_translations (hash, source_html, product_ids, in_stock)
+           SELECT h, src, string_to_array(ids, ',')::int[], st FROM unnest($1::text[], $2::text[], $3::text[], $4::bool[]) AS q(h, src, ids, st)
+           ON CONFLICT (hash) DO UPDATE SET product_ids = EXCLUDED.product_ids, in_stock = EXCLUDED.in_stock`,
+          [part.map(([h]) => h), part.map(([, v]) => v.html), part.map(([, v]) => v.ids.join(',')), part.map(([, v]) => v.inStock)]);
       }
-      await Promise.all([cacheBust('cache:products'), cacheBust('cache:suggest')]).catch(() => {});
     }
     result.status = 'done';
   } catch (err: any) {

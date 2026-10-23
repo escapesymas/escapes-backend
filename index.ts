@@ -6233,6 +6233,13 @@ setInterval(() => {
   dailyDiscontinued().catch((e) => console.error('[BIHR DESCATALOGADOS ERROR]:', e.message));
 }, 10 * 60_000);
 
+// Descripciones del proveedor en inglés: se traducen poco a poco (lib/description-translation.ts).
+setInterval(() => {
+  import('./lib/description-translation.js')
+    .then((m) => m.translatePendingDescriptions(90))
+    .catch((e) => console.error('[TRADUCCIÓN DESCRIPCIONES ERROR]:', e.message));
+}, 3 * 60_000);
+
 // ================================================================
 // FEED DE GOOGLE SHOPPING (lib/google-feed.ts)
 // ================================================================
