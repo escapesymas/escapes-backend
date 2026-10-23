@@ -71,3 +71,19 @@ describe('feed de Google Shopping', () => {
     expect(plainDescription('<b>Funda</b> impermeable. Distribuido por Bihr. Talla&nbsp;L.')).toBe('Funda impermeable. Talla L.');
   });
 });
+
+describe('compatibilidad en la descripción del feed', () => {
+  it('nombra las motos principales y cuántas más hay', async () => {
+    const { compatSentence } = await import('./google-feed.js');
+    expect(compatSentence(['KTM 300 EXC (1997-2003)', 'HUSQVARNA FC 350 (2019)'], 14)).toBe('Compatible con KTM 300 EXC (1997-2003), HUSQVARNA FC 350 (2019) y 12 modelos más.');
+    expect(compatSentence(['KTM 250 SX (1994)'], 1)).toBe('Compatible con KTM 250 SX (1994).');
+    expect(compatSentence([], 0)).toBe('');
+  });
+
+  it('la añade al final sin pasarse del máximo', () => {
+    const it = feedItem(row({ description: `<p>${'Texto largo. '.repeat(200)}</p>`, compat_top: ['KTM 300 EXC (1997-2003)'], compat_models: 3 }), cat);
+    const desc = ('xml' in it ? it.xml : '').match(/<description>(.*)<\/description>/)![1];
+    expect(desc.length).toBeLessThanOrEqual(1500);
+    expect(desc.endsWith('Compatible con KTM 300 EXC (1997-2003) y 2 modelos más.')).toBe(true);
+  });
+});

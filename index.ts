@@ -6233,11 +6233,15 @@ setInterval(() => {
   dailyDiscontinued().catch((e) => console.error('[BIHR DESCATALOGADOS ERROR]:', e.message));
 }, 10 * 60_000);
 
-// Descripciones del proveedor en inglés: se traducen poco a poco (lib/description-translation.ts).
-setInterval(() => {
-  import('./lib/description-translation.js')
+// Descripciones del proveedor en inglés: se traducen poco a poco (lib/description-translation.ts); después,
+// las de las fichas que el fabricante no describe se montan con sus datos (lib/attribute-descriptions.ts).
+setInterval(async () => {
+  await import('./lib/description-translation.js')
     .then((m) => m.translatePendingDescriptions(90))
     .catch((e) => console.error('[TRADUCCIÓN DESCRIPCIONES ERROR]:', e.message));
+  await import('./lib/attribute-descriptions.js')
+    .then((m) => m.generatePendingDescriptions(96))
+    .catch((e) => console.error('[DESCRIPCIONES ATRIBUTOS ERROR]:', e.message));
 }, 3 * 60_000);
 
 // ================================================================

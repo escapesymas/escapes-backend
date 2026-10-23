@@ -133,7 +133,7 @@ export async function writeDescriptions(updates: Array<{ id: number; html: strin
     await pool.query(
       `UPDATE products p SET description = u.html, description_source = 'bihr', updated_at = NOW()
          FROM unnest($1::int[], $2::text[]) AS u(id, html)
-        WHERE p.id = u.id AND p.description IS DISTINCT FROM u.html AND (p.description_source = 'bihr'
+        WHERE p.id = u.id AND p.description IS DISTINCT FROM u.html AND (p.description_source IN ('bihr', 'atributos')
            OR length(btrim(regexp_replace(coalesce(p.description, ''), '<[^>]*>', '', 'g'))) < $3)`,
       [part.map((u) => u.id), part.map((u) => u.html), MIN_DESCRIPTION_TEXT]);
   }
@@ -168,7 +168,8 @@ export async function fillDescriptions(file: string): Promise<DescriptionsResult
     const samples: Array<{ sku: string; text: string }> = [];
     for (const r of rows) {
       const ours = r.description_source === 'bihr';
-      if (!ours && textOf(r.description || '').length >= MIN_DESCRIPTION_TEXT) continue;
+      // Las montadas con los atributos (lib/attribute-descriptions.ts) ceden ante la del fabricante.
+      if (!ours && r.description_source !== 'atributos' && textOf(r.description || '').length >= MIN_DESCRIPTION_TEXT) continue;
       const raw = [r.sku, r.part_number].map((c) => String(c || '').trim().toLowerCase()).map((c) => catalog.get(c)).find(Boolean);
       if (!raw) continue;
       candidates++;

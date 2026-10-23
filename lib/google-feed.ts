@@ -86,6 +86,19 @@ export interface FeedRow {
   id: number; sku: string; name: string; brand: string | null; description: string | null;
   price: number; sale_price: number | null; promo_price: number | null; stock: number;
   images: unknown; barcode: string | null; supplier_code: string | null; weight_g: number | null; category_id: number | null;
+  /** Motos compatibles con más versiones («KTM 300 EXC (1997-2003)»), y cuántos modelos hay en total. */
+  compat_top?: string[] | null; compat_models?: number | null;
+}
+
+/**
+ * Frase de compatibilidad para la descripción del feed: Google Shopping busca en título y descripción, y así sale
+ * en búsquedas con el modelo («kit cadena ktm 300 exc»). En la web no hace falta: la ficha ya trae la lista.
+ */
+export function compatSentence(top: string[] | null | undefined, models: number | null | undefined): string {
+  const list = (top || []).filter(Boolean);
+  if (!list.length) return '';
+  const more = Math.max(0, (Number(models) || 0) - list.length);
+  return `Compatible con ${list.join(', ')}${more ? ` y ${more} ${more === 1 ? 'modelo' : 'modelos'} más` : ''}.`;
 }
 
 /** Un <item> del feed, o el motivo para dejarlo fuera. */
@@ -99,7 +112,9 @@ export function feedItem(r: FeedRow, categoryPath: (id: number | null) => string
   if (price <= 0) return { skip: 'sin_precio' };
   const title = String(r.name || '').replace(/\s+/g, ' ').trim().slice(0, 150);
   if (!title) return { skip: 'sin_nombre' };
-  const description = plainDescription(r.description) || title;
+  const compat = compatSentence(r.compat_top, r.compat_models);
+  const base = plainDescription(r.description) || title;
+  const description = compat ? `${base.slice(0, MAX_DESCRIPTION - compat.length - 1).trim()} ${compat}` : base;
   const gtin = validGtin(r.barcode);
   const mpn = String(r.supplier_code || '').trim().slice(0, 70);
   const brand = String(r.brand || '').trim();
@@ -145,8 +160,20 @@ async function* feedChunks(stats: { items: number; skipped: Record<string, numbe
   let lastId = 0;
   for (;;) {
     const { rows } = await pool.query<FeedRow>(
-      `SELECT id, sku, name, brand, description, price, sale_price, promo_price, stock, images, barcode, supplier_code, weight_g, category_id
-         FROM products
+      `SELECT id, sku, name, brand, description, price, sale_price, promo_price, stock, images, barcode, supplier_code, weight_g, category_id,
+              (SELECT array_agg(label ORDER BY n DESC, label) FROM (
+                 SELECT concat_ws(' ', e->>'brand', e->>'model')
+                        || CASE WHEN min(y) IS NULL THEN ''
+                                WHEN min(y) = max(y) THEN ' (' || min(y) || ')'
+                                ELSE ' (' || min(y) || '-' || max(y) || ')' END AS label,
+                        count(*) AS n
+                   FROM jsonb_array_elements(compat) e,
+                        LATERAL (SELECT CASE WHEN e->>'year' ~ '^[0-9]{4}$' THEN (e->>'year')::int END AS y) yy
+                  WHERE coalesce(e->>'model', '') <> ''
+                  GROUP BY e->>'brand', e->>'model' ORDER BY n DESC, 1 LIMIT 4) t) AS compat_top,
+              (SELECT count(DISTINCT (e->>'brand', e->>'model'))::int FROM jsonb_array_elements(compat) e WHERE coalesce(e->>'model', '') <> '') AS compat_models
+         FROM products,
+              LATERAL (SELECT CASE WHEN jsonb_typeof(compatibility) = 'array' THEN compatibility ELSE '[]'::jsonb END AS compat) c
         WHERE id > $1 AND status = 'published' AND price > 0 AND duplicate_of IS NULL AND stock > 0
         ORDER BY id LIMIT $2`, [lastId, BATCH]);
     if (!rows.length) break;

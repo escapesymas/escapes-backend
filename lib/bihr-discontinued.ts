@@ -198,6 +198,9 @@ async function doSync(): Promise<DiscontinuedResult> {
     Object.assign(result, { status: 'done', hidden: hide.length, restored: restore.length, keptWithStock });
     // Con el catálogo ya descargado se aprovecha para rellenar descripciones (no falla: guarda su propio resultado).
     await (await import('./bihr-descriptions.js')).fillDescriptions(productsFile);
+    // Lo que sigue sin texto se apunta para describirlo con sus datos (lib/attribute-descriptions.ts).
+    await (await import('./attribute-descriptions.js')).queueAttributeDescriptions(productsFile)
+      .catch((e) => console.error('[DESCRIPCIONES ATRIBUTOS ERROR]:', e.message));
   } catch (err: any) {
     Object.assign(result, { status: 'error', error: err?.message || String(err) });
   } finally {
