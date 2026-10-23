@@ -93,12 +93,12 @@ bihrRouter.get('/admin/bihr/descatalogados', async (req: any, res: any) => {
   return res.json({ last: lastDiscontinuedSync(), hiddenNow: r?.n ?? 0 });
 });
 
-// GET /api/admin/catalog/descriptions — cómo van las descripciones del fabricante y su traducción
-// (lib/bihr-descriptions.ts y lib/description-translation.ts).
+// GET /api/admin/catalog/descriptions — cómo van las descripciones del fabricante, su traducción y las montadas
+// con los datos del producto (lib/bihr-descriptions.ts, lib/description-translation.ts, lib/attribute-descriptions.ts).
 bihrRouter.get('/admin/catalog/descriptions', async (req: any, res: any) => {
   if (!(await requireAdminRole(req, res))) return;
   try {
-    const [products, queue, recent, last] = await Promise.all([
+    const [products, queue, recent, last, generated, generatedRecent] = await Promise.all([
       pool.query(`
         SELECT count(*)::int AS total,
                count(*) FILTER (WHERE stock > 0)::int AS con_stock,
@@ -121,11 +121,25 @@ bihrRouter.get('/admin/catalog/descriptions', async (req: any, res: any) => {
                left(regexp_replace(html_es, '<[^>]*>', ' ', 'g'), 200) AS es, translated_at
           FROM description_translations WHERE html_es IS NOT NULL ORDER BY translated_at DESC LIMIT 3`),
       pool.query(`SELECT value FROM catalog_meta WHERE key = 'bihr_descriptions_last'`),
+      pool.query(`
+        SELECT count(*)::int AS total,
+               count(*) FILTER (WHERE html IS NOT NULL)::int AS hechas,
+               count(*) FILTER (WHERE html IS NULL AND attempts < 3)::int AS pendientes,
+               count(*) FILTER (WHERE html IS NULL AND attempts >= 3)::int AS descartadas,
+               count(*) FILTER (WHERE html IS NULL AND attempts < 3 AND in_stock)::int AS pendientes_con_stock,
+               count(*) FILTER (WHERE generated_at > NOW() - INTERVAL '10 minutes')::int AS ultimos_10_min,
+               max(generated_at) AS ultima
+          FROM attribute_descriptions`),
+      pool.query(`
+        SELECT p.name, left(regexp_replace(a.html, '<[^>]*>', ' ', 'g'), 220) AS texto, a.generated_at
+          FROM attribute_descriptions a JOIN products p ON p.id = a.product_id
+         WHERE a.html IS NOT NULL ORDER BY a.generated_at DESC LIMIT 3`),
     ]);
     let lastRun = null;
     try { lastRun = JSON.parse(last.rows[0]?.value || 'null'); } catch { /* sin pasada */ }
     if (lastRun) delete lastRun.samples;
-    return res.json({ products: products.rows[0], queue: queue.rows[0], recent: recent.rows, lastRun });
+    return res.json({ products: products.rows[0], queue: queue.rows[0], recent: recent.rows, lastRun,
+      generated: generated.rows[0], generatedRecent: generatedRecent.rows });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
