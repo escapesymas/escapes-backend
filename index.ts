@@ -4842,6 +4842,8 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           sql`stock_status = ${stockStatus}`,
           sql`low_stock_threshold = ${lowStockThreshold}`,
           sql`description = ${desc}`,
+          // Si se cambia a mano deja de ser la del proveedor (lib/bihr-descriptions.ts ya no la toca).
+          sql`description_source = CASE WHEN description IS DISTINCT FROM ${desc} THEN NULL ELSE description_source END`,
           sql`compatibility = ${compat}`,
           sql`status = ${status}`,
           sql`brand = ${brand}`,

@@ -7,7 +7,8 @@
  * - Vuelven a 'published' si Bihr los reactiva o les entra stock (Bihr avisa de que puede pasar).
  * - Solo toca productos 'published' o 'descatalogado': los borradores, archivados o duplicados no.
  *
- * Se ejecuta tras cada sincronización del catálogo de Bihr y una vez al día. Los catálogos v3 se generan al
+ * Se ejecuta tras cada sincronización del catálogo de Bihr y una vez al día; de paso rellena descripciones
+ * (lib/bihr-descriptions.ts). Los catálogos v3 se generan al
  * momento y pesan poco (~40 MB y ~13 MB comprimidos); se leen por trozos para no cargar el JSON entero.
  */
 import fs from 'fs';
@@ -195,6 +196,8 @@ async function doSync(): Promise<DiscontinuedResult> {
       await Promise.all([cacheBust('cache:products'), cacheBust('compat:prod'), cacheBust('cache:suggest')]).catch(() => {});
     }
     Object.assign(result, { status: 'done', hidden: hide.length, restored: restore.length, keptWithStock });
+    // Con el catálogo ya descargado se aprovecha para rellenar descripciones (no falla: guarda su propio resultado).
+    await (await import('./bihr-descriptions.js')).fillDescriptions(productsFile);
   } catch (err: any) {
     Object.assign(result, { status: 'error', error: err?.message || String(err) });
   } finally {
