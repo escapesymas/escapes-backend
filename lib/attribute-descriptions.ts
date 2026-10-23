@@ -175,7 +175,7 @@ export function renderDescription(paragraph: string, f: Facts): string {
 
 const SYSTEM = `Eres redactor de fichas de producto de una tienda española de recambios y equipamiento de moto.
 Te paso un objeto JSON: cada clave es una ficha con TODO lo que se sabe del producto.
-Para cada ficha escribe UN párrafo de 2 a 4 frases (entre 150 y 450 caracteres) en español de España, tuteando, que:
+Para cada ficha escribe UN párrafo de 1 a 4 frases (como mucho 450 caracteres) en español de España, tuteando, que:
 - diga qué es y para qué sirve, a partir del nombre y la categoría;
 - destaque los datos que deciden la compra de ese tipo de pieza (medida, paso, dientes, material, talla, posición, uso, piezas del kit…);
 - explique lo que significa un dato si ayuda (p. ej. «14/50» en un kit de cadena = piñón de 14 dientes y corona de 50).
@@ -183,12 +183,17 @@ Reglas estrictas:
 - Usa SOLO los datos que te paso. No inventes características, materiales, homologaciones, garantías, cifras ni compatibilidades.
 - Nada de publicidad vacía («la mejor», «alta calidad», «excepcional», «premium»…).
 - No menciones a ningún distribuidor ni proveedor; la tienda es Escapes y Más (no hace falta nombrarla).
+- Si hay pocos datos, escribe menos: una o dos frases bastan. Nada de frases de relleno («identificado por su
+  referencia», «ten en cuenta la referencia», «componente de reposición») ni de decir lo que NO incluye si no es un dato.
+- Todo en español: traduce los valores que vengan en inglés («Twin Shocks» → doble amortiguador, «endless» → sin
+  eslabón de cierre). Deja en su idioma marcas, modelos y referencias.
+- Revisa la ortografía: palabras españolas correctas, sin erratas.
 - Sin HTML ni listas: solo el párrafo.
 Responde SOLO con un objeto JSON con las mismas claves y el párrafo como valor.`;
 
 async function ask(payload: Record<string, Facts>): Promise<Record<string, unknown> | null> {
   const r: any = await minimaxClient.chat.completions.create({
-    model: CHAT_MODEL, temperature: 0.3, max_tokens: 12000,
+    model: CHAT_MODEL, temperature: 0.2, max_tokens: 12000,
     messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(payload) }],
     reasoning_split: true,
   } as any);
