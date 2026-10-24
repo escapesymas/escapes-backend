@@ -271,7 +271,10 @@ export async function chatHandler(req: Request, res: Response) {
         reasoning_split: true,
       } as any);
       finishReason = r.choices?.[0]?.finish_reason || null;
-      const content = String(r.choices?.[0]?.message?.content || '');
+      let content = String(r.choices?.[0]?.message?.content || '');
+      // A veces se cuela el razonamiento delante con su etiqueta de cierre («…</mm:think>»): vale lo de después.
+      const close = [...content.matchAll(/<\/\s*(mm:)?think(ing)?\s*>/gi)].pop();
+      if (close) content = content.slice(close.index! + close[0].length);
       raw = /think/i.test(content) ? stripThinking(content) : content;
       if (raw.trim() && !CJK_ANY_RE.test(raw) && finishReason !== 'length') break;
       console.warn(`[chatbot] respuesta descartada (${!raw.trim() ? 'vacía' : CJK_ANY_RE.test(raw) ? 'con chino' : 'cortada'}), intento ${attempt + 1}`);
