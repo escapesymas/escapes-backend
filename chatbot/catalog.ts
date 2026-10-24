@@ -562,7 +562,8 @@ export async function getCatalogContext(
   if (positions.length) {
     const p = positions.join(' y ');
     notes.push(`Pide la posición «${p}». Los nombres no suelen indicarla: si un producto lleva «posición:», esa es la suya; ` +
-      `el resto son compatibles con su moto, pero no afirmes su posición si no la dice el nombre: di que la ficha la confirma. ` +
+      `del resto NO sabemos la posición: di que son compatibles con su moto y añade «la posición la puedes comprobar en la ficha»; ` +
+      `nunca digas que son ${p} ni que la ficha lo confirma. ` +
       `No digas que no tenemos «${p}» si hay productos compatibles.`);
   }
   if (shown.some((x) => !x.tag) && moto) {
