@@ -15,8 +15,9 @@ export const minimaxClient = new OpenAI({
 export const CHAT_MODEL = 'MiniMax-M3.1-Flash';
 
 export const CHAT_LIMITS = {
-  // Incluye el razonamiento del modelo: con 400 algunas respuestas salían cortadas; M3.1-Flash razona más.
-  maxTokens: 1500,
+  // Incluye el razonamiento del modelo: M3.1-Flash a veces razona más de 1.500 tokens y la respuesta salía
+  // vacía o sin la marca de productos (sin tarjetas).
+  maxTokens: 4000,
   temperature: 0.4,
   topP: 0.9,
   historyMaxMessages: 20,

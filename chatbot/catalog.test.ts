@@ -36,6 +36,7 @@ describe('tarjetas del chat', () => {
   it('solo las de los productos que elige el asistente, en su orden', () => {
     expect(cardsFor(hits, ' P3, P1').map((c) => c.sku)).toEqual(['S3', 'S1']);
     expect(cardsFor(hits, 'P2, P2, P9').map((c) => c.sku)).toEqual(['S2']);
+    expect(cardsFor(hits, ' 3, 1').map((c) => c.sku)).toEqual(['S3', 'S1']);
   });
 
   it('ninguna si no elige o no pone la marca', () => {

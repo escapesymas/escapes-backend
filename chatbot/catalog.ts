@@ -472,14 +472,19 @@ export async function getCatalogContext(
 
   // Moto nombrada en la consulta (solo si se reconoce la marca: «talla 58» no es una moto).
   const parsed = extractMotorcycleFromQuery(query);
-  const queryMoto = parsed?.brand ? parsed : null;
+  const garageMotos = garageEntries.map(parseGarageMotorcycle).filter((m): m is GarageMotorcycle => !!m && !!m.brand);
+  let queryMoto = parsed?.brand ? parsed : null;
+  // «¿Y para mi PCX?»: modelo sin marca que coincide con una moto del garaje → esa moto (con su año).
+  if (!queryMoto && parsed?.model) {
+    const re = modelPattern(parsed.model);
+    const own = re ? garageMotos.find((m) => re.test(m.model)) : undefined;
+    if (own) queryMoto = { ...own, year: parsed.year ?? own.year };
+  }
   // El año de la moto no está en el texto de búsqueda (se filtra después con la
   // compatibilidad): «pastillas mt-07 2019» buscaría «2019» y no daría nada.
   if (queryMoto?.year) base = base.replace(new RegExp(`\\b${queryMoto.year}\\b`, 'g'), ' ').replace(/\s+/g, ' ').trim();
   // Si nombra un modelo aunque no diga la marca («pcx 125»), no se usa el garaje.
-  const garageMoto = !queryMoto && !parsed?.model
-    ? garageEntries.map(parseGarageMotorcycle).find((m): m is GarageMotorcycle => !!m && !!m.brand) || null
-    : null;
+  const garageMoto = !queryMoto && !parsed?.model ? garageMotos[0] || null : null;
 
   // Sin moto en la consulta, primero se prueba con la del garaje («pastillas de
   // freno» → las de su MT-07) y si no hay nada, sin moto (un casco no depende de ella).
@@ -492,7 +497,7 @@ export async function getCatalogContext(
   if (garageMoto) {
     withSpaced(`${base} ${productSearchText(`${garageMoto.brand} ${garageMoto.model}`)}`, garageMoto.model, garageMoto);
   }
-  withSpaced(base, parsed?.model, queryMoto);
+  withSpaced(base, queryMoto?.model || parsed?.model, queryMoto);
 
   // Con moto se piden más modelos: después se quitan los que no le valen por año.
   const run = async (search: string, m: GarageMotorcycle | null) => {
@@ -543,6 +548,15 @@ export async function getCatalogContext(
   }).slice(0, 6);
 
   const notes: string[] = [];
+  // Se conocía su moto pero lo encontrado no se ha filtrado por ella (no hay nada con compatibilidad registrada).
+  const knownMoto = queryMoto || garageMoto;
+  if (knownMoto && !moto) {
+    const name = `${knownMoto.brand} ${knownMoto.model}${knownMoto.year ? ` (${knownMoto.year})` : ''}`;
+    notes.push(`NINGÚN PRODUCTO TIENE COMPATIBILIDAD REGISTRADA CON SU ${name}: los de abajo NO están comprobados con su moto. ` +
+      `Nunca digas que son compatibles. Si la pieza depende de la moto (frenos, filtros, transmisión, motor…), dile que no tenemos ` +
+      `datos de compatibilidad para su ${name}, no elijas ninguno y pídele la referencia original o las medidas; si no depende ` +
+      `(casco, ropa, accesorios universales), ofrécelos.`);
+  }
   if (missing) {
     notes.push(`Ningún producto lleva «${missing}» en su nombre: estos son los más parecidos. Ofrécelos aclarando que «${missing}» no figura ` +
       `en su descripción (si es una marca, que ahora mismo no la tenemos; si es una posición o variante, que lo compruebe en la ficha).`);
@@ -561,10 +575,8 @@ export async function getCatalogContext(
   }
   if (positions.length) {
     const p = positions.join(' y ');
-    notes.push(`Pide la posición «${p}». Los nombres no suelen indicarla: si un producto lleva «posición:», esa es la suya; ` +
-      `del resto NO sabemos la posición: di que son compatibles con su moto y añade «la posición la puedes comprobar en la ficha»; ` +
-      `nunca digas que son ${p} ni que la ficha lo confirma. ` +
-      `No digas que no tenemos «${p}» si hay productos compatibles.`);
+    notes.push(`Posición pedida: ${p}. Solo los que llevan «posición:» la tienen indicada; de los demás no la sabemos: ofrécelos igual ` +
+      `si encajan y añade «la posición la puedes comprobar en la ficha» (sin afirmar que son ${p}).`);
   }
   if (shown.some((x) => !x.tag) && moto) {
     notes.push('Los productos sin etiqueta de compatibilidad no tienen datos de compatibilidad: dilo y recomienda comprobar la medida o la referencia original.');
@@ -577,7 +589,7 @@ export async function getCatalogContext(
 export function cardsFor(hits: CatalogHit[], chosen: string | null) {
   if (!chosen) return [];
   const seen = new Set<number>();
-  return [...chosen.matchAll(/P\s*(\d+)/gi)]
+  return [...chosen.matchAll(/(?:^|[^a-z0-9])P?\s*(\d{1,2})(?!\d)/gi)]
     .map((m) => hits[parseInt(m[1], 10) - 1])
     .filter((hit): hit is CatalogHit => !!hit && !seen.has(hit.id) && !!seen.add(hit.id))
     .slice(0, 4)
