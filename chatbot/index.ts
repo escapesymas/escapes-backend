@@ -326,9 +326,9 @@ export async function chatHandler(req: Request, res: Response) {
 
     // Tarjetas al final, solo de los productos que ha elegido el asistente para su respuesta (antes salían
     // antes de responder y a veces contradecían lo que decía).
-    const picked = cardsFor(catalog.hits, chosen);
+    const picked = cardsFor(catalog.hits, chosen, sentText);
     if (picked.length > 0) send({ products: picked });
-    if (chosen === null && catalog.hits.length) console.warn(`[chatbot] respuesta sin [[PRODUCTOS]]${finishReason === 'length' ? ' (cortada)' : ''}: sin tarjetas`);
+    if (chosen === null && catalog.hits.length) console.warn(`[chatbot] respuesta sin [[PRODUCTOS]]${finishReason === 'length' ? ' (cortada)' : ''}: ${picked.length} tarjetas por las referencias nombradas`);
     else if (chosen && !picked.length && !/ningun/i.test(chosen)) console.warn('[chatbot] [[PRODUCTOS]] sin productos reconocibles:', JSON.stringify(chosen).slice(0, 120));
 
     // Con asesor disponible, botón «Hablar con un asesor»; sin él, «Dejar un mensaje».

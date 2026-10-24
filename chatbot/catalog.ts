@@ -608,12 +608,26 @@ export async function getCatalogContext(
   return { hits: shown.map((x) => x.hit), text };
 }
 
-/** Tarjetas de los productos elegidos («P1, P3» → los de esa posición en la lista que vio el asistente). */
-export function cardsFor(hits: CatalogHit[], chosen: string | null) {
-  if (!chosen) return [];
+/**
+ * Productos que nombra la respuesta por su referencia de modelo («MA359», «07GR03CC»): por si el asistente se
+ * olvida de la marca [[PRODUCTOS]]. Solo cuentan palabras del nombre con letras y cifras (4+ caracteres).
+ */
+export function hitsMentioned(hits: CatalogHit[], answer: string): CatalogHit[] {
+  const text = ` ${normalizeText(answer).replace(/[^a-z0-9]+/g, ' ')} `;
+  return hits.filter((h) => normalizeText(h.name).split(/[^a-z0-9]+/)
+    .some((w) => w.length >= 4 && /\d/.test(w) && /[a-z]/.test(w) && text.includes(` ${w} `)));
+}
+
+/**
+ * Tarjetas de los productos elegidos («P1, P3» → los de esa posición en la lista que vio el asistente). Sin marca
+ * (`chosen` null), los que nombra la respuesta.
+ */
+export function cardsFor(hits: CatalogHit[], chosen: string | null, answer = '') {
   const seen = new Set<number>();
-  return [...chosen.matchAll(/(?:^|[^a-z0-9])P?\s*(\d{1,2})(?!\d)/gi)]
-    .map((m) => hits[parseInt(m[1], 10) - 1])
+  const picked = chosen === null
+    ? hitsMentioned(hits, answer)
+    : [...chosen.matchAll(/(?:^|[^a-z0-9])P?\s*(\d{1,2})(?!\d)/gi)].map((m) => hits[parseInt(m[1], 10) - 1]);
+  return picked
     .filter((hit): hit is CatalogHit => !!hit && !seen.has(hit.id) && !!seen.add(hit.id))
     .slice(0, 4)
     .map((hit) => ({

@@ -48,8 +48,10 @@ describe('tarjetas del chat', () => {
     expect(cardsFor(hits, ' 3, 1').map((c) => c.sku)).toEqual(['S3', 'S1']);
   });
 
-  it('ninguna si no elige o no pone la marca', () => {
+  it('ninguna si elige «ninguno»; sin marca, las que nombra la respuesta por su referencia', () => {
     expect(cardsFor(hits, ' ninguno')).toEqual([]);
     expect(cardsFor(hits, null)).toEqual([]);
+    const named = [{ ...hit(1), name: 'Pastillas de freno Tecnium MA359 Orgánicas' }, { ...hit(2), name: 'Pastillas Brembo 07GR03CC' }, { ...hit(3), name: 'Zapatas BA208' }];
+    expect(cardsFor(named, null, 'Te recomiendo las **Tecnium MA359** o las Brembo 07GR03CC.').map((c) => c.id)).toEqual([1, 2]);
   });
 });
