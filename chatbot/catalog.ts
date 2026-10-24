@@ -109,6 +109,21 @@ export function spaceModel(search: string, model?: string): string {
   return search.replace(/\b[a-z]+\d+[a-z]*\b/g, (tok) => (tok === compact ? tok.match(/[a-z]+|\d+/g)!.join(' ') : tok));
 }
 
+/** Moto del garaje nombrada en el texto por una palabra propia de su modelo («pcx», «amico»); la última nombrada. */
+export function garageMotoNamed(text: string, motos: GarageMotorcycle[]): GarageMotorcycle | null {
+  const q = ` ${normalizeText(text).replace(/[^a-z0-9]+/g, ' ')} `;
+  let best: GarageMotorcycle | null = null;
+  let bestPos = -1;
+  for (const m of motos) {
+    for (const w of normalizeText(m.model).split(/[^a-z0-9]+/)) {
+      if (w.length < 3 || /^\d+$/.test(w)) continue;
+      const pos = q.lastIndexOf(` ${w} `);
+      if (pos > bestPos) { bestPos = pos; best = m; }
+    }
+  }
+  return best;
+}
+
 /** Posiciones pedidas (delantera, trasera…) y el texto de búsqueda sin ellas. */
 export function splitPosition(search: string): { search: string; positions: string[] } {
   const positions = new Set<string>();
@@ -479,6 +494,12 @@ export async function getCatalogContext(
     const re = modelPattern(parsed.model);
     const own = re ? garageMotos.find((m) => re.test(m.model)) : undefined;
     if (own) queryMoto = { ...own, year: parsed.year ?? own.year };
+  }
+  // «¿Y para mi pcx?» sin número: una moto del garaje nombrada por una palabra de su modelo; si salen varias,
+  // la nombrada más tarde (la consulta junta los mensajes en orden).
+  if (!queryMoto) {
+    const own = garageMotoNamed(query, garageMotos);
+    if (own) queryMoto = { ...own, year: parsed?.year ?? own.year };
   }
   // El año de la moto no está en el texto de búsqueda (se filtra después con la
   // compatibilidad): «pastillas mt-07 2019» buscaría «2019» y no daría nada.

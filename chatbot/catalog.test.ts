@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../db.js', () => ({ pool: { query: vi.fn(async () => ({ rows: [] })) } }));
 
-const { splitPosition, contradictsPosition, cardsFor, spaceModel } = await import('./catalog.js');
+const { splitPosition, contradictsPosition, cardsFor, spaceModel, garageMotoNamed } = await import('./catalog.js');
 
 describe('posición pedida', () => {
   it('se saca de la búsqueda (los nombres no la llevan)', () => {
@@ -26,6 +26,15 @@ describe('modelo escrito junto', () => {
     expect(spaceModel('kit de arrastre honda cb500f', 'CB500F')).toBe('kit de arrastre honda cb 500 f');
     expect(spaceModel('pastillas honda pcx 125', 'PCX 125')).toBe('pastillas honda pcx 125');
     expect(spaceModel('kit 520 honda', undefined)).toBe('kit 520 honda');
+  });
+});
+
+describe('moto del garaje nombrada', () => {
+  const motos = [{ brand: 'CYCLONE', model: 'RX2', year: 2026 }, { brand: 'APRILIA', model: 'AMICO 50', year: 1998 }, { brand: 'HONDA', model: 'PCX 125', year: 2022 }];
+  it('por una palabra de su modelo, la última nombrada', () => {
+    expect(garageMotoNamed('Pastillas de freno para mi moto Delanteras Y para mi pcx', motos)?.model).toBe('PCX 125');
+    expect(garageMotoNamed('para la amico y luego la PCX', motos)?.model).toBe('PCX 125');
+    expect(garageMotoNamed('pastillas delanteras', motos)).toBeNull();
   });
 });
 
