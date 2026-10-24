@@ -556,6 +556,7 @@ function itemText(msg: string): string {
   const own = new Set<string>(moto ? [
     ...normalizeText(`${moto.brand} ${moto.model}`).split(/[^a-z0-9]+/),
     ...(normalizeText(moto.model).match(/[a-z]+|\d+/g) || []),
+    ...normalizeText(moto.model).split(/\s+/).map(compact), // «x-cape» de «650 X-CAPE»
     compact(moto.model),
   ] : []);
   const words = productSearchText(msg).split(/\s+/)

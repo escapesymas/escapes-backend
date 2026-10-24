@@ -9,6 +9,7 @@ vi.mock('../lib/moto-catalog.js', () => ({
     APRILIA: { 'AMICO 50': {} },
     CYCLONE: { RX2: {} },
     MOTOBECANE: { '51': {} },
+    'MOTO MORINI': { '650 X-CAPE': {} },
   } }),
 }));
 
@@ -48,6 +49,7 @@ describe('pieza de la conversación', () => {
     expect(conversationProduct(['Pastillas de freno para mi moto', 'Y para una mt09 de 2023?']).search).toBe('pastillas freno');
     expect(conversationProduct(['kit de arrastre para la CB500F', 'Es de 2016']).search).toBe('kit de arrastre');
     expect(conversationProduct(['pastillas para la mt07', '¿y un filtro de aceite?']).search).toBe('filtro aceite');
+    expect(conversationProduct(['Busco filtro de aire', 'Es para una moto morini 650 x-cape del 2022']).search).toBe('filtro aire');
   });
 
   it('la posición va aparte y manda la del último mensaje', () => {
