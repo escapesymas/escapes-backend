@@ -27,6 +27,8 @@ export interface CatalogParams {
   inStock?: boolean;
   attrs?: Record<string, string[]>;
   universal?: boolean;
+  /** Solo estas referencias (p. ej. las compatibles con una moto, para el asistente). */
+  skus?: string[];
 }
 
 // Palabra en español → términos que aparecen en los nombres del proveedor.
@@ -35,8 +37,8 @@ const SYNONYMS: Record<string, string[]> = {
   cadena: ['chain'],
   corona: ['sprocket', 'rr sproc', 'sproc'],
   pinon: ['sprocket', 'fr sproc', 'sproc'],
-  'kit de arrastre': ['chain kit'],
-  'kit arrastre': ['chain kit'],
+  'kit de arrastre': ['chain kit', 'kit de cadena', 'kit cadena', 'kit de transmision'],
+  'kit arrastre': ['chain kit', 'kit de cadena', 'kit cadena', 'kit de transmision'],
   transmision: ['chain kit', 'chain'],
   pastilla: ['brake pad', 'pad'],
   freno: ['brake'],
@@ -241,6 +243,10 @@ export function buildConditions(params: CatalogParams, opts: { fuzzy?: boolean; 
 
   if (params.universal) {
     q.add(`AND (p.compatibility IS NULL OR p.compatibility = '[]'::jsonb)`);
+  }
+
+  if (params.skus) {
+    q.add(`AND p.sku = ANY(?)`, params.skus);
   }
 
   if (opts.exclude !== 'brand' && params.brands?.length) {

@@ -3,7 +3,7 @@ import type { Request, Response } from 'express';
 import { verifyJWT } from '../utils.js';
 import { minimaxClient, CHAT_MODEL, CHAT_LIMITS } from './minimax.js';
 import { sanitizeUserInput, containsPromptInjection, isOutOfScope } from './sanitize.js';
-import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, extractMotorcycleFromQuery, buildSearchQuery, cardsFor } from './catalog.js';
+import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, extractMotorcycleFromQuery, cardsFor } from './catalog.js';
 import { ORDER_TIERS, MAX_EXTRA_DISCOUNT_PERCENT } from '../lib/order-pricing.js';
 import { pool } from '../db.js';
 import { supportStatus, type SupportStatus } from '../lib/live-chat.js';
@@ -225,9 +225,9 @@ export async function chatHandler(req: Request, res: Response) {
   }
 
   try {
-    // Lo que se busca tiene en cuenta la conversación («¿y para la trasera?»).
-    const searchQuery = buildSearchQuery(messages.filter((m) => m.role === 'user').map((m) => m.content));
-    const moto = extractMotorcycleFromQuery(searchQuery);
+    // Lo que se busca tiene en cuenta la conversación («¿y para la trasera?», «¿y para una mt09?»).
+    const userMessages = messages.filter((m) => m.role === 'user').map((m) => m.content);
+    const moto = extractMotorcycleFromQuery(userMessages.slice(-3).join(' '));
     // La moto elegida ahora en la web va primero; después, las del garaje.
     const selectedBike = typeof (req.body as any)?.selectedBike === 'string'
       ? sanitizeUserInput((req.body as any).selectedBike).slice(0, 80)
@@ -242,7 +242,7 @@ export async function chatHandler(req: Request, res: Response) {
       isTechSpecQuery(cleanInput)
         ? searchMotorcycleTechSpecs(cleanInput, moto?.brand, moto?.model, moto?.year)
         : Promise.resolve(''),
-      garageEntriesP.then((g) => getCatalogContext(searchQuery, g)),
+      garageEntriesP.then((g) => getCatalogContext(userMessages, g)),
       supportStatus().catch(() => null),
     ]);
 

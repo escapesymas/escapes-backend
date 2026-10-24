@@ -1,6 +1,6 @@
 import { pool } from '../db.js';
 import { listFamilies, normalizeText, searchTerms } from '../lib/catalog-query.js';
-import { getCatalogData } from '../lib/moto-catalog.js';
+import { getCatalogData, compatibleSkus } from '../lib/moto-catalog.js';
 import { formatOrderNumber, eur } from '../lib/email-templates.js';
 
 export interface CatalogHit {
@@ -30,24 +30,6 @@ interface GarageMotorcycle {
   brand: string;
   model: string;
   year: number | null;
-}
-
-// El año llega como «(2021)» (JSON antiguo) o suelto («YAMAHA MT-07 2021», tabla garage).
-const GARAGE_YEAR_RE = /\(?\b(19[5-9]\d|20[0-4]\d)\b\)?/;
-
-function parseGarageMotorcycle(entry: string): GarageMotorcycle | null {
-  const s = (entry || '').trim();
-  if (!s) return null;
-  const m = s.match(GARAGE_YEAR_RE);
-  const year = m ? parseInt(m[1], 10) : null;
-  const withoutYear = s.replace(GARAGE_YEAR_RE, ' ').replace(/\s+/g, ' ').trim();
-  const parts = withoutYear.split(' ');
-  if (parts.length < 2) return null;
-  return {
-    brand: parts[0].toUpperCase(),
-    model: parts.slice(1).join(' ').toUpperCase(),
-    year: Number.isFinite(year as number) ? (year as number) : null,
-  };
 }
 
 function pickFirstImage(images: any): string | null {
@@ -101,16 +83,6 @@ const POSITION_ROOT: Array<[RegExp, string, RegExp]> = [
   [/^delant/, 'delantera', /delant/], [/^(tras|detras)/, 'trasera', /tras/],
   [/^izquierd/, 'izquierda', /izquierd/], [/^derech/, 'derecha', /derech/],
 ];
-
-/**
- * El modelo escrito junto («cb500f») no casa con las compatibilidades, que lo guardan separado («CB 500 F»):
- * devuelve la búsqueda con ese modelo separado (o igual si no hace falta).
- */
-export function spaceModel(search: string, model?: string): string {
-  const compact = normalizeText(model || '').replace(/[^a-z0-9]/g, '');
-  if (!/^[a-z]+\d+[a-z]*$/.test(compact)) return search;
-  return search.replace(/\b[a-z]+\d+[a-z]*\b/g, (tok) => (tok === compact ? tok.match(/[a-z]+|\d+/g)!.join(' ') : tok));
-}
 
 /** Moto del garaje nombrada en el texto por una palabra propia de su modelo («pcx», «amico»); la última nombrada. */
 export function garageMotoNamed(text: string, motos: GarageMotorcycle[]): GarageMotorcycle | null {
@@ -190,9 +162,12 @@ export function catalogMotoIn(text: string): GarageMotorcycle | null {
   return null;
 }
 
-/** ¿La palabra es de la moto (marca, modelo o año) y no del producto? */
+let brandWords: Set<string> | null = null;
+/** ¿La palabra es de la moto (marca del catálogo, modelo o año) y no del producto? */
 function isMotoWord(w: string): boolean {
-  return /^(19[5-9]\d|20[0-4]\d)$/.test(w) || !!BRAND_ALIASES[w] || motoModelIndex().has(w);
+  brandWords ||= new Set(Object.keys(getCatalogData()?.hierarchy || {})
+    .flatMap((b) => normalizeText(b).split(/[^a-z0-9]+/)).filter((x) => x.length >= 3));
+  return /^(19[5-9]\d|20[0-4]\d)$/.test(w) || !!BRAND_ALIASES[w] || brandWords.has(w) || motoModelIndex().has(w);
 }
 
 /** Posiciones pedidas (delantera, trasera…) y el texto de búsqueda sin ellas. */
@@ -250,28 +225,6 @@ function yearRanges(years: number[]): string {
   return out.join(', ');
 }
 
-/**
- * Filtra por la moto (y el año, si se sabe) con la compatibilidad de cada
- * producto: del mismo modelo cambian las piezas según el año (MT-07 2014-2016,
- * 2017-2020 y 2021+). Devuelve los productos con la etiqueta para el asistente.
- */
-function filterByMoto(hits: CatalogHit[], moto: GarageMotorcycle): { hit: CatalogHit; tag: string }[] {
-  const name = `${moto.brand} ${moto.model}`.replace(/[¿?¡!,;]/g, '').trim();
-  const verified: { hit: CatalogHit; tag: string }[] = [];
-  const unknown: { hit: CatalogHit; tag: string }[] = [];
-  for (const hit of hits) {
-    const years = compatibleYears(hit, moto);
-    if (years === null) { unknown.push({ hit, tag: '' }); continue; } // sin datos: se ofrece sin garantizar
-    if (years.length === 0) continue; // tiene compatibilidades, pero no con esta moto
-    if (moto.year) {
-      if (years.includes(moto.year)) verified.push({ hit, tag: `[COMPATIBLE VERIFICADO CON ${name} (${moto.year})]` });
-    } else {
-      verified.push({ hit, tag: `[COMPATIBLE CON ${name} DE ${yearRanges(years)}]` });
-    }
-  }
-  return [...verified, ...unknown];
-}
-
 
 // Palabras de conversación que no describen el producto («¿tenéis…?», «me
 // recomiendas…»): el buscador de la web exige que aparezcan todas.
@@ -316,11 +269,11 @@ function productSearchText(text: string): string {
  * representativo: con stock y el más barato). Sin resultados aproximados, para
  * no ofrecer piezas de otra moto.
  */
-async function searchLikeWeb(search: string, perPage = 12): Promise<CatalogHit[]> {
+async function searchLikeWeb(search: string, perPage = 12, skus?: string[]): Promise<CatalogHit[]> {
   if (!search) return [];
   try {
-    // Una sola consulta exacta; los modelos con stock van primero.
-    const res = await listFamilies({ search }, 'relevance', 1, perPage, { exact: true });
+    // Una sola consulta exacta (la tolerante a erratas traía cualquier cosa); los modelos con stock van primero.
+    const res = await listFamilies({ search, skus }, 'relevance', 1, perPage, { exact: true });
     if (res.total === 0) return [];
     const ids = res.rows.map((r) => r.rep_id);
     const { rows } = await pool.query(
@@ -518,130 +471,186 @@ function productTerms(text: string): string[] {
 }
 
 /**
- * Lo que hay que buscar teniendo en cuenta la conversación: en «¿y para la
- * trasera?» o «¿alguna más barata?» se arrastra la petición anterior, y si el
- * mensaje no nombra moto se usa la última que haya salido.
+ * Marca y modelo del catálogo de motos de la web (los del selector) nombrados en el texto: «Honda CB500F de 2016»,
+ * «una mt09 de 2023», «HONDA PCX 125 (2022)». El modelo se compara junto («cb500f» = «CB 500 F») y gana lo
+ * nombrado más tarde. Sin modelo reconocible devuelve null (solo la marca no basta para buscar piezas).
  */
-export function buildSearchQuery(userMessages: string[]): string {
-  const msgs = userMessages.map((m) => m.trim()).filter(Boolean);
-  if (msgs.length === 0) return '';
-  // Respuestas cortas encadenadas («es de 2022», «es honda», «¿y la trasera?») se
-  // suman a la última petición de verdad (con al menos dos términos de producto).
-  // Las palabras de la moto («mt09», «2023») no cuentan: «¿y para una mt09 de 2023?» sigue la petición anterior.
-  const itemTerms = (m: string) => {
-    const moto = extractMotorcycleFromQuery(m);
-    const own = new Set(moto ? searchTerms(`${moto.brand} ${moto.model}`) : []);
-    return productTerms(m).filter((w) => !isMotoWord(w) && !own.has(w));
-  };
-  const last = msgs[msgs.length - 1];
-  const lastMoto = extractMotorcycleFromQuery(last);
-  // Si el último mensaje nombra otra moto, de los anteriores solo se toma el producto (no su moto ni su año).
-  const lastHasMoto = !!(lastMoto?.brand || lastMoto?.model || catalogMotoIn(last));
-  const parts: string[] = [last];
-  if (itemTerms(last).length <= 1) {
-    for (let i = msgs.length - 2; i >= Math.max(0, msgs.length - 6); i--) {
-      parts.unshift(lastHasMoto ? itemTerms(msgs[i]).join(' ') : msgs[i]);
-      if (itemTerms(msgs[i]).length >= 2) break;
+export function catalogMoto(text: string): GarageMotorcycle | null {
+  const hierarchy = getCatalogData()?.hierarchy || {};
+  const words = normalizeText(text).split(/[^a-z0-9]+/).filter(Boolean);
+  const joined = ` ${words.join(' ')} `;
+  let brand = '';
+  for (const b of Object.keys(hierarchy)) {
+    const nb = normalizeText(b).replace(/[^a-z0-9]+/g, ' ').trim();
+    if (nb && joined.includes(` ${nb} `) && nb.length > brand.length) brand = b;
+  }
+  if (!brand) {
+    for (const w of words) {
+      const alias = BRAND_ALIASES[w];
+      const key = alias && Object.keys(hierarchy).find((k) => k.toUpperCase() === alias);
+      if (key) { brand = key; break; }
     }
   }
-  let query = parts.join(' ');
-  if (!extractMotorcycleFromQuery(query)?.brand) {
-    for (let i = msgs.length - parts.length - 1; i >= Math.max(0, msgs.length - 8); i--) {
-      const moto = extractMotorcycleFromQuery(msgs[i]);
-      if (moto?.brand) { query = `${query} ${moto.brand} ${moto.model}${moto.year ? ` ${moto.year}` : ''}`.trim(); break; }
+  if (brand) {
+    const byKey = new Map<string, string[]>();
+    for (const m of Object.keys(hierarchy[brand] || {})) {
+      const first = compact(m.split(/\s+/)[0] || '');
+      for (const k of new Set([compact(m), first])) {
+        // Con la marca dicha valen también modelos que son solo un número («Motobecane 51»).
+        if (k.length < 2 || NOT_MODEL_WORDS.has(k)) continue;
+        byKey.set(k, [...(byKey.get(k) || []), m]);
+      }
+    }
+    for (let i = words.length - 1; i >= 0; i--) {
+      for (const n of [6, 5, 4, 3, 2, 1]) {
+        if (i - n + 1 < 0) continue;
+        const key = words.slice(i - n + 1, i + 1).join('');
+        const found = byKey.get(key);
+        if (!found) continue;
+        const pick = found.find((m) => compact(m) === key) || [...found].sort((a, b) => a.length - b.length)[0];
+        return { brand, model: pick, year: yearIn(text) };
+      }
     }
   }
-  return query;
+  const byModel = catalogMotoIn(text);
+  if (!byModel) return null;
+  // Con la grafía del catálogo (catalogMotoIn la devuelve en mayúsculas).
+  const b = Object.keys(hierarchy).find((k) => k.toUpperCase() === byModel.brand) || byModel.brand;
+  const m = Object.keys(hierarchy[b] || {}).find((k) => k.toUpperCase() === byModel.model) || byModel.model;
+  return { brand: b, model: m, year: byModel.year };
 }
 
-/** Búsqueda del asistente: los mismos resultados que el catálogo de la web. */
+/** Moto de la conversación para buscar piezas compatibles. */
+export interface ConversationMoto extends GarageMotorcycle {
+  /** 'mensaje': la nombró el cliente; 'garaje': la elegida en la web o la primera de su garaje. */
+  from: 'mensaje' | 'garaje';
+}
+
+/**
+ * La moto de la que se habla: la nombrada en el último mensaje que nombre una (del catálogo o de su garaje: «mi
+ * pcx»), con el año que diga ese mensaje o uno posterior («es de 2016»); si no nombra ninguna, la elegida en la
+ * web o la primera de su garaje.
+ */
+export function conversationMoto(userMessages: string[], garageEntries: string[]): ConversationMoto | null {
+  const garage = garageEntries.map(catalogMoto).filter((m): m is GarageMotorcycle => !!m && !!m.model);
+  let laterYear: number | null = null;
+  for (let i = userMessages.length - 1; i >= Math.max(0, userMessages.length - 8); i--) {
+    const msg = userMessages[i];
+    const named = catalogMoto(msg);
+    const own = garageMotoNamed(msg, garage);
+    // Si es una de su garaje (aunque la nombre a medias), vale la del garaje con su año.
+    const sameAsOwn = own && named && own.brand === named.brand && own.model === named.model;
+    const m = sameAsOwn || !named ? own : named;
+    if (m) return { brand: m.brand, model: m.model, year: yearIn(msg) ?? laterYear ?? (m === own ? own.year : null), from: 'mensaje' };
+    laterYear ??= yearIn(msg);
+  }
+  if (garage[0]) return { ...garage[0], year: garage[0].year ?? laterYear, from: 'garaje' };
+  return null;
+}
+
+/** Palabras de la pieza en un mensaje: sin relleno, sin palabras de pedidos y sin la moto (marca, modelo, año). */
+function itemText(msg: string): string {
+  const moto = catalogMoto(msg);
+  const own = new Set<string>(moto ? [
+    ...normalizeText(`${moto.brand} ${moto.model}`).split(/[^a-z0-9]+/),
+    ...(normalizeText(moto.model).match(/[a-z]+|\d+/g) || []),
+    compact(moto.model),
+  ] : []);
+  const words = productSearchText(msg).split(/\s+/)
+    .filter((w) => w && !NON_PRODUCT.has(w) && !isMotoWord(w) && !own.has(w) && !own.has(compact(w)));
+  // Sin artículos ni preposiciones, con las frases con sinónimo juntas («kit de arrastre»).
+  return searchTerms(words.join(' ')).join(' ');
+}
+
+/**
+ * Qué pieza busca: la del último mensaje que nombre una («¿y para una mt09?» o «¿y la trasera?» siguen con la
+ * anterior). La posición pedida (delantera, trasera…) va aparte, y la del último mensaje manda.
+ */
+export function conversationProduct(userMessages: string[]): { search: string; positions: string[] } {
+  const lastPositions = userMessages.length ? splitPosition(productSearchText(userMessages[userMessages.length - 1])).positions : [];
+  for (let i = userMessages.length - 1; i >= Math.max(0, userMessages.length - 6); i--) {
+    const { search, positions } = splitPosition(itemText(userMessages[i]));
+    if (search && productTerms(search).length) return { search, positions: lastPositions.length ? lastPositions : positions };
+  }
+  return { search: '', positions: lastPositions };
+}
+
+/**
+ * Búsqueda del asistente. Con moto, las piezas salen de su compatibilidad (la misma que usa el selector de la
+ * web: lib/moto-catalog.ts) y el texto solo dice qué pieza es; así no depende de cómo escriba el cliente la moto.
+ */
 export async function getCatalogContext(
-  query: string,
+  userMessages: string[],
   garageEntries: string[] = []
 ): Promise<CatalogContextResult> {
-  const split = splitPosition(productSearchText(query));
-  let base = split.search;
-  const positions = split.positions;
-  if (productTerms(query).length === 0 || !base) {
-    return { hits: [], text: await catalogSummary() };
-  }
-
-  // Moto nombrada en la consulta (solo si se reconoce la marca: «talla 58» no es una moto).
-  const parsed = extractMotorcycleFromQuery(query);
-  const garageMotos = garageEntries.map(parseGarageMotorcycle).filter((m): m is GarageMotorcycle => !!m && !!m.brand);
-  let queryMoto = parsed?.brand ? parsed : null;
-  // «¿Y para mi PCX?»: modelo sin marca que coincide con una moto del garaje → esa moto (con su año).
-  if (!queryMoto && parsed?.model) {
-    const re = modelPattern(parsed.model);
-    const own = re ? garageMotos.find((m) => re.test(m.model)) : undefined;
-    if (own) queryMoto = { ...own, year: parsed.year ?? own.year };
-  }
-  // «¿Y para mi pcx?» sin número: una moto del garaje nombrada por una palabra de su modelo; si salen varias,
-  // la nombrada más tarde (la consulta junta los mensajes en orden).
-  if (!queryMoto) {
-    const own = garageMotoNamed(query, garageMotos);
-    if (own) queryMoto = { ...own, year: parsed?.year ?? own.year };
-  }
-  // «¿Y para una mt09 de 2023?»: modelo sin marca que está en el catálogo de motos de la web.
-  if (!queryMoto) queryMoto = catalogMotoIn(query);
-  // El año de la moto no está en el texto de búsqueda (se filtra después con la
-  // compatibilidad): «pastillas mt-07 2019» buscaría «2019» y no daría nada.
-  if (queryMoto?.year) base = base.replace(new RegExp(`\\b${queryMoto.year}\\b`, 'g'), ' ').replace(/\s+/g, ' ').trim();
-  // Si nombra un modelo aunque no diga la marca («pcx 125»), no se usa el garaje.
-  const garageMoto = !queryMoto && !parsed?.model ? garageMotos[0] || null : null;
-
-  // Sin moto en la consulta, primero se prueba con la del garaje («pastillas de
-  // freno» → las de su MT-07) y si no hay nada, sin moto (un casco no depende de ella).
-  const attempts: { search: string; moto: GarageMotorcycle | null }[] = [];
-  const withSpaced = (search: string, model: string | undefined, m: GarageMotorcycle | null) => {
-    attempts.push({ search, moto: m });
-    const spaced = spaceModel(search, model);
-    if (spaced !== search) attempts.push({ search: spaced, moto: m });
-  };
-  if (garageMoto) {
-    withSpaced(`${base} ${productSearchText(`${garageMoto.brand} ${garageMoto.model}`)}`, garageMoto.model, garageMoto);
-  }
-  withSpaced(base, queryMoto?.model || parsed?.model, queryMoto);
-
-  // Con moto se piden más modelos: después se quitan los que no le valen por año.
-  const run = async (search: string, m: GarageMotorcycle | null) => {
-    const found = (await searchLikeWeb(search, m ? 36 : 12)).filter((h) => !contradictsPosition(h.position, positions));
-    return m ? filterByMoto(found, m) : found.map((hit) => ({ hit, tag: '' }));
-  };
-
+  const product = conversationProduct(userMessages);
+  const positions = product.positions;
+  if (!product.search) return { hits: [], text: await catalogSummary() };
+  const moto = conversationMoto(userMessages, garageEntries);
+  const notes: string[] = [];
   let found: { hit: CatalogHit; tag: string }[] = [];
-  let moto: GarageMotorcycle | null = null;
-  for (const a of attempts) {
-    found = await run(a.search, a.moto);
-    if (found.length > 0) { moto = a.moto; break; }
-  }
-
-  // ¿Pide algo que no tenemos («escape Akrapovic para Z900», «guantes de
-  // verano»)? Se quita la palabra más rara del catálogo (una marca que no hay, un
-  // adjetivo) y se ofrece lo que haya; nunca el tipo de pieza («kit de arrastre»).
   let missing = '';
-  if (found.length === 0) {
-    const motoTerms = new Set(queryMoto ? searchTerms(`${queryMoto.brand} ${queryMoto.model}`) : []);
-    const terms = searchTerms(base);
-    const rare = await rarestTerm(terms.filter((w) => !motoTerms.has(w)));
-    if (rare && terms.length >= 2) {
-      found = await run(terms.filter((w) => w !== rare).join(' '), queryMoto);
-      if (found.length > 0) { missing = rare; moto = queryMoto; }
+  const keepPosition = (hits: CatalogHit[]) => hits.filter((h) => !contradictsPosition(h.position, positions));
+
+  if (moto) {
+    const name = `${moto.brand} ${moto.model}`.toUpperCase();
+    const fullName = `${name}${moto.year ? ` (${moto.year})` : ''}`;
+    const skus = await compatibleSkus(moto.brand, moto.model, moto.year ? String(moto.year) : undefined).catch(() => [] as string[]);
+    const tagFor = (hit: CatalogHit) => {
+      if (moto.year) return `[COMPATIBLE VERIFICADO CON ${fullName}]`;
+      const years = compatibleYears(hit, moto);
+      return years?.length ? `[COMPATIBLE CON ${name} DE ${yearRanges(years)}]` : `[COMPATIBLE CON ${name}]`;
+    };
+    if (skus.length) {
+      let hits = keepPosition(await searchLikeWeb(product.search, 24, skus));
+      // ¿Pide algo concreto que no hay para su moto («pastillas brembo»)? Sin la palabra más rara, lo que haya.
+      if (!hits.length) {
+        const terms = searchTerms(product.search);
+        const rare = await rarestTerm(terms);
+        if (rare && terms.length >= 2) {
+          hits = keepPosition(await searchLikeWeb(terms.filter((w) => w !== rare).join(' '), 24, skus));
+          if (hits.length) missing = rare;
+        }
+      }
+      found = hits.map((hit) => ({ hit, tag: tagFor(hit) }));
+    }
+    if (!found.length) {
+      // Nada compatible: solo se ofrece lo universal (sin compatibilidades: cascos, aceites…).
+      const general = keepPosition(await searchLikeWeb(product.search, 12));
+      const universal = general.filter((h) => !Array.isArray(h.compatibility) || h.compatibility.length === 0);
+      found = universal.map((hit) => ({ hit, tag: '[UNIVERSAL: NO DEPENDE DE LA MOTO]' }));
+      if (!skus.length) {
+        notes.push(`NO HAY NINGUNA PIEZA CON COMPATIBILIDAD REGISTRADA PARA SU ${fullName}. Si busca una pieza que depende de la moto, ` +
+          `dile que no tenemos datos de compatibilidad para su moto y pídele la referencia original o las medidas. No digas nunca que algo es compatible.`);
+      } else if (general.length > universal.length) {
+        notes.push(`Tenemos «${product.search}», pero NINGUNO figura como compatible con su ${fullName}: dile que ahora mismo no lo tenemos para su moto ` +
+          `(no ofrezcas piezas de otras motos)${moto.year ? ' y que confirme el año' : ''}; puede darte la referencia original para comprobarlo.`);
+      } else if (!universal.length) {
+        notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos y pídele más detalles o que escriba a info@escapesymas.com.`);
+      }
+    }
+    if (found.length && moto.from === 'garaje') {
+      notes.push(`Resultados para su moto ${fullName} (la elegida en la web o la primera de su garaje).`);
+      if (garageEntries.length > 1) notes.push(`Tiene más motos guardadas (${garageEntries.slice(1, 4).join(', ')}): menciona para cuál son y ofrece buscar para otra.`);
+    }
+    if (found.length && !moto.year && found.some((x) => !x.tag.startsWith('[UNIVERSAL'))) {
+      notes.push('NO SABEMOS EL AÑO DE LA MOTO: indica los años compatibles de cada producto si los tiene y pregúntale el año para confirmar.');
+    }
+  } else {
+    // Sin moto solo se enseña lo que no depende de ella (cascos, ropa, aceites…): una pastilla o un kit de otra
+    // moto no le sirve, hay que preguntarle cuál tiene.
+    const general = keepPosition(await searchLikeWeb(product.search, 12));
+    const universal = general.filter((h) => !Array.isArray(h.compatibility) || h.compatibility.length === 0);
+    found = universal.map((hit) => ({ hit, tag: '' }));
+    if (general.length > universal.length) {
+      notes.push(`Tenemos «${product.search}» para muchas motos, pero NO SABEMOS LA SUYA: pregúntale marca, modelo y año (o que la guarde en ` +
+        `Mi garaje) antes de recomendar nada; no elijas productos para tarjetas hasta saberla${universal.length ? ', salvo los universales de abajo' : ''}.`);
+    } else if (!general.length) {
+      notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos y pídele más detalles o que escriba a info@escapesymas.com.`);
     }
   }
 
-  if (found.length === 0) {
-    const what = queryMoto
-      ? `${base} (moto ${queryMoto.brand} ${queryMoto.model}${queryMoto.year ? ` de ${queryMoto.year}` : ''})`
-      : base;
-    return {
-      hits: [],
-      text: `NO SE ENCONTRARON PRODUCTOS PARA «${what}». Dile al cliente que ahora mismo no lo tenemos en el catálogo, ` +
-        `no ofrezcas piezas de otra moto ni de otro año y pídele más detalles o que escriba a info@escapesymas.com.`,
-    };
-  }
-
-  // Dos por marca para variar, respetando el orden (compatibles verificados primero).
+  // Dos por marca para variar, respetando el orden (con stock primero).
   const perBrand = new Map<string, number>();
   const shown = found.filter(({ hit }) => {
     const k = (hit.brand || '').toUpperCase().trim();
@@ -651,39 +660,14 @@ export async function getCatalogContext(
     return true;
   }).slice(0, 6);
 
-  const notes: string[] = [];
-  // Se conocía su moto pero lo encontrado no se ha filtrado por ella (no hay nada con compatibilidad registrada).
-  const knownMoto = queryMoto || garageMoto;
-  if (knownMoto && !moto) {
-    const name = `${knownMoto.brand} ${knownMoto.model}${knownMoto.year ? ` (${knownMoto.year})` : ''}`;
-    notes.push(`NINGÚN PRODUCTO TIENE COMPATIBILIDAD REGISTRADA CON SU ${name}: los de abajo NO están comprobados con su moto. ` +
-      `Nunca digas que son compatibles. Si la pieza depende de la moto (frenos, filtros, transmisión, motor…), dile que no tenemos ` +
-      `datos de compatibilidad para su ${name}, no elijas ninguno y pídele la referencia original o las medidas; si no depende ` +
-      `(casco, ropa, accesorios universales), ofrécelos.`);
-  }
   if (missing) {
     notes.push(`Ningún producto lleva «${missing}» en su nombre: estos son los más parecidos. Ofrécelos aclarando que «${missing}» no figura ` +
-      `en su descripción (si es una marca, que ahora mismo no la tenemos; si es una posición o variante, que lo compruebe en la ficha).`);
+      `en su descripción (si es una marca, que ahora mismo no la tenemos; si es una variante, que lo compruebe en la ficha).`);
   }
-  if (moto && moto === garageMoto) {
-    notes.push(`Resultados para su moto ${moto.brand} ${moto.model}${moto.year ? ` (${moto.year})` : ''} (la elegida en la web o la primera de su garaje).`);
-    if (garageEntries.length > 1) {
-      notes.push(`Tiene más motos guardadas (${garageEntries.slice(1, 4).join(', ')}): menciona para cuál son y ofrece buscar para otra.`);
-    }
-  }
-  if (!queryMoto && parsed?.model) {
-    notes.push(`Ha nombrado el modelo ${parsed.model} sin la marca: estos productos no están filtrados por su moto. Pregúntale marca y año para confirmar la compatibilidad.`);
-  }
-  if (moto && !moto.year) {
-    notes.push('NO SABEMOS EL AÑO DE LA MOTO: indica los años compatibles de cada producto y pregúntale el año para confirmar.');
-  }
-  if (positions.length) {
+  if (positions.length && shown.length) {
     const p = positions.join(' y ');
     notes.push(`Posición pedida: ${p}. Donde pone «posición: NO INDICADA» no sabemos si es ${p}: no lo afirmes; ofrécelo si encaja ` +
       `y di «la posición la puedes comprobar en la ficha».`);
-  }
-  if (shown.some((x) => !x.tag) && moto) {
-    notes.push('Los productos sin etiqueta de compatibilidad no tienen datos de compatibilidad: dilo y recomienda comprobar la medida o la referencia original.');
   }
   const text = [...notes, ...shown.map(({ hit, tag }, i) => formatHitText(hit, tag, i + 1, positions.length > 0))].join('\n');
   return { hits: shown.map((x) => x.hit), text };
