@@ -106,6 +106,14 @@ const SYNONYMS: Record<string, string[]> = {
   limpiador: ['cleaner'],
   grasa: ['grease'],
   lubricante: ['lube', 'lubricant'],
+  // Palabras generales que usa el cliente y casi nunca están en los nombres («¿qué tienes de suspensión?»).
+  suspension: ['horquilla', 'amortiguador', 'muelle de horquilla', 'reten de horquilla', 'fork', 'shock', 'suspension'],
+  cupula: ['pantalla', 'parabrisas', 'windscreen', 'screen', 'deflector', 'cupula'],
+  parabrisas: ['pantalla', 'cupula', 'windscreen', 'screen', 'parabrisas'],
+  arrastre: ['kit de cadena', 'kit cadena', 'chain kit', 'corona', 'pinon', 'sprocket'],
+  luz: ['faro', 'intermitente', 'piloto', 'light', 'luz', 'led'],
+  luces: ['faro', 'intermitente', 'piloto', 'light', 'luz', 'led'],
+  iluminacion: ['faro', 'intermitente', 'piloto', 'light', 'luz', 'led'],
 };
 
 export function normalizeText(s: string): string {

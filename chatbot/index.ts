@@ -256,8 +256,9 @@ export async function chatHandler(req: Request, res: Response) {
     // La respuesta se genera entera y se revisa antes de enviarla: MiniMax a veces escribe trozos en chino y,
     // quitándolos sobre la marcha, la frase quedaba rota («(2022)。**TECNIUM MA359Orgánicas**»). Si trae chino,
     // está vacía o se corta, se repite (como mucho 3 veces). reasoning_split deja el razonamiento aparte.
-    // Si pide una persona expresamente, se le ofrece aunque el modelo no ponga la marca.
-    let offerHuman = ASKS_HUMAN_RE.test(cleanInput);
+    // Si pide una persona expresamente, o no tenemos lo que busca (o no para su moto), se le ofrece aunque el modelo
+    // no ponga la marca: botón de hablar con un asesor o, fuera de horario, de dejarle un mensaje.
+    let offerHuman = ASKS_HUMAN_RE.test(cleanInput) || !!catalog.noMatch;
     let finishReason: string | null = null;
     let raw = '';
     for (let attempt = 0; attempt < 3; attempt++) {

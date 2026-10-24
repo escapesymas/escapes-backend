@@ -24,6 +24,8 @@ export interface CatalogHit {
 export interface CatalogContextResult {
   hits: CatalogHit[];
   text: string;
+  /** No tenemos lo que pide (o no para su moto): se le ofrece hablar con un asesor. */
+  noMatch?: boolean;
 }
 
 interface GarageMotorcycle {
@@ -590,6 +592,8 @@ export async function getCatalogContext(
   const notes: string[] = [];
   let found: { hit: CatalogHit; tag: string }[] = [];
   let missing = '';
+  let noMatch = false;
+  const ADVISOR = ' Ofrécele que un asesor lo revise (según ATENCIÓN HUMANA).';
   const keepPosition = (hits: CatalogHit[]) => hits.filter((h) => !contradictsPosition(h.position, positions));
 
   if (moto) {
@@ -620,13 +624,16 @@ export async function getCatalogContext(
       const universal = general.filter((h) => !Array.isArray(h.compatibility) || h.compatibility.length === 0);
       found = universal.map((hit) => ({ hit, tag: '[UNIVERSAL: NO DEPENDE DE LA MOTO]' }));
       if (!skus.length) {
+        noMatch = true;
         notes.push(`NO HAY NINGUNA PIEZA CON COMPATIBILIDAD REGISTRADA PARA SU ${fullName}. Si busca una pieza que depende de la moto, ` +
-          `dile que no tenemos datos de compatibilidad para su moto y pídele la referencia original o las medidas. No digas nunca que algo es compatible.`);
+          `dile que no tenemos datos de compatibilidad para su moto. No digas nunca que algo es compatible.${ADVISOR}`);
       } else if (general.length > universal.length) {
+        noMatch = true;
         notes.push(`Tenemos «${product.search}», pero NINGUNO figura como compatible con su ${fullName}: dile que ahora mismo no lo tenemos para su moto ` +
-          `(no ofrezcas piezas de otras motos)${moto.year ? ' y que confirme el año' : ''}; puede darte la referencia original para comprobarlo.`);
+          `(no ofrezcas piezas de otras motos)${moto.year ? '' : ' y pregúntale el año'}.${ADVISOR}`);
       } else if (!universal.length) {
-        notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos y pídele más detalles o que escriba a info@escapesymas.com.`);
+        noMatch = true;
+        notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos.${ADVISOR}`);
       }
     }
     // Si antes habló de otra moto, la respuesta es solo para esta (sin la lista de la otra decía que «no había»).
@@ -649,7 +656,8 @@ export async function getCatalogContext(
       notes.push(`Tenemos «${product.search}» para muchas motos, pero NO SABEMOS LA SUYA: pregúntale marca, modelo y año (o que la guarde en ` +
         `Mi garaje) antes de recomendar nada; no elijas productos para tarjetas hasta saberla${universal.length ? ', salvo los universales de abajo' : ''}.`);
     } else if (!general.length) {
-      notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos y pídele más detalles o que escriba a info@escapesymas.com.`);
+      noMatch = true;
+      notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos.${ADVISOR}`);
     }
   }
 
@@ -673,7 +681,7 @@ export async function getCatalogContext(
       `y di «la posición la puedes comprobar en la ficha».`);
   }
   const text = [...notes, ...shown.map(({ hit, tag }, i) => formatHitText(hit, tag, i + 1, positions.length > 0))].join('\n');
-  return { hits: shown.map((x) => x.hit), text };
+  return { hits: shown.map((x) => x.hit), text, noMatch };
 }
 
 /**
