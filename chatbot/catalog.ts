@@ -83,12 +83,14 @@ function mapHit(row: any): CatalogHit {
 }
 
 /** Línea del producto para el asistente; `n` es su número (P1, P2…) para elegir las tarjetas. */
-function formatHitText(p: CatalogHit, tag = '', n = 0): string {
+function formatHitText(p: CatalogHit, tag = '', n = 0, askedPosition = false): string {
   const priceStr = p.sale_price
     ? `${(p.sale_price / 100).toFixed(2)}€ (antes ${(p.price / 100).toFixed(2)}€)`
     : `${(p.price / 100).toFixed(2)}€`;
   const stockStr = (p.stock || 0) > 0 ? `stock: ${p.stock}` : 'sin stock';
-  return `- ${n ? `P${n} ` : ''}${tag ? `${tag} ` : ''}${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}${p.position ? ` | posición: ${p.position}` : ''}`;
+  // Si el cliente pide una posición, se dice también cuándo la ficha no la indica (si no, el asistente la suponía).
+  const pos = p.position ? ` | posición: ${p.position}` : askedPosition ? ' | posición: NO INDICADA' : '';
+  return `- ${n ? `P${n} ` : ''}${tag ? `${tag} ` : ''}${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}${pos}`;
 }
 
 // Posición que pide el cliente («pastillas delanteras»). No va en la búsqueda: los nombres casi nunca la llevan
@@ -596,13 +598,13 @@ export async function getCatalogContext(
   }
   if (positions.length) {
     const p = positions.join(' y ');
-    notes.push(`Posición pedida: ${p}. Solo los que llevan «posición:» la tienen indicada; de los demás no la sabemos: ofrécelos igual ` +
-      `si encajan y añade «la posición la puedes comprobar en la ficha» (sin afirmar que son ${p}).`);
+    notes.push(`Posición pedida: ${p}. Donde pone «posición: NO INDICADA» no sabemos si es ${p}: no lo afirmes; ofrécelo si encaja ` +
+      `y di «la posición la puedes comprobar en la ficha».`);
   }
   if (shown.some((x) => !x.tag) && moto) {
     notes.push('Los productos sin etiqueta de compatibilidad no tienen datos de compatibilidad: dilo y recomienda comprobar la medida o la referencia original.');
   }
-  const text = [...notes, ...shown.map(({ hit, tag }, i) => formatHitText(hit, tag, i + 1))].join('\n');
+  const text = [...notes, ...shown.map(({ hit, tag }, i) => formatHitText(hit, tag, i + 1, positions.length > 0))].join('\n');
   return { hits: shown.map((x) => x.hit), text };
 }
 
