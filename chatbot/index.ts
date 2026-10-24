@@ -3,7 +3,7 @@ import type { Request, Response } from 'express';
 import { verifyJWT } from '../utils.js';
 import { minimaxClient, CHAT_MODEL, CHAT_LIMITS } from './minimax.js';
 import { sanitizeUserInput, containsPromptInjection, isOutOfScope } from './sanitize.js';
-import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, extractMotorcycleFromQuery, buildSearchQuery, type CatalogHit } from './catalog.js';
+import { getCatalogContext, getGarageContext, getGarageEntries, getRecentOrdersContext, extractMotorcycleFromQuery, buildSearchQuery, cardsFor } from './catalog.js';
 import { ORDER_TIERS, MAX_EXTRA_DISCOUNT_PERCENT } from '../lib/order-pricing.js';
 import { pool } from '../db.js';
 import { supportStatus, type SupportStatus } from '../lib/live-chat.js';
@@ -68,7 +68,7 @@ function humanSupportRules(status: SupportStatus): string {
   return `ATENCIÓN HUMANA: ahora no hay asesores conectados. Horario del chat con asesor: ${status.hoursText}.${status.nextOpen ? ` Volvemos ${status.nextOpen}.` : ''} Si no puedes resolver la consulta o pide hablar con una persona, explícale el horario y ofrécele dejar aquí su mensaje: un asesor le responderá en cuanto se conecte y le avisaremos con una notificación y por email. En ese caso termina tu respuesta con la marca [[MENSAJE]] (verá un botón para dejarlo).`;
 }
 
-function buildSystemPrompt(userContext: string, catalogContext: string, ordersContext: string, policies: string, webSearchText = '', humanRules = ''): string {
+export function buildSystemPrompt(userContext: string, catalogContext: string, ordersContext: string, policies: string, webSearchText = '', humanRules = ''): string {
   return `Eres el asistente de Escapes y Más (escapesymas.com), tienda online española de recambios, accesorios y equipamiento para moto. Hablas en español de España, con un tono cercano y profesional.
 
 ALCANCE: catálogo y compatibilidades, datos técnicos de motos, pedidos, envíos, pagos, devoluciones, garantía y uso de la web. Para cualquier otro tema responde EXACTAMENTE: "Lo siento, solo puedo ayudarte con temas de Escapes y Más (catálogo, pedidos o soporte web). ¿En qué producto o pedido te echo una mano?"
@@ -88,7 +88,7 @@ ${catalogContext}
 CÓMO RESPONDER:
 - Escribe siempre en español, sin palabras en otros idiomas ni caracteres chinos.
 - Breve: 2-4 frases, o una lista corta si comparas productos. Texto plano: sin títulos (#) ni tablas; como mucho **negritas** y guiones para listas.
-- No muestres referencias (SKU) ni enlaces: debajo de tu respuesta el cliente ve tarjetas con esos productos, su precio y el botón de añadir al carrito.
+- No muestres referencias (SKU) ni enlaces. Debajo de tu respuesta el cliente verá tarjetas (foto, precio y botón de añadir al carrito) SOLO de los productos que elijas: termina SIEMPRE con una línea aparte [[PRODUCTOS: P1, P3]] con los que recomiendas o mencionas (como mucho 4, el que mejor encaja primero), o [[PRODUCTOS: ninguno]] si no recomiendas ninguno. Nunca elijas uno que no sea del tipo que pide ni, si conoces su moto, uno que no sea compatible con ella.
 - Productos, precios y stock: solo los de la lista de arriba, con el precio que figura. Si un producto pone «sin stock», di que ahora mismo está agotado; nunca lo describas como disponible.
 - Las piezas cambian según el año de la moto. Los marcados [COMPATIBLE VERIFICADO CON moto (año)] son compatibles con esa moto y año: confírmalo sin rodeos. Los marcados [COMPATIBLE CON moto DE años] solo valen para esos años: díselos y, si no sabes el año de su moto, pregúntaselo antes de recomendar uno.
 - Si la lista indica que no hay productos, dilo con naturalidad, no ofrezcas piezas de otra moto y pide más datos (marca, modelo y año de la moto, tipo de pieza). Di «ahora mismo no lo tenemos», nunca «no trabajamos esa marca».
@@ -133,6 +133,8 @@ function stripThinking(text: string): string {
 
 const ADVISOR_RE = /\[\[\s*(ASESOR|MENSAJE)\s*\]\]/i;
 const ADVISOR_RE_G = /\s*\[\[\s*(ASESOR|MENSAJE)\s*\]\]\s*/gi;
+// Productos que elige el asistente para las tarjetas («[[PRODUCTOS: P1, P3]]»): no se muestra.
+const PRODUCTS_RE = /\s*\[\[\s*PRODUCTOS\s*:([^\]]*)\]\]\s*/i;
 const ASKS_HUMAN_RE = /\b(hablar|habla|contactar|pasar|atender|atienda|llamar|chatear)\b.{0,30}\b(persona|humano|humana|asesor|asesora|agente|alguien|empleado|operador|operadora|encargado|dependiente|vendedor)\b|\b(asesor|persona real|humano)\b\s*[?!.]*$/i;
 const CJK_RE = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]+/g;
 
@@ -250,23 +252,6 @@ export async function chatHandler(req: Request, res: Response) {
 
     startStream();
 
-    // Tarjetas primero (aparecen mientras se escribe la respuesta): las que hay
-    // en stock y, si no hay ninguna, hasta dos agotadas para que se vean.
-    const inStock = catalog.hits.filter((h) => (h.stock || 0) > 0);
-    const cards = (inStock.length > 0 ? inStock.slice(0, 4) : catalog.hits.slice(0, 2)).map((hit: CatalogHit) => ({
-      id: hit.id,
-      sku: hit.sku,
-      name: hit.name,
-      brand: hit.brand,
-      price: hit.price,
-      sale_price: hit.sale_price,
-      stock: hit.stock,
-      image: hit.image,
-      slug: hit.slug,
-      in_stock: (hit.stock || 0) > 0,
-    }));
-    if (cards.length > 0) send({ products: cards });
-
     // reasoning_split: MiniMax manda el razonamiento aparte y el texto llega
     // limpio, así que se reenvía según se genera. Si aun así llegara un
     // <think>…</think> al principio, se descarta.
@@ -286,6 +271,15 @@ export async function chatHandler(req: Request, res: Response) {
     let offerHuman = ASKS_HUMAN_RE.test(cleanInput);
     let sentText = '';
     let finishReason: string | null = null;
+    // Lo que elige el asistente para las tarjetas (null si no pone la marca).
+    let chosen: string | null = null;
+    const takeMarkers = (text: string) => {
+      let out = text;
+      if (ADVISOR_RE.test(out)) { offerHuman = true; out = out.replace(ADVISOR_RE_G, ''); }
+      const m = out.match(PRODUCTS_RE);
+      if (m) { chosen = m[1]; out = out.replace(PRODUCTS_RE, ''); }
+      return out;
+    };
     for await (const chunk of stream as any) {
       const choice = chunk.choices?.[0];
       if (choice?.finish_reason) finishReason = choice.finish_reason;
@@ -306,22 +300,21 @@ export async function chatHandler(req: Request, res: Response) {
         if (!pending) continue;
         started = true;
       }
-      // La marca [[ASESOR]] no se muestra: activa el botón de hablar con un asesor.
-      // Un posible comienzo de marca al final se guarda hasta el siguiente trozo.
-      let out = pending;
-      if (ADVISOR_RE.test(out)) { offerHuman = true; out = out.replace(ADVISOR_RE_G, ''); }
-      const open = out.lastIndexOf('[');
-      if (open !== -1 && open >= out.length - 11 && !out.slice(open).includes(']')) {
-        pending = out.slice(open);
-        out = out.slice(0, open);
+      // Las marcas [[ASESOR]] y [[PRODUCTOS: …]] no se muestran. Una marca a medias al final se guarda
+      // hasta el siguiente trozo.
+      let out = takeMarkers(pending);
+      const open = out.lastIndexOf('[[');
+      const hold = open !== -1 && !out.slice(open).includes(']]') ? open : out.endsWith('[') ? out.length - 1 : -1;
+      if (hold !== -1) {
+        pending = out.slice(hold);
+        out = out.slice(0, hold);
       } else {
         pending = '';
       }
       if (out) { send({ delta: out }); sentText += out; }
     }
     if (pending) {
-      let rest = started ? pending : stripThinking(pending);
-      if (ADVISOR_RE.test(rest)) { offerHuman = true; rest = rest.replace(ADVISOR_RE_G, ''); }
+      const rest = takeMarkers(started ? pending : stripThinking(pending)).replace(/\[\[[^\]]*$/, '');
       if (rest.trim()) { send({ delta: rest }); sentText += rest; }
     }
     if (!sentText.trim()) {
@@ -331,6 +324,12 @@ export async function chatHandler(req: Request, res: Response) {
       send({ delta: '…' });
     }
 
+    // Tarjetas al final, solo de los productos que ha elegido el asistente para su respuesta (antes salían
+    // antes de responder y a veces contradecían lo que decía).
+    const picked = cardsFor(catalog.hits, chosen);
+    if (picked.length > 0) send({ products: picked });
+    if (chosen === null && catalog.hits.length) console.warn('[chatbot] respuesta sin [[PRODUCTOS]]: sin tarjetas');
+
     // Con asesor disponible, botón «Hablar con un asesor»; sin él, «Dejar un mensaje».
     if (offerHuman && support?.available) send({ offerHuman: true, agentName: support.agentName });
     else if (offerHuman && support && support.mode !== 'off') send({ offerMessage: true, hoursText: support.hoursText, nextOpen: support.nextOpen });
@@ -338,7 +337,7 @@ export async function chatHandler(req: Request, res: Response) {
     send({ done: true });
     res.end();
     logAiTurn(sessionKey, user.user_id, {
-      question: cleanInput, answer: sentText, products: cards.map((c) => c.sku).filter(Boolean), offeredHuman: offerHuman,
+      question: cleanInput, answer: sentText, products: picked.map((c) => c.sku).filter(Boolean), offeredHuman: offerHuman,
     });
     logRequest(user, cleanInput, 'ok', `${offerHuman && support?.available ? 'asesor ' : ''}chars=${sentText.length} hits=${catalog.hits.length}${finishReason === 'length' ? ' cortada' : ''}`);
   } catch (err: any) {

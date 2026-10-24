@@ -16,6 +16,8 @@ export interface CatalogHit {
   compatibility: any;
   category2: string | null;
   category3: string | null;
+  /** Posición del atributo «Posición» de la ficha (Delantero, Trasero…), si la tiene. */
+  position: string | null;
 }
 
 export interface CatalogContextResult {
@@ -76,15 +78,47 @@ function mapHit(row: any): CatalogHit {
     compatibility: row.compatibility,
     category2: row.category2,
     category3: row.category3,
+    position: row.position || null,
   };
 }
 
-function formatHitText(p: CatalogHit, tag = ''): string {
+/** Línea del producto para el asistente; `n` es su número (P1, P2…) para elegir las tarjetas. */
+function formatHitText(p: CatalogHit, tag = '', n = 0): string {
   const priceStr = p.sale_price
     ? `${(p.sale_price / 100).toFixed(2)}€ (antes ${(p.price / 100).toFixed(2)}€)`
     : `${(p.price / 100).toFixed(2)}€`;
   const stockStr = (p.stock || 0) > 0 ? `stock: ${p.stock}` : 'sin stock';
-  return `- ${tag ? `${tag} ` : ''}${p.sku} | ${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}`;
+  return `- ${n ? `P${n} ` : ''}${tag ? `${tag} ` : ''}${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}${p.position ? ` | posición: ${p.position}` : ''}`;
+}
+
+// Posición que pide el cliente («pastillas delanteras»). No va en la búsqueda: los nombres casi nunca la llevan
+// y, si se exige, no sale nada y el asistente acaba diciendo que no hay.
+const POSITION_RE = /\b(delanter[oa]s?|delante|traser[oa]s?|detras|izquierd[oa]s?|derech[oa]s?)\b/g;
+const POSITION_ROOT: Array<[RegExp, string, RegExp]> = [
+  [/^delant/, 'delantera', /delant/], [/^(tras|detras)/, 'trasera', /tras/],
+  [/^izquierd/, 'izquierda', /izquierd/], [/^derech/, 'derecha', /derech/],
+];
+
+/** Posiciones pedidas (delantera, trasera…) y el texto de búsqueda sin ellas. */
+export function splitPosition(search: string): { search: string; positions: string[] } {
+  const positions = new Set<string>();
+  const rest = search.replace(POSITION_RE, (w) => {
+    const hit = POSITION_ROOT.find(([re]) => re.test(w));
+    if (hit) positions.add(hit[1]);
+    return ' ';
+  });
+  return { search: rest.replace(/\s+/g, ' ').trim(), positions: [...positions] };
+}
+
+/** ¿La posición de la ficha contradice la pedida? (sin posición en la ficha, no se sabe: no contradice). */
+export function contradictsPosition(position: string | null, wanted: string[]): boolean {
+  if (!position || !wanted.length) return false;
+  const pos = normalizeText(position);
+  return wanted.some((w) => {
+    const [, , mine] = POSITION_ROOT.find(([, name]) => name === w)!;
+    const others = POSITION_ROOT.filter(([, name]) => name !== w && (w === 'delantera' || w === 'trasera' ? ['delantera', 'trasera'] : ['izquierda', 'derecha']).includes(name));
+    return !mine.test(pos) && others.some(([, , re]) => re.test(pos));
+  });
 }
 
 /** «MT-07» → /(^|[^A-Z0-9])MT[\s-]?07(?![A-Z0-9])/: no confunde la Z900 con la Z900RS. */
@@ -195,7 +229,7 @@ async function searchLikeWeb(search: string, perPage = 12): Promise<CatalogHit[]
     const ids = res.rows.map((r) => r.rep_id);
     const { rows } = await pool.query(
       `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, stock_status,
-              images, compatibility, category2, category3
+              images, compatibility, category2, category3, attributes->>'Posición' AS position
        FROM products WHERE id = ANY($1::int[])`,
       [ids]
     );
@@ -419,8 +453,10 @@ export async function getCatalogContext(
   query: string,
   garageEntries: string[] = []
 ): Promise<CatalogContextResult> {
-  let base = productSearchText(query);
-  if (productTerms(query).length === 0) {
+  const split = splitPosition(productSearchText(query));
+  let base = split.search;
+  const positions = split.positions;
+  if (productTerms(query).length === 0 || !base) {
     return { hits: [], text: await catalogSummary() };
   }
 
@@ -445,7 +481,7 @@ export async function getCatalogContext(
 
   // Con moto se piden más modelos: después se quitan los que no le valen por año.
   const run = async (search: string, m: GarageMotorcycle | null) => {
-    const found = await searchLikeWeb(search, m ? 36 : 12);
+    const found = (await searchLikeWeb(search, m ? 36 : 12)).filter((h) => !contradictsPosition(h.position, positions));
     return m ? filterByMoto(found, m) : found.map((hit) => ({ hit, tag: '' }));
   };
 
@@ -508,11 +544,38 @@ export async function getCatalogContext(
   if (moto && !moto.year) {
     notes.push('NO SABEMOS EL AÑO DE LA MOTO: indica los años compatibles de cada producto y pregúntale el año para confirmar.');
   }
+  if (positions.length) {
+    const p = positions.join(' y ');
+    notes.push(`Pide la posición «${p}». Los nombres no suelen indicarla: si un producto lleva «posición:», esa es la suya; ` +
+      `el resto son compatibles con su moto y la posición se confirma en la ficha. No digas que no tenemos «${p}» si hay productos compatibles.`);
+  }
   if (shown.some((x) => !x.tag) && moto) {
     notes.push('Los productos sin etiqueta de compatibilidad no tienen datos de compatibilidad: dilo y recomienda comprobar la medida o la referencia original.');
   }
-  const text = [...notes, ...shown.map(({ hit, tag }) => formatHitText(hit, tag))].join('\n');
+  const text = [...notes, ...shown.map(({ hit, tag }, i) => formatHitText(hit, tag, i + 1))].join('\n');
   return { hits: shown.map((x) => x.hit), text };
+}
+
+/** Tarjetas de los productos elegidos («P1, P3» → los de esa posición en la lista que vio el asistente). */
+export function cardsFor(hits: CatalogHit[], chosen: string | null) {
+  if (!chosen) return [];
+  const seen = new Set<number>();
+  return [...chosen.matchAll(/P\s*(\d+)/gi)]
+    .map((m) => hits[parseInt(m[1], 10) - 1])
+    .filter((hit): hit is CatalogHit => !!hit && !seen.has(hit.id) && !!seen.add(hit.id))
+    .slice(0, 4)
+    .map((hit) => ({
+      id: hit.id,
+      sku: hit.sku,
+      name: hit.name,
+      brand: hit.brand,
+      price: hit.price,
+      sale_price: hit.sale_price,
+      stock: hit.stock,
+      image: hit.image,
+      slug: hit.slug,
+      in_stock: (hit.stock || 0) > 0,
+    }));
 }
 
 export interface GarageEntry {
