@@ -629,6 +629,9 @@ export async function getCatalogContext(
         notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos y pídele más detalles o que escriba a info@escapesymas.com.`);
       }
     }
+    // Si antes habló de otra moto, la respuesta es solo para esta (sin la lista de la otra decía que «no había»).
+    notes.unshift(`MOTO DE ESTA RESPUESTA: ${fullName}. Los productos de abajo son solo para ella: responde solo sobre esta moto y no digas nada ` +
+      `de otras motos de la conversación (no tienes sus productos aquí; si pregunta por otra, se buscará en su momento).`);
     if (found.length && moto.from === 'garaje') {
       notes.push(`Resultados para su moto ${fullName} (la elegida en la web o la primera de su garaje).`);
       if (garageEntries.length > 1) notes.push(`Tiene más motos guardadas (${garageEntries.slice(1, 4).join(', ')}): menciona para cuál son y ofrece buscar para otra.`);
