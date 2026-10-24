@@ -48,7 +48,7 @@ export async function storePolicies(): Promise<string> {
   const text = `DATOS DE LA TIENDA (úsalos tal cual, no inventes otros):
 - ${shipping}
 - Descuento automático por importe del pedido: ${tiers}. Se aplica solo en el carrito. Sumando cupones, el descuento del carrito es como máximo del ${MAX_EXTRA_DISCOUNT_PERCENT} %.
-- Los pedidos se preparan en 24-72 horas hábiles tras el pago; los plazos de entrega son orientativos.
+- Los pedidos se preparan en 24-72 horas hábiles tras el pago. Entrega estimada: 5-10 días laborables en España y 6-12 en el resto de la UE (orientativa). No prometas plazos más cortos.
 - Pago seguro con Stripe: tarjeta (Visa, Mastercard, American Express), Bizum y Klarna (a plazos).
 - Canarias, Ceuta y Melilla: sin IVA español (pueden aplicar impuestos locales al recibirlo).
 - Devoluciones: 14 días naturales desde la recepción, producto sin usar ni montar y en su embalaje original. El envío de la devolución lo paga el cliente salvo defecto o error nuestro. No se admiten líquidos/lubricantes desprecintados, interiores de casco ni recambios eléctricos desprecintados. Reembolso en 14 días por el mismo método de pago.

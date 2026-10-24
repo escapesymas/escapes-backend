@@ -368,7 +368,7 @@ chatToolsRouter.post('/admin/chats/:id/suggest', async (req: any, res: any) => {
       `Eres ${name}, asesor de Escapes y Más (escapesymas.com), tienda online española de recambios y accesorios de moto. ` +
       'Propón la siguiente respuesta del asesor al cliente: breve (1-3 frases), cercana y profesional, en español de España, sin markdown. ' +
       'No inventes precios, stock ni plazos; si hacen falta datos, pídeselos al cliente. Datos fijos: envío 19,99 € (gratis desde 200 €), ' +
-      'preparación en 24-72 h hábiles, devolución en 14 días, garantía de 3 años.',
+      'preparación en 24-72 h hábiles, entrega en 5-10 días laborables en España (6-12 en el resto de la UE), devolución en 14 días, garantía de 3 años.',
       `Conversación:\n${text}\n\nEscribe solo la respuesta del asesor.`, 500);
     if (!suggestion) return res.status(502).json({ error: 'No se pudo sugerir una respuesta' });
     res.json({ suggestion });
