@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../db.js', () => ({ pool: { query: vi.fn(async () => ({ rows: [] })) } }));
 
-const { splitPosition, contradictsPosition, cardsFor } = await import('./catalog.js');
+const { splitPosition, contradictsPosition, cardsFor, spaceModel } = await import('./catalog.js');
 
 describe('posición pedida', () => {
   it('se saca de la búsqueda (los nombres no la llevan)', () => {
@@ -18,6 +18,14 @@ describe('posición pedida', () => {
     expect(contradictsPosition(null, ['delantera'])).toBe(false);
     expect(contradictsPosition('Derecho', ['delantera'])).toBe(false);
     expect(contradictsPosition('Izquierda', ['derecha'])).toBe(true);
+  });
+});
+
+describe('modelo escrito junto', () => {
+  it('se separa como en las compatibilidades', () => {
+    expect(spaceModel('kit de arrastre honda cb500f', 'CB500F')).toBe('kit de arrastre honda cb 500 f');
+    expect(spaceModel('pastillas honda pcx 125', 'PCX 125')).toBe('pastillas honda pcx 125');
+    expect(spaceModel('kit 520 honda', undefined)).toBe('kit 520 honda');
   });
 });
 

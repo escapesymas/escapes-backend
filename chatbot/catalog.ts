@@ -99,6 +99,16 @@ const POSITION_ROOT: Array<[RegExp, string, RegExp]> = [
   [/^izquierd/, 'izquierda', /izquierd/], [/^derech/, 'derecha', /derech/],
 ];
 
+/**
+ * El modelo escrito junto («cb500f») no casa con las compatibilidades, que lo guardan separado («CB 500 F»):
+ * devuelve la búsqueda con ese modelo separado (o igual si no hace falta).
+ */
+export function spaceModel(search: string, model?: string): string {
+  const compact = normalizeText(model || '').replace(/[^a-z0-9]/g, '');
+  if (!/^[a-z]+\d+[a-z]*$/.test(compact)) return search;
+  return search.replace(/\b[a-z]+\d+[a-z]*\b/g, (tok) => (tok === compact ? tok.match(/[a-z]+|\d+/g)!.join(' ') : tok));
+}
+
 /** Posiciones pedidas (delantera, trasera…) y el texto de búsqueda sin ellas. */
 export function splitPosition(search: string): { search: string; positions: string[] } {
   const positions = new Set<string>();
@@ -474,10 +484,15 @@ export async function getCatalogContext(
   // Sin moto en la consulta, primero se prueba con la del garaje («pastillas de
   // freno» → las de su MT-07) y si no hay nada, sin moto (un casco no depende de ella).
   const attempts: { search: string; moto: GarageMotorcycle | null }[] = [];
+  const withSpaced = (search: string, model: string | undefined, m: GarageMotorcycle | null) => {
+    attempts.push({ search, moto: m });
+    const spaced = spaceModel(search, model);
+    if (spaced !== search) attempts.push({ search: spaced, moto: m });
+  };
   if (garageMoto) {
-    attempts.push({ search: `${base} ${productSearchText(`${garageMoto.brand} ${garageMoto.model}`)}`, moto: garageMoto });
+    withSpaced(`${base} ${productSearchText(`${garageMoto.brand} ${garageMoto.model}`)}`, garageMoto.model, garageMoto);
   }
-  attempts.push({ search: base, moto: queryMoto });
+  withSpaced(base, parsed?.model, queryMoto);
 
   // Con moto se piden más modelos: después se quitan los que no le valen por año.
   const run = async (search: string, m: GarageMotorcycle | null) => {
@@ -547,7 +562,8 @@ export async function getCatalogContext(
   if (positions.length) {
     const p = positions.join(' y ');
     notes.push(`Pide la posición «${p}». Los nombres no suelen indicarla: si un producto lleva «posición:», esa es la suya; ` +
-      `el resto son compatibles con su moto y la posición se confirma en la ficha. No digas que no tenemos «${p}» si hay productos compatibles.`);
+      `el resto son compatibles con su moto, pero no afirmes su posición si no la dice el nombre: di que la ficha la confirma. ` +
+      `No digas que no tenemos «${p}» si hay productos compatibles.`);
   }
   if (shown.some((x) => !x.tag) && moto) {
     notes.push('Los productos sin etiqueta de compatibilidad no tienen datos de compatibilidad: dilo y recomienda comprobar la medida o la referencia original.');
