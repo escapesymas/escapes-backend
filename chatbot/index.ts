@@ -136,7 +136,8 @@ const ADVISOR_RE_G = /\s*\[\[\s*(ASESOR|MENSAJE)\s*\]\]\s*/gi;
 // Productos que elige el asistente para las tarjetas («[[PRODUCTOS: P1, P3]]»): no se muestra.
 const PRODUCTS_RE = /\s*\[\[\s*PRODUCTOS\s*:([^\]]*)\]\]\s*/i;
 const ASKS_HUMAN_RE = /\b(hablar|habla|contactar|pasar|atender|atienda|llamar|chatear)\b.{0,30}\b(persona|humano|humana|asesor|asesora|agente|alguien|empleado|operador|operadora|encargado|dependiente|vendedor)\b|\b(asesor|persona real|humano)\b\s*[?!.]*$/i;
-const CJK_RE = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]+/g;
+const CJK_RE = /[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]+/g;
+const CJK_ANY_RE = /[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]/;
 
 const recentByUser = new Map<number, number[]>();
 const PER_USER_LIMIT_MS = 10 * 60 * 1000;
@@ -252,83 +253,45 @@ export async function chatHandler(req: Request, res: Response) {
 
     startStream();
 
-    // reasoning_split: MiniMax manda el razonamiento aparte y el texto llega
-    // limpio, así que se reenvía según se genera. Si aun así llegara un
-    // <think>…</think> al principio, se descarta.
-    const stream = await minimaxClient.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: finalMessages as any,
-      max_tokens: CHAT_LIMITS.maxTokens,
-      temperature: CHAT_LIMITS.temperature,
-      top_p: CHAT_LIMITS.topP,
-      stream: true,
-      reasoning_split: true,
-    } as any);
-
-    let pending = '';
-    let started = false;
+    // La respuesta se genera entera y se revisa antes de enviarla: MiniMax a veces escribe trozos en chino y,
+    // quitándolos sobre la marcha, la frase quedaba rota («(2022)。**TECNIUM MA359Orgánicas**»). Si trae chino,
+    // está vacía o se corta, se repite (como mucho 3 veces). reasoning_split deja el razonamiento aparte.
     // Si pide una persona expresamente, se le ofrece aunque el modelo no ponga la marca.
     let offerHuman = ASKS_HUMAN_RE.test(cleanInput);
-    let sentText = '';
     let finishReason: string | null = null;
-    // Lo que elige el asistente para las tarjetas (null si no pone la marca).
+    let raw = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r: any = await minimaxClient.chat.completions.create({
+        model: CHAT_MODEL,
+        messages: finalMessages as any,
+        max_tokens: CHAT_LIMITS.maxTokens,
+        temperature: CHAT_LIMITS.temperature,
+        top_p: CHAT_LIMITS.topP,
+        reasoning_split: true,
+      } as any);
+      finishReason = r.choices?.[0]?.finish_reason || null;
+      const content = String(r.choices?.[0]?.message?.content || '');
+      raw = /think/i.test(content) ? stripThinking(content) : content;
+      if (raw.trim() && !CJK_ANY_RE.test(raw) && finishReason !== 'length') break;
+      console.warn(`[chatbot] respuesta descartada (${!raw.trim() ? 'vacía' : CJK_ANY_RE.test(raw) ? 'con chino' : 'cortada'}), intento ${attempt + 1}`);
+    }
+    // Último recurso si sigue trayendo chino: se quita y se arregla la puntuación china.
+    raw = raw.replace(/。/g, '. ').replace(/，/g, ', ').replace(/：/g, ': ').replace(CJK_RE, '').replace(/[ \t]{2,}/g, ' ');
+
+    // Las marcas [[ASESOR]] y [[PRODUCTOS: …]] no se muestran.
     let chosen: string | null = null;
-    const takeMarkers = (text: string) => {
-      let out = text;
-      if (ADVISOR_RE.test(out)) { offerHuman = true; out = out.replace(ADVISOR_RE_G, ''); }
-      const m = out.match(PRODUCTS_RE);
-      if (m) { chosen = m[1]; out = out.replace(PRODUCTS_RE, ''); }
-      return out;
-    };
-    for await (const chunk of stream as any) {
-      const choice = chunk.choices?.[0];
-      if (choice?.finish_reason) finishReason = choice.finish_reason;
-      // MiniMax a veces cuela palabras en chino («materiales复合材料»): se quitan.
-      const piece = choice?.delta?.content?.replace(CJK_RE, '');
-      if (!piece) continue;
-      pending += piece;
-      if (!started) {
-        const head = pending.trimStart();
-        if (head.startsWith('<think')) {
-          const end = pending.indexOf('</think>');
-          if (end === -1) continue;
-          pending = pending.slice(end + '</think>'.length);
-        } else if ('<think>'.startsWith(head)) {
-          continue; // podría ser el comienzo de la etiqueta
-        }
-        pending = pending.replace(/^\s+/, '');
-        if (!pending) continue;
-        started = true;
-      }
-      // Las marcas [[ASESOR]] y [[PRODUCTOS: …]] no se muestran. Una marca a medias al final se guarda
-      // hasta el siguiente trozo.
-      let out = takeMarkers(pending);
-      const open = out.lastIndexOf('[[');
-      const hold = open !== -1 && !out.slice(open).includes(']]') ? open : out.endsWith('[') ? out.length - 1 : -1;
-      if (hold !== -1) {
-        pending = out.slice(hold);
-        out = out.slice(0, hold);
-      } else {
-        pending = '';
-      }
-      if (out) { send({ delta: out }); sentText += out; }
-    }
-    if (pending) {
-      const rest = takeMarkers(started ? pending : stripThinking(pending)).replace(/\[\[[^\]]*$/, '');
-      if (rest.trim()) { send({ delta: rest }); sentText += rest; }
-    }
-    if (!sentText.trim()) {
-      sentText = 'Perdona, no he podido preparar la respuesta. ¿Me lo repites con otras palabras?';
-      send({ delta: sentText });
-    } else if (finishReason === 'length') {
-      send({ delta: '…' });
-    }
+    if (ADVISOR_RE.test(raw)) { offerHuman = true; raw = raw.replace(ADVISOR_RE_G, ' '); }
+    const marker = raw.match(PRODUCTS_RE);
+    if (marker) { chosen = marker[1]; raw = raw.replace(PRODUCTS_RE, ' '); }
+    let sentText = raw.replace(/\[\[[^\]]*(\]\])?/g, '').trim();
+    if (!sentText) sentText = 'Perdona, no he podido preparar la respuesta. ¿Me lo repites con otras palabras?';
+    send({ delta: sentText });
 
     // Tarjetas al final, solo de los productos que ha elegido el asistente para su respuesta (antes salían
     // antes de responder y a veces contradecían lo que decía).
     const picked = cardsFor(catalog.hits, chosen, sentText);
     if (picked.length > 0) send({ products: picked });
-    if (chosen === null && catalog.hits.length) console.warn(`[chatbot] respuesta sin [[PRODUCTOS]]${finishReason === 'length' ? ' (cortada)' : ''}: ${picked.length} tarjetas por las referencias nombradas`);
+    if (chosen === null && catalog.hits.length) console.warn(`[chatbot] respuesta sin [[PRODUCTOS]]: ${picked.length} tarjetas por las referencias nombradas`);
     else if (chosen && !picked.length && !/ningun/i.test(chosen)) console.warn('[chatbot] [[PRODUCTOS]] sin productos reconocibles:', JSON.stringify(chosen).slice(0, 120));
 
     // Con asesor disponible, botón «Hablar con un asesor»; sin él, «Dejar un mensaje».

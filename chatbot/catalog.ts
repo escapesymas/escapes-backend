@@ -1,5 +1,6 @@
 import { pool } from '../db.js';
 import { listFamilies, normalizeText, searchTerms } from '../lib/catalog-query.js';
+import { getCatalogData } from '../lib/moto-catalog.js';
 import { formatOrderNumber, eur } from '../lib/email-templates.js';
 
 export interface CatalogHit {
@@ -124,6 +125,74 @@ export function garageMotoNamed(text: string, motos: GarageMotorcycle[]): Garage
     }
   }
   return best;
+}
+
+// Palabras de modelo que también son palabras corrientes o de producto: no sirven para reconocer la moto.
+const NOT_MODEL_WORDS = new Set(['para', 'moto', 'motos', 'kit', 'super', 'sport', 'classic', 'custom', 'street', 'touring',
+  'adventure', 'racing', 'special', 'deluxe', 'limited', 'scooter', 'enduro', 'cross', 'trail', 'naked', 'rally', 'city',
+  'basic', 'edition', 'plus', 'pastillas', 'pastilla', 'freno', 'frenos', 'filtro', 'aceite', 'cadena', 'escape', 'casco',
+  'delantera', 'delanteras', 'trasera', 'traseras', 'universal', 'tour', 'turismo', 'falcon', 'tiger', 'monster', 'scrambler']);
+
+let modelIndex: Map<string, Array<{ brand: string; model: string }>> | null = null;
+const compact = (s: string) => normalizeText(s).replace(/[^a-z0-9]/g, '');
+
+/**
+ * Índice del catálogo de motos (el del selector de la web): primera palabra del modelo y modelo entero, juntos
+ * («mt09», «tenere», «pcx», «pcx125») → motos que lo usan.
+ */
+function motoModelIndex() {
+  if (modelIndex) return modelIndex;
+  modelIndex = new Map();
+  const hierarchy = getCatalogData()?.hierarchy || {};
+  for (const [brand, models] of Object.entries<any>(hierarchy)) {
+    for (const model of Object.keys(models || {})) {
+      const first = compact(model.split(/\s+/)[0] || '');
+      const keys = new Set([compact(model), first]);
+      for (const k of keys) {
+        if (k.length < 3 || /^\d+$/.test(k) || NOT_MODEL_WORDS.has(k)) continue;
+        if (!/\d/.test(k) && k.length < 5) continue; // palabras cortas sin cifras: demasiado ambiguas
+        const list = modelIndex.get(k) || [];
+        list.push({ brand, model });
+        modelIndex.set(k, list);
+      }
+    }
+  }
+  return modelIndex;
+}
+
+/** Año de moto que aparece en el texto (el último). */
+export function yearIn(text: string): number | null {
+  const all = [...String(text).matchAll(/\b(19[5-9]\d|20[0-4]\d)\b/g)];
+  return all.length ? parseInt(all[all.length - 1][1], 10) : null;
+}
+
+/**
+ * Moto nombrada solo por su modelo («una mt09 de 2023», «una tenere de 2025»), con la marca del catálogo de
+ * motos. Si el modelo existe en varias marcas, no se adivina. Gana lo nombrado más tarde.
+ */
+export function catalogMotoIn(text: string): GarageMotorcycle | null {
+  const index = motoModelIndex();
+  const words = normalizeText(text).split(/[^a-z0-9]+/).filter(Boolean);
+  for (let i = words.length - 1; i >= 0; i--) {
+    for (const n of [3, 2, 1]) {
+      if (i - n + 1 < 0) continue;
+      const key = words.slice(i - n + 1, i + 1).join('');
+      const found = index.get(key);
+      if (!found) continue;
+      const brands = new Set(found.map((f) => f.brand));
+      if (brands.size !== 1) continue;
+      // El modelo que coincide entero; si no, el más corto (el básico: «TENERE 700» antes que «TENERE 700 RALLY»).
+      const exact = found.find((f) => compact(f.model) === key);
+      const pick = exact || [...found].sort((a, b) => a.model.length - b.model.length)[0];
+      return { brand: pick.brand.toUpperCase(), model: pick.model.toUpperCase(), year: yearIn(text) };
+    }
+  }
+  return null;
+}
+
+/** ¿La palabra es de la moto (marca, modelo o año) y no del producto? */
+function isMotoWord(w: string): boolean {
+  return /^(19[5-9]\d|20[0-4]\d)$/.test(w) || !!BRAND_ALIASES[w] || motoModelIndex().has(w);
 }
 
 /** Posiciones pedidas (delantera, trasera…) y el texto de búsqueda sin ellas. */
@@ -458,11 +527,21 @@ export function buildSearchQuery(userMessages: string[]): string {
   if (msgs.length === 0) return '';
   // Respuestas cortas encadenadas («es de 2022», «es honda», «¿y la trasera?») se
   // suman a la última petición de verdad (con al menos dos términos de producto).
-  const parts: string[] = [msgs[msgs.length - 1]];
-  if (productTerms(parts[0]).length <= 1) {
+  // Las palabras de la moto («mt09», «2023») no cuentan: «¿y para una mt09 de 2023?» sigue la petición anterior.
+  const itemTerms = (m: string) => {
+    const moto = extractMotorcycleFromQuery(m);
+    const own = new Set(moto ? searchTerms(`${moto.brand} ${moto.model}`) : []);
+    return productTerms(m).filter((w) => !isMotoWord(w) && !own.has(w));
+  };
+  const last = msgs[msgs.length - 1];
+  const lastMoto = extractMotorcycleFromQuery(last);
+  // Si el último mensaje nombra otra moto, de los anteriores solo se toma el producto (no su moto ni su año).
+  const lastHasMoto = !!(lastMoto?.brand || lastMoto?.model || catalogMotoIn(last));
+  const parts: string[] = [last];
+  if (itemTerms(last).length <= 1) {
     for (let i = msgs.length - 2; i >= Math.max(0, msgs.length - 6); i--) {
-      parts.unshift(msgs[i]);
-      if (productTerms(msgs[i]).length >= 2) break;
+      parts.unshift(lastHasMoto ? itemTerms(msgs[i]).join(' ') : msgs[i]);
+      if (itemTerms(msgs[i]).length >= 2) break;
     }
   }
   let query = parts.join(' ');
@@ -503,6 +582,8 @@ export async function getCatalogContext(
     const own = garageMotoNamed(query, garageMotos);
     if (own) queryMoto = { ...own, year: parsed?.year ?? own.year };
   }
+  // «¿Y para una mt09 de 2023?»: modelo sin marca que está en el catálogo de motos de la web.
+  if (!queryMoto) queryMoto = catalogMotoIn(query);
   // El año de la moto no está en el texto de búsqueda (se filtra después con la
   // compatibilidad): «pastillas mt-07 2019» buscaría «2019» y no daría nada.
   if (queryMoto?.year) base = base.replace(new RegExp(`\\b${queryMoto.year}\\b`, 'g'), ' ').replace(/\s+/g, ' ').trim();

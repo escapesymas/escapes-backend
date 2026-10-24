@@ -1,8 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../db.js', () => ({ pool: { query: vi.fn(async () => ({ rows: [] })) } }));
+vi.mock('../lib/moto-catalog.js', () => ({ getCatalogData: () => ({ hierarchy: {
+  YAMAHA: { 'MT-09': {}, 'MT-09 SP': {}, 'TENERE 700': {}, 'TENERE 700 RALLY': {} },
+  HONDA: { 'PCX 125': {}, 'CB 500 F': {} },
+} }) }));
 
-const { splitPosition, contradictsPosition, cardsFor, spaceModel, garageMotoNamed } = await import('./catalog.js');
+const { splitPosition, contradictsPosition, cardsFor, spaceModel, garageMotoNamed, catalogMotoIn, buildSearchQuery } = await import('./catalog.js');
 
 describe('posición pedida', () => {
   it('se saca de la búsqueda (los nombres no la llevan)', () => {
@@ -35,6 +39,19 @@ describe('moto del garaje nombrada', () => {
     expect(garageMotoNamed('Pastillas de freno para mi moto Delanteras Y para mi pcx', motos)?.model).toBe('PCX 125');
     expect(garageMotoNamed('para la amico y luego la PCX', motos)?.model).toBe('PCX 125');
     expect(garageMotoNamed('pastillas delanteras', motos)).toBeNull();
+  });
+});
+
+describe('moto nombrada solo por el modelo', () => {
+  it('se reconoce con el catálogo de motos y su año', () => {
+    expect(catalogMotoIn('Y para una mt09 de 2023?')).toEqual({ brand: 'YAMAHA', model: 'MT-09', year: 2023 });
+    expect(catalogMotoIn('Y para una tenere de 2025?')).toEqual({ brand: 'YAMAHA', model: 'TENERE 700', year: 2025 });
+    expect(catalogMotoIn('pastillas de freno delanteras')).toBeNull();
+  });
+  it('una pregunta de seguimiento con otra moto mantiene el producto y cambia de moto', () => {
+    expect(buildSearchQuery(['Pastillas de freno para mi moto', 'Y para una mt09 de 2023?'])).toBe('pastillas freno Y para una mt09 de 2023?');
+    expect(buildSearchQuery(['pastillas de freno honda pcx 125 2022', 'Y para una tenere de 2025?'])).toBe('pastillas freno Y para una tenere de 2025?');
+    expect(buildSearchQuery(['pastillas de freno honda pcx 125 2022', '¿y la trasera?'])).toBe('pastillas de freno honda pcx 125 2022 ¿y la trasera?');
   });
 });
 
