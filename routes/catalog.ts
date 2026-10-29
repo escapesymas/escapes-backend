@@ -11,6 +11,14 @@ import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
 import { getLiveStockValue } from '../bihrService.js';
 import { getCatalogData, compatibleSkus } from '../lib/moto-catalog.js';
+import {
+  resolveBrandSlug,
+  resolveModelSlug,
+  getMotoSeoDirectory,
+  buildRootCategoryMap,
+  classifyMotoProducts,
+  isPrimaryEscape,
+} from '../lib/moto-seo.js';
 import { tyreOptions } from '../lib/tyres.js';
 import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
 
@@ -384,6 +392,202 @@ catalogRouter.get('/catalog/sitemap-count', async (_req, res) => {
     res.set('Cache-Control', 'public, max-age=3600');
     res.json({ total: r.rows[0].total });
   } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+let rootCatMapCache: { expiresAt: number; map: Map<number, { id: number; name: string; slug: string }> } | null = null;
+async function getCachedRootCategoryMap() {
+  if (rootCatMapCache && rootCatMapCache.expiresAt > Date.now()) return rootCatMapCache.map;
+  const r = await pool.query<{ id: number; name: string; slug: string; parent_id: number | null }>(
+    `SELECT id, name, slug, parent_id FROM categories WHERE slug NOT LIKE 'old-%'`
+  );
+  const map = buildRootCategoryMap(r.rows);
+  rootCatMapCache = { expiresAt: Date.now() + 15 * 60_000, map };
+  return map;
+}
+
+// GET /api/catalog/sitemap-motos — solo marcas y modelos con productos compatibles publicados.
+catalogRouter.get('/catalog/sitemap-motos', async (_req, res) => {
+  try {
+    const dir = await getMotoSeoDirectory(pool);
+    const activeBrands = dir.brands
+      .filter((b) => b.activeModelCount > 0)
+      .map((b) => ({ slug: b.slug, escapeModelCount: b.escapeModelCount }));
+
+    const activeModels: { brandSlug: string; modelSlug: string; escapeCount: number }[] = [];
+    for (const b of activeBrands) {
+      const list = dir.modelsByBrandSlug[b.slug] || [];
+      for (const m of list) {
+        if (m.hasProducts) {
+          activeModels.push({ brandSlug: b.slug, modelSlug: m.slug, escapeCount: m.escapeCount });
+        }
+      }
+    }
+
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json({ brands: activeBrands, models: activeModels });
+  } catch (err: any) {
+    console.error('[SITEMAP MOTOS ERROR]:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/motos — portada de escapes y recambios por marca/modelo de moto.
+catalogRouter.get('/catalog/motos', async (_req, res) => {
+  try {
+    const dir = await getMotoSeoDirectory(pool);
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json({
+      totalActiveBrands: dir.totalActiveBrands,
+      totalActiveModels: dir.totalActiveModels,
+      totalEscapeModels: dir.totalEscapeModels,
+      totalEscapeProducts: dir.totalEscapeProducts,
+      brands: dir.brands.filter((b) => b.activeModelCount > 0),
+      featuredModels: dir.featuredModels,
+      topEscapeBrands: dir.topEscapeBrands,
+    });
+  } catch (err: any) {
+    console.error('[MOTOS DIRECTORY ERROR]:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/motos/:brandSlug — página de marca de moto con todos sus modelos y escapes destacados.
+catalogRouter.get('/catalog/motos/:brandSlug', async (req, res) => {
+  try {
+    const resolved = resolveBrandSlug(req.params.brandSlug);
+    if (!resolved) return res.status(404).json({ missing: true });
+    if (resolved.needsRedirect) return res.json({ redirectTo: resolved.canonicalPath });
+
+    const dir = await getMotoSeoDirectory(pool);
+    const brandEntry = dir.brands.find((b) => b.slug === resolved.node.slug);
+    const models = dir.modelsByBrandSlug[resolved.node.slug] || [];
+
+    const escCacheKey = `cache:moto-seo:brand-esc:v2:${resolved.node.slug}`;
+    let featuredEscapes = await cacheGet<any[]>(escCacheKey);
+    if (!featuredEscapes) {
+      const escRows = await pool.query(
+        `SELECT ${PRODUCT_CARD_COLUMNS}
+           FROM products
+          WHERE status = 'published' AND price > 0 AND stock > 0
+            AND (category_id IN (1007, 1000048, 1030) OR name ~* '\\m(escape|escapes|silencioso|silenciosos|silenciador|silenciadores|colector|colectores)\\M')
+            AND name !~* 'colector(es)?\\s+de\\s+admisi'
+            AND compatibility @> $1::jsonb
+          ORDER BY (category_id = 1007) DESC, price DESC
+          LIMIT 24`,
+        [JSON.stringify([{ brand: resolved.node.brand.toUpperCase() }])]
+      );
+      const grouped = groupCardsByFamily(escRows.rows);
+      const primary = grouped.filter((p) => isPrimaryEscape(p));
+      const rest = grouped.filter((p) => !isPrimaryEscape(p));
+      featuredEscapes = [...primary, ...rest].slice(0, 8);
+      await cacheSet(escCacheKey, featuredEscapes, 1800);
+    }
+
+    res.set('Cache-Control', 'public, max-age=1800');
+    res.json({
+      brand: brandEntry || {
+        brand: resolved.node.brand,
+        name: resolved.node.name,
+        slug: resolved.node.slug,
+        yearFrom: resolved.node.yearFrom,
+        yearTo: resolved.node.yearTo,
+        modelCount: models.length,
+        activeModelCount: models.filter((m) => m.hasProducts).length,
+        escapeModelCount: models.filter((m) => m.escapeCount > 0).length,
+        escapeProductCount: 0,
+        isPopular: false,
+      },
+      models,
+      featuredEscapes,
+    });
+  } catch (err: any) {
+    console.error('[MOTO BRAND ROUTE ERROR]:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/motos/:brandSlug/:modelSlug — landing page SEO de un modelo de moto.
+catalogRouter.get('/catalog/motos/:brandSlug/:modelSlug', async (req, res) => {
+  try {
+    const resolved = resolveModelSlug(req.params.brandSlug, req.params.modelSlug);
+    if (!resolved) return res.status(404).json({ missing: true });
+
+    const rawYear = String(req.query.year || '').trim();
+    const validYear = /^\d{4}$/.test(rawYear) && resolved.modelNode.years.includes(rawYear) ? rawYear : '';
+
+    if (resolved.needsRedirect) {
+      const target = validYear ? `${resolved.canonicalPath}?year=${encodeURIComponent(validYear)}` : resolved.canonicalPath;
+      return res.json({ redirectTo: target });
+    }
+
+    const cacheKey = `cache:moto-seo:model:v2:${resolved.brandNode.slug}:${resolved.modelNode.slug}:${validYear}`;
+    const cached = await cacheGet<any>(cacheKey);
+    if (cached) {
+      res.set('Cache-Control', 'public, max-age=600');
+      return res.json(cached);
+    }
+
+    const skusList = (await compatibleSkus(resolved.brandNode.brand, resolved.modelNode.model, validYear || undefined)).slice(0, 3000);
+    let cards: any[] = [];
+    if (skusList.length > 0) {
+      const productsRes = await pool.query(
+        `SELECT ${PRODUCT_CARD_COLUMNS} FROM products WHERE status = 'published' AND price > 0 AND sku = ANY($1) ORDER BY price ASC`,
+        [skusList]
+      );
+      cards = groupCardsByFamily(productsRes.rows);
+    }
+
+    const rootMap = await getCachedRootCategoryMap();
+    const classified = classifyMotoProducts(cards, rootMap);
+
+    let relatedModels: { model: string; slug: string; yearFrom: number | null; yearTo: number | null; escapeCount: number }[] = [];
+    try {
+      const dir = await getMotoSeoDirectory(pool);
+      const siblings = dir.modelsByBrandSlug[resolved.brandNode.slug] || [];
+      relatedModels = siblings
+        .filter((m) => m.slug !== resolved.modelNode.slug && m.hasProducts)
+        .slice(0, 8)
+        .map((m) => ({
+          model: m.model,
+          slug: m.slug,
+          yearFrom: m.yearFrom,
+          yearTo: m.yearTo,
+          escapeCount: m.escapeCount,
+        }));
+    } catch {
+      // Sin modelos relacionados si la BD está ocupada.
+    }
+
+    const payload = {
+      bike: {
+        brand: resolved.brandNode.brand,
+        brandName: resolved.brandNode.name,
+        brandSlug: resolved.brandNode.slug,
+        model: resolved.modelNode.model,
+        modelSlug: resolved.modelNode.slug,
+        years: resolved.modelNode.years,
+        yearFrom: resolved.modelNode.yearFrom,
+        yearTo: resolved.modelNode.yearTo,
+        selectedYear: validYear || null,
+      },
+      primaryEscapes: classified.primaryEscapes,
+      escapeAccessories: classified.escapeAccessories,
+      escapes: classified.escapes,
+      categories: classified.categories,
+      products: classified.allProducts,
+      totalProducts: classified.allProducts.length,
+      totalEscapes: classified.escapes.length,
+      totalPrimaryEscapes: classified.primaryEscapes.length,
+      relatedModels,
+    };
+
+    await cacheSet(cacheKey, payload, 600);
+    res.set('Cache-Control', 'public, max-age=600');
+    res.json(payload);
+  } catch (err: any) {
+    console.error('[MOTO MODEL ROUTE ERROR]:', err);
     res.status(500).json({ error: err.message });
   }
 });

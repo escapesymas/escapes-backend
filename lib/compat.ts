@@ -22,6 +22,7 @@ const MAX_MODELS = 25;
 export function cleanModelName(m: unknown): string {
   return String(m || '')
     .replace(/\(.*\)/g, '')
+    .replace(/\b(neo\s+sports\s+cafe|black\s+edition|special\s+edition|exclusive|tech\s+max|iron\s+max|black\s+max|white\s+max|lux\s+max|bronze\s+max|moto\s+cage|night\s+fluo)\b/gi, '')
     .replace(/\b(abs|cbs|dx|sx|sp|se|rr|r|i|ie|fi|euro\s*\d)\b/gi, '')
     .trim()
     .toLowerCase()
@@ -36,6 +37,11 @@ export function ensureCompatModels(): Promise<void> {
   if (ready) return Promise.resolve();
   if (!ensuring) {
     ensuring = (async () => {
+      const exists = await pool.query<{ reg: string | null }>(`SELECT to_regclass($1) AS reg`, [MV]);
+      if (exists.rows[0]?.reg) {
+        ready = true;
+        return;
+      }
       await pool.query(`
         CREATE MATERIALIZED VIEW IF NOT EXISTS ${MV} AS
         SELECT DISTINCT upper(e->>'brand') AS brand, (e->>'year') AS year, e->>'model' AS model
@@ -78,7 +84,8 @@ export async function findCompatibleSkus(brand: string, model?: string, year?: s
 
   const y = year && year !== 'General' ? String(year).trim() : '';
   const wanted = cleanModelName(model);
-  const wantedNoDigits = wanted.replace(/\d+/g, '').trim();
+  const rawNoDigits = wanted.replace(/\d+/g, '').replace(/\s+/g, ' ').trim();
+  const wantedNoDigits = rawNoDigits.replace(/[^a-z]/g, '').length >= 4 ? rawNoDigits : '';
 
   const modelsRes = y
     ? await pool.query(`SELECT DISTINCT model, year FROM ${MV} WHERE brand = $1 AND year = $2`, [b, y])

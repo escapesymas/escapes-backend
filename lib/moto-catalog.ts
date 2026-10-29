@@ -122,13 +122,20 @@ export async function compatibleSkus(brand: string, model?: string, year?: strin
     let codes: string[] = [];
 
     if (model) {
-      const matchedModelKey = Object.keys(hierarchy[matchedBrandKey] || {}).find(k => k.toLowerCase() === model.toLowerCase()) || model;
-      if (year && year !== 'General' && year !== '') {
-        codes = hierarchy[matchedBrandKey][matchedModelKey]?.[year] || hierarchy[matchedBrandKey][model]?.[year] || [];
-      } else if (hierarchy[matchedBrandKey][matchedModelKey]) {
-        Object.values(hierarchy[matchedBrandKey][matchedModelKey]).forEach((cList: any) => {
-          if (Array.isArray(cList)) codes.push(...cList);
-        });
+      const normModel = model.trim().replace(/\s+/g, ' ').toLowerCase();
+      const matchedModelKeys = Object.keys(hierarchy[matchedBrandKey] || {}).filter(
+        (k) => k.trim().replace(/\s+/g, ' ').toLowerCase() === normModel
+      );
+      const keysToUse = matchedModelKeys.length > 0 ? matchedModelKeys : [model];
+      for (const mk of keysToUse) {
+        if (year && year !== 'General' && year !== '') {
+          const yrCodes = hierarchy[matchedBrandKey][mk]?.[year] || [];
+          if (Array.isArray(yrCodes)) codes.push(...yrCodes);
+        } else if (hierarchy[matchedBrandKey][mk]) {
+          Object.values(hierarchy[matchedBrandKey][mk]).forEach((cList: any) => {
+            if (Array.isArray(cList)) codes.push(...cList);
+          });
+        }
       }
     } else {
       Object.values(hierarchy[matchedBrandKey]).forEach((modelsObj: any) => {
@@ -148,30 +155,49 @@ export async function compatibleSkus(brand: string, model?: string, year?: strin
   }
 
   // 3. SKUs desde bihr_compatibility_cache.json (compatibilidades sincronizadas en memoria)
-  const cacheFile = path.join(process.cwd(), 'bihr_compatibility_cache.json');
-  if (fs.existsSync(cacheFile)) {
-    try {
-      const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
-      const bLower = (brand || '').toLowerCase();
-      const mLower = (model || '').toLowerCase();
-      const yStr = year ? String(year) : '';
+  const cacheData = getBihrCompatCache();
+  if (cacheData) {
+    const bLower = (brand || '').toLowerCase();
+    const mLower = (model || '').toLowerCase();
+    const yStr = year ? String(year) : '';
 
-      for (const [sku, list] of Object.entries(cacheData)) {
-        if (!Array.isArray(list)) continue;
-        for (const item of list as any[]) {
-          if (!item.brand) continue;
-          const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
-          const matchModel = !mLower || (item.model && (item.model.toLowerCase().includes(mLower) || mLower.includes(item.model.toLowerCase())));
-          const matchYear = !yStr || (item.year && String(item.year) === yStr);
+    for (const [sku, list] of Object.entries(cacheData)) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list as any[]) {
+        if (!item.brand) continue;
+        const matchBrand = bLower && (item.brand.toLowerCase().includes(bLower) || bLower.includes(item.brand.toLowerCase()));
+        const matchModel = !mLower || (item.model && (item.model.toLowerCase().includes(mLower) || mLower.includes(item.model.toLowerCase())));
+        const matchYear = !yStr || (item.year && String(item.year) === yStr);
 
-          if (matchBrand && matchModel && matchYear) {
-            skusSet.add(sku);
-            break;
-          }
+        if (matchBrand && matchModel && matchYear) {
+          skusSet.add(sku);
+          break;
         }
       }
-    } catch (e) {}
+    }
   }
 
   return Array.from(skusSet);
+}
+
+let bihrCompatCache: Record<string, any[]> | null | undefined = undefined;
+function getBihrCompatCache(): Record<string, any[]> | null {
+  if (bihrCompatCache !== undefined) return bihrCompatCache;
+  const candidates = [
+    path.join(__dirname, '..', 'bihr_compatibility_cache.json'),
+    path.join(process.cwd(), 'bihr_compatibility_cache.json'),
+    path.join(process.cwd(), 'escapes-backend', 'bihr_compatibility_cache.json'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        bihrCompatCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        return bihrCompatCache!;
+      }
+    } catch {
+      // continue
+    }
+  }
+  bihrCompatCache = null;
+  return null;
 }
