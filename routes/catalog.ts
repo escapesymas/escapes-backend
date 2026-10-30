@@ -19,6 +19,11 @@ import {
   classifyMotoProducts,
   isPrimaryEscape,
 } from '../lib/moto-seo.js';
+import {
+  getManufacturerBrandsDirectory,
+  resolveManufacturerBrandSlug,
+  resolveLegacyProductRedirect,
+} from '../lib/brand-seo.js';
 import { tyreOptions } from '../lib/tyres.js';
 import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
 
@@ -248,7 +253,7 @@ export function mapProductToFrontend(row: any) {
       }
     }
     return img;
-  });
+  }).filter((img: any) => img && typeof img.src === 'string' && img.src.trim() !== '');
 
   const slug = row.slug || row.sku || String(row.id);
 
@@ -277,6 +282,7 @@ export function mapProductToFrontend(row: any) {
     compatibility: row.compatibility || [],
     attributes: publicAttributes(row.attributes, row.variant_options),
     barcode: row.barcode || '',
+    mpn: row.supplier_code || '',
     weight_g: row.weight_g || null,
     category: row.category_name || '',
     categorySlug: row.category_slug || '',
@@ -368,7 +374,7 @@ catalogRouter.get('/vehicles', async (req, res) => {
   }
 });
 
-// GET /api/catalog/sitemap-skus
+// GET /api/catalog/sitemap-skus — prioriza primero los productos con stock en los primeros sitemaps.
 catalogRouter.get('/catalog/sitemap-skus', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
@@ -376,7 +382,11 @@ catalogRouter.get('/catalog/sitemap-skus', async (req, res) => {
     const offset = (page - 1) * limit;
 
     const result = await db.execute(sql`
-      SELECT sku, updated_at FROM products WHERE status = 'published' AND price > 0 ORDER BY id ASC LIMIT ${limit} OFFSET ${offset}
+      SELECT sku, updated_at
+        FROM products
+       WHERE status = 'published' AND price > 0
+       ORDER BY (stock > 0) DESC, id ASC
+       LIMIT ${limit} OFFSET ${offset}
     `);
     res.set('Cache-Control', 'public, max-age=3600');
     res.json(result.rows);
@@ -589,6 +599,155 @@ catalogRouter.get('/catalog/motos/:brandSlug/:modelSlug', async (req, res) => {
   } catch (err: any) {
     console.error('[MOTO MODEL ROUTE ERROR]:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/sitemap-marcas — todas las marcas activas de fabricantes (sin BIHR).
+catalogRouter.get('/catalog/sitemap-marcas', async (_req, res) => {
+  try {
+    const dir = await getManufacturerBrandsDirectory(pool);
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json({
+      brands: dir.brands
+        .filter((b) => b.productCount > 0)
+        .map((b) => ({
+          slug: b.slug,
+          productCount: b.productCount,
+          inStockCount: b.inStockCount,
+          escapeCount: b.escapeCount,
+          isEscapeSpecialist: b.isEscapeSpecialist,
+        })),
+    });
+  } catch (err: any) {
+    console.error('[SITEMAP MARCAS ERROR]:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/marcas — directorio público de fabricantes de escapes, recambios y equipamiento.
+catalogRouter.get('/catalog/marcas', async (_req, res) => {
+  try {
+    const dir = await getManufacturerBrandsDirectory(pool);
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json(dir);
+  } catch (err: any) {
+    console.error('[MARCAS DIRECTORY ERROR]:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/marcas/:brandSlug — landing SEO de un fabricante con productos paginados por familia.
+catalogRouter.get('/catalog/marcas/:brandSlug', async (req, res) => {
+  try {
+    const resolved = await resolveManufacturerBrandSlug(pool, req.params.brandSlug);
+    if (!resolved) return res.status(404).json({ missing: true });
+
+    const pageNum = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    if (resolved.needsRedirect) {
+      const target = pageNum > 1 ? `${resolved.canonicalPath}?page=${pageNum}` : resolved.canonicalPath;
+      return res.json({ redirectTo: target });
+    }
+
+    const perPage = Math.min(Math.max(1, parseInt(String(req.query.per_page || '24'), 10) || 24), 48);
+    const catRaw = parseInt(String(req.query.category_id || ''), 10);
+    const categoryId = Number.isFinite(catRaw) && catRaw > 0 ? catRaw : null;
+    const inStock = req.query.in_stock === '1' || req.query.in_stock === 'true';
+    const q = typeof req.query.q === 'string' && req.query.q.trim() ? req.query.q.trim().slice(0, 120) : undefined;
+    const sortParam = String(req.query.sort || 'relevance');
+    const sort: SortKey = (['relevance', 'price_asc', 'price_desc', 'name_asc', 'newest'] as SortKey[]).includes(sortParam as SortKey)
+      ? (sortParam as SortKey)
+      : 'relevance';
+
+    const cacheKey = cacheKeyFor(`cache:brand-seo:detail:v1:${resolved.entry.slug}`, {
+      pageNum,
+      perPage,
+      categoryId,
+      inStock,
+      q: q || '',
+      sort,
+    });
+    const cached = await cacheGet<any>(cacheKey);
+    if (cached) {
+      res.set('Cache-Control', 'public, max-age=300');
+      return res.json(cached);
+    }
+
+    const { rows, total, refs } = await listFamilies(
+      {
+        brands: [resolved.entry.brand],
+        categoryId,
+        inStock,
+        search: q,
+      },
+      sort,
+      pageNum,
+      perPage,
+    );
+
+    const repIds = rows.map((r) => r.rep_id);
+    const repRes = repIds.length
+      ? await pool.query(`SELECT ${PRODUCT_CARD_COLUMNS} FROM products WHERE id = ANY($1)`, [repIds])
+      : { rows: [] as any[] };
+    const byId = new Map(repRes.rows.map((r: any) => [r.id, r]));
+
+    const products = rows
+      .map((f) => {
+        const row: any = byId.get(f.rep_id);
+        if (!row) return null;
+        const mapped: any = mapProductToFrontend(row);
+        const options: Record<string, string[]> = {};
+        for (const [k, vals] of Object.entries(f.opts || {})) {
+          options[k] = [...(vals as string[])]
+            .map((value) => ({ value }))
+            .sort(compareOptionValues)
+            .map((x) => x.value);
+        }
+        const title = f.n > 1 ? familyTitle(f.nmin, f.nmax, row.name, f.nmode) : row.name;
+        mapped.title = title;
+        mapped.name = title;
+        mapped.variantOptions = row.variant_options || null;
+        mapped.family = {
+          code: f.family_code,
+          variantCount: f.n,
+          priceMin: Number(f.pmin) / 100,
+          priceMax: Number(f.pmax) / 100,
+          inStock: f.any_stock,
+          options,
+        };
+        return cardView(mapped);
+      })
+      .filter(Boolean);
+
+    const dir = await getManufacturerBrandsDirectory(pool);
+    const poolCandidates = resolved.entry.isEscapeSpecialist ? dir.escapeBrands : dir.featuredBrands;
+    const relatedBrands = poolCandidates
+      .filter((b) => b.slug !== resolved.entry.slug)
+      .slice(0, 10)
+      .map((b) => ({
+        name: b.name,
+        slug: b.slug,
+        modelCount: b.modelCount,
+        escapeCount: b.escapeCount,
+        isEscapeSpecialist: b.isEscapeSpecialist,
+      }));
+
+    const payload = {
+      brand: resolved.entry,
+      products,
+      total,
+      refs,
+      totalPages: Math.max(1, Math.ceil(total / perPage)),
+      page: pageNum,
+      perPage,
+      relatedBrands,
+    };
+
+    await cacheSet(cacheKey, payload, 300);
+    res.set('Cache-Control', 'public, max-age=300');
+    return res.json(payload);
+  } catch (err: any) {
+    console.error('[MARCA DETAIL ROUTE ERROR]:', err);
+    return res.status(500).json({ error: 'Error al cargar la marca' });
   }
 });
 
@@ -1012,7 +1171,44 @@ catalogRouter.get('/catalog/product-by-slug/:slug', async (req, res) => {
       ORDER BY (p.sku = ${slugStr}) DESC, (p.sku = ${skuStr}) DESC, (p.status = 'published') DESC
       LIMIT 1
     `);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
+    if (result.rows.length === 0) {
+      if (slugStr.includes('-')) {
+        const parts = slugStr.split('-').filter(Boolean);
+        const rawCandidates = [
+          parts[0],
+          parts[0]?.toUpperCase(),
+          parts.length >= 3 ? `${parts[0]}-${parts[1]}` : '',
+          parts.length >= 3 ? `${parts[0]}-${parts[1]}`.toUpperCase() : '',
+        ].filter((c) => c && c.length >= 3);
+        const candidates = [...new Set(rawCandidates)];
+        if (candidates.length > 0) {
+          const prefixRes = await pool.query(
+            `SELECT sku, status, duplicate_of
+               FROM products
+              WHERE sku = ANY($1)
+                AND status IN ('published', 'duplicate')
+              ORDER BY length(sku) DESC, (status = 'published') DESC
+              LIMIT 1`,
+            [candidates],
+          );
+          if (prefixRes.rows.length > 0) {
+            const pRow = prefixRes.rows[0];
+            if (pRow.status === 'duplicate' && pRow.duplicate_of) {
+              const canon = await pool.query(`SELECT sku FROM products WHERE id = $1 AND status = 'published'`, [pRow.duplicate_of]);
+              if (canon.rows.length) return res.json({ redirectTo: canon.rows[0].sku });
+            } else if (pRow.status === 'published') {
+              return res.json({ redirectTo: pRow.sku });
+            }
+          }
+        }
+
+        const legacyPath = resolveLegacyProductRedirect(slugStr);
+        if (legacyPath) {
+          return res.json({ redirectToPath: legacyPath });
+        }
+      }
+      return res.status(404).json({ error: 'No encontrado' });
+    }
     const row: any = result.rows[0];
 
     // Ficha duplicada (importación antigua): indicar la canónica para redirigir (301).
