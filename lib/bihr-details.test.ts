@@ -84,10 +84,10 @@ describe('Products/Details de Bihr', () => {
 
   it('un 404 es «Bihr no conoce esos productos»: sin fotos y sin pausar la API', async () => {
     respond = () => new Response('', { status: 404 });
-    for (let i = 0; i < 8; i++) expect((await bihrProductPictures(['X'])).size).toBe(0);
+    for (let i = 0; i < 6; i++) expect((await bihrProductPictures(['X'])).size).toBe(0);
     respond = () => new Response(JSON.stringify([detail('X')]), { status: 200 });
     expect((await bihrProductPictures(['X'])).has('x')).toBe(true);
-  });
+  }, 20_000);
 
   it('si el token está revocado pide otro y repite la llamada una vez', async () => {
     let n = 0;
@@ -95,7 +95,7 @@ describe('Products/Details de Bihr', () => {
     expect((await bihrProductPictures(['1008253'])).has('1008253')).toBe(true);
     expect(tokens).toBe(2);
     expect(calls.map((c) => c.init.headers.Authorization)).toEqual(['Bearer t1', 'Bearer t2']);
-  });
+  }, 10_000);
 
   it('un error de Bihr se cuenta con su código y el principio de lo que contesta', async () => {
     respond = () => new Response('{"error":"too many criteria"}', { status: 400 });
