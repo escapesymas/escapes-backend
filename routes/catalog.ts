@@ -25,6 +25,7 @@ import {
   resolveLegacyProductRedirect,
 } from '../lib/brand-seo.js';
 import { tyreOptions } from '../lib/tyres.js';
+import { submitIndexNowUrls } from '../lib/indexnow.js';
 import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1514,3 +1515,44 @@ catalogRouter.all('/catalog/products-by-skus', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+// POST /api/catalog/indexnow
+// Notifica instantáneamente a Bing, Yandex y motores IndexNow sobre URLs nuevas/actualizadas.
+const indexNowLimiter = rateLimit({
+  keyGenerator: (req: any) => ipKeyGenerator(req.clientIp || req.ip || 'unknown'),
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas peticiones a IndexNow. Inténtalo más tarde.' },
+});
+
+catalogRouter.post('/catalog/indexnow', indexNowLimiter, async (req, res) => {
+  try {
+    const rawUrls = req.body?.urls || req.body?.urlList || req.body?.url;
+    if (!rawUrls) {
+      return res.status(400).json({ error: 'Debes proporcionar al menos una URL en el campo "urls".' });
+    }
+
+    const urlsList = Array.isArray(rawUrls) ? rawUrls : [rawUrls];
+    const result = await submitIndexNowUrls(urlsList);
+
+    if (!result.ok) {
+      return res.status(result.statusCode && result.statusCode >= 400 && result.statusCode < 500 ? result.statusCode : 502).json({
+        success: false,
+        error: result.error,
+        submittedCount: 0,
+      });
+    }
+
+    return res.json({
+      success: true,
+      submittedCount: result.submittedCount,
+      statusCode: result.statusCode || 200,
+    });
+  } catch (err: any) {
+    console.error('[INDEXNOW ROUTE ERROR]:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
