@@ -7,6 +7,7 @@ import {
   getManufacturerBrandsDirectory,
   resolveManufacturerBrandSlug,
   resolveLegacyProductRedirect,
+  getCompatibleMotosForBrand,
 } from './brand-seo.js';
 
 describe('brand-seo: normalización, confidencialidad de proveedor y formato', () => {
@@ -158,4 +159,35 @@ describe('catalogRouter + mapProductToFrontend: imágenes vacías, MPN y endpoin
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   }, 15_000);
+
+  it('obtiene y agrega modelos de moto compatibles para marcas fabricantes excluyendo a BIHR', async () => {
+    const fakePool: any = {
+      async query(sqlText: string, params: any[]) {
+        if (params?.[0] === 'IXIL') {
+          return {
+            rows: [
+              { bike_brand: 'YAMAHA', bike_model: 'MT-07 ABS', product_count: 20, escape_count: 20 },
+              { bike_brand: 'YAMAHA', bike_model: 'MT-07', product_count: 10, escape_count: 10 },
+              { bike_brand: 'HONDA', bike_model: 'CB 650 R NEO SPORTS CAFE', product_count: 15, escape_count: 15 },
+            ],
+          };
+        }
+        return { rows: [] };
+      },
+    };
+
+    const bihrMotos = await getCompatibleMotosForBrand(fakePool, 'BIHR');
+    expect(bihrMotos).toEqual([]);
+
+    const ixilMotos = await getCompatibleMotosForBrand(fakePool, 'IXIL');
+    expect(ixilMotos.length).toBeGreaterThanOrEqual(2);
+
+    // Yamaha MT-07 debe estar agrupada con 30 escapes
+    const mt07 = ixilMotos.find((m) => m.href === '/escapes/yamaha/mt-07');
+    expect(mt07).toBeTruthy();
+    expect(mt07?.productCount).toBe(30);
+    expect(mt07?.escapeCount).toBe(30);
+    expect(mt07?.brandName).toBe('Yamaha');
+    expect(mt07?.modelName).toBe('MT-07');
+  });
 });

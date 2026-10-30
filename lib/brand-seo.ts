@@ -7,7 +7,7 @@
  */
 import type { Pool } from 'pg';
 import { cacheGet, cacheSet } from './cache.js';
-import { getHierarchyIndex, slugifyMoto } from './moto-seo.js';
+import { getHierarchyIndex, slugifyMoto, resolveModelSlug } from './moto-seo.js';
 
 /** Proveedores mayoristas que nunca deben exponerse como marca pública. */
 export function isExcludedSupplierBrand(brand: unknown): boolean {
@@ -534,3 +534,95 @@ export function resolveLegacyProductRedirect(rawSlug: string): string | null {
   }
   return `/escapes/${matchedBrand.slug}`;
 }
+
+export interface BrandCompatibleMoto {
+  brandName: string;
+  brandSlug: string;
+  modelName: string;
+  modelSlug: string;
+  fullName: string;
+  productCount: number;
+  escapeCount: number;
+  href: string;
+}
+
+/**
+ * Obtiene los modelos de moto más populares compatibles con una marca de fabricante.
+ * Realiza agregación en base de datos sobre los productos publicados de dicha marca y
+ * resuelve la URL canónica hacia la landing de cada moto (/escapes/:brand/:model).
+ */
+export async function getCompatibleMotosForBrand(
+  pool: Pool,
+  brand: string,
+  limit: number = 12,
+): Promise<BrandCompatibleMoto[]> {
+  const cleanBrand = String(brand || '').trim();
+  if (!cleanBrand || isExcludedSupplierBrand(cleanBrand)) return [];
+
+  const cacheKey = `cache:brand-seo:motos:v1:${slugifyManufacturerBrand(cleanBrand)}`;
+  const cached = await cacheGet<BrandCompatibleMoto[]>(cacheKey);
+  if (cached && Array.isArray(cached)) return cached;
+
+  try {
+    const res = await pool.query<{
+      bike_brand: string;
+      bike_model: string;
+      product_count: number;
+      escape_count: number;
+    }>(
+      `SELECT
+         c->>'brand' AS bike_brand,
+         c->>'model' AS bike_model,
+         count(*)::int AS product_count,
+         count(*) FILTER (WHERE p.category_id IN (1007, 1000048, 1030))::int AS escape_count
+       FROM products p,
+       LATERAL jsonb_array_elements(p.compatibility) AS c
+       WHERE p.brand = $1
+         AND p.status = 'published'
+         AND p.price > 0
+         AND c->>'brand' IS NOT NULL
+         AND c->>'model' IS NOT NULL
+       GROUP BY c->>'brand', c->>'model'
+       ORDER BY escape_count DESC, product_count DESC
+       LIMIT 60`,
+      [cleanBrand],
+    );
+
+    const mapByHref = new Map<string, BrandCompatibleMoto>();
+
+    for (const row of res.rows) {
+      if (!row.bike_brand || !row.bike_model) continue;
+      const resolved = resolveModelSlug(row.bike_brand, row.bike_model);
+      if (!resolved) continue;
+
+      const href = resolved.canonicalPath;
+      const existing = mapByHref.get(href);
+      if (existing) {
+        existing.productCount += row.product_count;
+        existing.escapeCount += row.escape_count;
+      } else {
+        mapByHref.set(href, {
+          brandName: resolved.brandNode.name,
+          brandSlug: resolved.brandNode.slug,
+          modelName: resolved.modelNode.model,
+          modelSlug: resolved.modelNode.slug,
+          fullName: `${resolved.brandNode.name} ${resolved.modelNode.model}`,
+          productCount: row.product_count,
+          escapeCount: row.escape_count,
+          href,
+        });
+      }
+    }
+
+    const sorted = [...mapByHref.values()]
+      .sort((a, b) => b.escapeCount - a.escapeCount || b.productCount - a.productCount)
+      .slice(0, limit);
+
+    await cacheSet(cacheKey, sorted, 1800);
+    return sorted;
+  } catch (err) {
+    console.warn('[BRAND COMPATIBLE MOTOS ERROR]:', err);
+    return [];
+  }
+}
+

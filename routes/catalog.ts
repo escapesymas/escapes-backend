@@ -17,12 +17,17 @@ import {
   getMotoSeoDirectory,
   buildRootCategoryMap,
   classifyMotoProducts,
+  isEscapeProduct,
   isPrimaryEscape,
 } from '../lib/moto-seo.js';
 import {
   getManufacturerBrandsDirectory,
   resolveManufacturerBrandSlug,
   resolveLegacyProductRedirect,
+  getCompatibleMotosForBrand,
+  formatManufacturerBrandDisplay,
+  slugifyManufacturerBrand,
+  isExcludedSupplierBrand,
 } from '../lib/brand-seo.js';
 import { tyreOptions } from '../lib/tyres.js';
 import { submitIndexNowUrls } from '../lib/indexnow.js';
@@ -571,6 +576,49 @@ catalogRouter.get('/catalog/motos/:brandSlug/:modelSlug', async (req, res) => {
       // Sin modelos relacionados si la BD está ocupada.
     }
 
+    // Agrupa las marcas de fabricante con escapes o recambios para este modelo de moto
+    const brandCounts = new Map<string, { brand: string; productCount: number; escapeCount: number }>();
+    for (const card of cards) {
+      const b = String(card.brand || '').trim();
+      if (!b || isExcludedSupplierBrand(b)) continue;
+      const cur = brandCounts.get(b) || { brand: b, productCount: 0, escapeCount: 0 };
+      cur.productCount++;
+      if (isEscapeProduct(card)) cur.escapeCount++;
+      brandCounts.set(b, cur);
+    }
+
+    let compatibleBrands: {
+      name: string;
+      slug: string;
+      productCount: number;
+      escapeCount: number;
+      isEscapeSpecialist: boolean;
+      href: string;
+    }[] = [];
+
+    try {
+      const dir = await getManufacturerBrandsDirectory(pool);
+      const dirBySlug = new Map(dir.brands.map((b) => [b.slug, b]));
+
+      compatibleBrands = [...brandCounts.values()]
+        .map((bc) => {
+          const slug = slugifyManufacturerBrand(bc.brand);
+          const entry = dirBySlug.get(slug);
+          return {
+            name: entry?.name || formatManufacturerBrandDisplay(bc.brand),
+            slug,
+            productCount: bc.productCount,
+            escapeCount: bc.escapeCount,
+            isEscapeSpecialist: entry?.isEscapeSpecialist || bc.escapeCount > 0,
+            href: `/marcas/${slug}`,
+          };
+        })
+        .sort((a, b) => b.escapeCount - a.escapeCount || b.productCount - a.productCount)
+        .slice(0, 12);
+    } catch {
+      // Sin marcas si hay error en el directorio
+    }
+
     const payload = {
       bike: {
         brand: resolved.brandNode.brand,
@@ -592,6 +640,7 @@ catalogRouter.get('/catalog/motos/:brandSlug/:modelSlug', async (req, res) => {
       totalEscapes: classified.escapes.length,
       totalPrimaryEscapes: classified.primaryEscapes.length,
       relatedModels,
+      compatibleBrands,
     };
 
     await cacheSet(cacheKey, payload, 600);
@@ -732,6 +781,8 @@ catalogRouter.get('/catalog/marcas/:brandSlug', async (req, res) => {
         isEscapeSpecialist: b.isEscapeSpecialist,
       }));
 
+    const compatibleMotos = await getCompatibleMotosForBrand(pool, resolved.entry.brand, 12);
+
     const payload = {
       brand: resolved.entry,
       products,
@@ -741,6 +792,7 @@ catalogRouter.get('/catalog/marcas/:brandSlug', async (req, res) => {
       page: pageNum,
       perPage,
       relatedBrands,
+      compatibleMotos,
     };
 
     await cacheSet(cacheKey, payload, 300);
