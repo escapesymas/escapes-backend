@@ -73,7 +73,10 @@ function getTransporter(): Transporter {
       user: process.env.SMTP_USER || 'web@escapesymas.com',
       pass: process.env.SMTP_PASSWORD,
     },
-    tls: { rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true' },
+    tls: {
+      servername: process.env.SMTP_SERVERNAME || 'mail.escapesymas.com',
+      rejectUnauthorized: process.env.SMTP_ALLOW_UNSECURE === 'true' ? false : true,
+    },
     pool: true, // reuse connections across sends
     maxConnections: 3,
     maxMessages: 100,
