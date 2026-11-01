@@ -7229,9 +7229,11 @@ app.post('/api/reviews', formsLimiter, async (req, res) => {
       }
     }
 
+    const status = verified_purchase ? 'approved' : 'pending';
+
     const result = await db.execute(sql`
-      INSERT INTO product_reviews (product_id, user_id, rating, title, content, verified_purchase)
-      VALUES (${parseInt(product_id)}, ${userId}, ${parseInt(rating)}, ${title || null}, ${content || null}, ${verified_purchase})
+      INSERT INTO product_reviews (product_id, user_id, rating, title, content, verified_purchase, status)
+      VALUES (${parseInt(product_id)}, ${userId}, ${parseInt(rating)}, ${title || null}, ${content || null}, ${verified_purchase}, ${status})
       RETURNING *
     `);
 
