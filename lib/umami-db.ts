@@ -42,6 +42,46 @@ export function getUmamiPool(): any {
   return umamiPool;
 }
 
+export interface SessionEventItem {
+  eventId: string;
+  createdAt: string;
+  timeFormatted: string;
+  secondsFromStart: number;
+  timeOnPageSeconds: number | null;
+  eventType: number;
+  eventName: string;
+  urlPath: string;
+  pageTitle: string;
+  referrerDomain: string | null;
+  utmSource?: string | null;
+  utmMedium?: string | null;
+  utmCampaign?: string | null;
+  eventData: { key: string; value: string }[];
+}
+
+export interface SessionDetailResponse {
+  session: {
+    sessionId: string;
+    city: string;
+    region: string;
+    country: string;
+    device: string;
+    os: string;
+    browser: string;
+    screen: string;
+    language: string;
+    sessionStart: string;
+    lastActiveAt: string;
+    durationSeconds: number;
+    totalEvents: number;
+    initialReferrer: string | null;
+    utmSource?: string | null;
+    utmMedium?: string | null;
+    utmCampaign?: string | null;
+  };
+  events: SessionEventItem[];
+}
+
 export interface RealtimeActiveUser {
   sessionId: string;
   city: string;
@@ -525,5 +565,126 @@ export async function getAnalyticsStats(
     devices: formatWithPercent(devicesRes.rows, totalVisitors, 'device') as any,
     operatingSystems: formatWithPercent(osRes.rows, totalVisitors, 'os') as any,
     browsers: formatWithPercent(browsersRes.rows, totalVisitors, 'browser') as any,
+  };
+}
+
+/**
+ * Obtiene el recorrido detallado paso a paso de un visitante específico:
+ * metadatos de su sesión y secuencia cronológica de todas las páginas y eventos.
+ */
+export async function getSessionDetail(sessionId: string): Promise<SessionDetailResponse | null> {
+  const pool = getUmamiPool();
+
+  const sessionQuery = `
+    SELECT 
+      s.session_id,
+      COALESCE(s.city, 'Desconocida') AS city,
+      COALESCE(s.region, '') AS region,
+      COALESCE(s.country, 'ES') AS country,
+      COALESCE(s.device, 'desktop') AS device,
+      COALESCE(s.os, 'Unknown') AS os,
+      COALESCE(s.browser, 'Unknown') AS browser,
+      COALESCE(s.screen, '') AS screen,
+      COALESCE(s.language, '') AS language,
+      s.created_at AS session_start
+    FROM session s
+    WHERE s.session_id = $1
+    LIMIT 1;
+  `;
+
+  const eventsQuery = `
+    SELECT 
+      e.event_id,
+      e.created_at,
+      TO_CHAR(e.created_at + INTERVAL '1 hour', 'HH24:MI:SS') AS time_formatted,
+      e.event_type,
+      COALESCE(e.event_name, 'pageview') AS event_name,
+      e.url_path,
+      COALESCE(e.page_title, '') AS page_title,
+      e.referrer_domain,
+      e.utm_source,
+      e.utm_medium,
+      e.utm_campaign,
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'key', ed.data_key,
+            'value', COALESCE(ed.string_value, ed.number_value::text)
+          )
+        ) FILTER (WHERE ed.data_key IS NOT NULL),
+        '[]'
+      ) AS event_data
+    FROM website_event e
+    LEFT JOIN event_data ed ON ed.website_event_id = e.event_id
+    WHERE e.session_id = $1
+    GROUP BY e.event_id, e.created_at, e.event_type, e.event_name, e.url_path, e.page_title, e.referrer_domain, e.utm_source, e.utm_medium, e.utm_campaign
+    ORDER BY e.created_at ASC;
+  `;
+
+  const [sRes, eRes] = await Promise.all([
+    pool.query(sessionQuery, [sessionId]),
+    pool.query(eventsQuery, [sessionId]),
+  ]);
+
+  if (sRes.rows.length === 0) return null;
+
+  const sRow = sRes.rows[0];
+  const eRows = eRes.rows;
+
+  const sessionStartMs = new Date(sRow.session_start).getTime();
+  const lastActiveAtMs = eRows.length > 0 ? new Date(eRows[eRows.length - 1].created_at).getTime() : sessionStartMs;
+  const durationSeconds = Math.max(0, Math.round((lastActiveAtMs - sessionStartMs) / 1000));
+
+  const events: SessionEventItem[] = eRows.map((r: any, idx: number) => {
+    const curMs = new Date(r.created_at).getTime();
+    const secondsFromStart = Math.max(0, Math.round((curMs - sessionStartMs) / 1000));
+
+    let timeOnPageSeconds: number | null = null;
+    if (idx < eRows.length - 1) {
+      const nextMs = new Date(eRows[idx + 1].created_at).getTime();
+      timeOnPageSeconds = Math.max(0, Math.round((nextMs - curMs) / 1000));
+    }
+
+    return {
+      eventId: r.event_id,
+      createdAt: r.created_at,
+      timeFormatted: r.time_formatted,
+      secondsFromStart,
+      timeOnPageSeconds,
+      eventType: r.event_type,
+      eventName: r.event_name,
+      urlPath: r.url_path || '/',
+      pageTitle: r.page_title,
+      referrerDomain: r.referrer_domain || null,
+      utmSource: r.utm_source || null,
+      utmMedium: r.utm_medium || null,
+      utmCampaign: r.utm_campaign || null,
+      eventData: Array.isArray(r.event_data) ? r.event_data : [],
+    };
+  });
+
+  const firstEvent = events[0];
+
+  return {
+    session: {
+      sessionId: sRow.session_id,
+      city: sRow.city,
+      region: sRow.region,
+      country: sRow.country,
+      device: sRow.device,
+      os: sRow.os,
+      browser: sRow.browser,
+      screen: sRow.screen,
+      language: sRow.language,
+      sessionStart: sRow.session_start,
+      lastActiveAt: eRows.length > 0 ? eRows[eRows.length - 1].created_at : sRow.session_start,
+      durationSeconds,
+      totalEvents: events.length,
+      initialReferrer: firstEvent?.referrerDomain || null,
+      utmSource: firstEvent?.utmSource || null,
+      utmMedium: firstEvent?.utmMedium || null,
+      utmCampaign: firstEvent?.utmCampaign || null,
+    },
+    events,
   };
 }

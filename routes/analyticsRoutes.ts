@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { requireAdminRole } from '../lib/agent-auth.js';
-import { getRealtimeData, getAnalyticsStats } from '../lib/umami-db.js';
+import { getRealtimeData, getAnalyticsStats, getSessionDetail } from '../lib/umami-db.js';
 
 export const analyticsRouter = Router();
 
@@ -65,5 +65,30 @@ analyticsRouter.get('/admin/analytics/stats', async (req: any, res: any) => {
   } catch (err: any) {
     console.error('[ANALYTICS STATS ERROR]:', err);
     res.status(500).json({ error: err.message || 'Error consultando analítica web' });
+  }
+});
+
+/**
+ * GET /api/admin/analytics/session-detail
+ * Retorna el recorrido completo paso a paso (páginas vistas y eventos) de una sesión.
+ */
+analyticsRouter.get('/admin/analytics/session-detail', async (req: any, res: any) => {
+  const admin = await requireAdminRole(req, res);
+  if (!admin) return;
+
+  const sessionId = req.query.sessionId as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId es obligatorio' });
+  }
+
+  try {
+    const detail = await getSessionDetail(sessionId);
+    if (!detail) {
+      return res.status(404).json({ error: 'Sesión no encontrada' });
+    }
+    res.json(detail);
+  } catch (err: any) {
+    console.error('[ANALYTICS SESSION DETAIL ERROR]:', err);
+    res.status(500).json({ error: err.message || 'Error consultando detalle de la sesión' });
   }
 });
