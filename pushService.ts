@@ -506,8 +506,9 @@ export async function notifyDailySummary(s: {
 
 export interface VisitorEventInput {
   sessionId?: string;
-  event: 'visit' | 'engaged';
+  event: 'visit' | 'engaged' | 'leave';
   page?: string;
+  lastPage?: string;
   title?: string;
   referrer?: string;
   source?: string;
@@ -515,6 +516,8 @@ export interface VisitorEventInput {
   productName?: string;
   productPrice?: number;
   cartTotal?: number;
+  cartCount?: number;
+  cartProduct?: string;
   pageCount?: number;
   durationSeconds?: number;
   ip?: string;
@@ -528,6 +531,16 @@ export function isBot(userAgent?: string): boolean {
   const ua = userAgent.trim();
   if (ua.length < 15) return true;
   return BOT_REGEX.test(ua);
+}
+
+function formatDuration(sec: number): string {
+  if (sec < 60) return `${sec} s`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  if (min < 60) return remSec > 0 ? `${min} min ${remSec} s` : `${min} min`;
+  const hr = Math.floor(min / 60);
+  const remMin = min % 60;
+  return `${hr} h ${remMin} min`;
 }
 
 interface VisitorSessionRecord {
@@ -553,8 +566,20 @@ if (typeof setInterval !== 'undefined') {
   }, 15 * 60 * 1000).unref();
 }
 
+/** Aviso inmediato cuando un cliente inicia una pasarela de pago (Stripe / Bizum). */
+export async function notifyPaymentStart(p: { orderId: number; amountCents: number; email?: string }) {
+  await sendNotificationToAll({
+    category: 'visitor_activity',
+    title: '💳 Cliente iniciando el pago',
+    body: `Pedido #${p.orderId} de ${eur(p.amountCents)} · Ha abierto la pasarela de pago (Tarjeta / Bizum / Klarna)`,
+    url: adminUrl('orders', { order: p.orderId }),
+    tag: `payment-start-${p.orderId}`,
+    data: { orderId: p.orderId, amount: p.amountCents / 100 },
+  });
+}
+
 /**
- * Procesa un evento de visitante (entrada o avance en catálogo/carrito).
+ * Procesa un evento de visitante (entrada, interacción con catálogo/carrito o salida).
  * Aplica deduplicación estricta, filtros de bots y cooldown para no saturar al administrador.
  */
 export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ success: boolean; skipped?: string; notified?: string }> {
@@ -616,12 +641,12 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
 
   // ── Caso 2: El cliente avanza en la tienda ──────────────────────────────
   if (input.event === 'engaged') {
-    // Cooldown de 15 segundos entre avisos de actividad para el mismo visitante
-    if (now - session.lastActivityNotified < 15 * 1000) {
+    const action = input.action || 'browse';
+
+    // Para acciones generales de navegación, espaciar 15s. Las de intención (carrito, pago) van al momento.
+    if ((action === 'browse' || action === 'view_product') && (now - session.lastActivityNotified < 15 * 1000)) {
       return { success: true, skipped: 'activity_cooldown' };
     }
-
-    const action = input.action || 'browse';
 
     if (action === 'add_to_cart') {
       const prodName = (input.productName || 'un producto').slice(0, 50);
@@ -702,6 +727,41 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
       });
       return { success: true, notified: 'browse' };
     }
+  }
+
+  // ── Caso 3: El visitante se marcha de la tienda ─────────────────────────
+  if (input.event === 'leave') {
+    if (session.actionsNotified.has('leave')) {
+      return { success: true, skipped: 'leave_already_notified' };
+    }
+
+    const duration = input.durationSeconds || Math.round((now - session.firstSeen) / 1000);
+    // Descartamos visitas ultra breves (< 8s) sin páginas ni carrito para no spamear rebotes
+    if (duration < 8 && (!input.pageCount || input.pageCount <= 1) && (!input.cartCount || input.cartCount === 0)) {
+      return { success: true, skipped: 'too_brief' };
+    }
+
+    session.actionsNotified.add('leave');
+
+    const durText = formatDuration(duration);
+    const pagesText = input.pageCount ? ` · ${input.pageCount} pág.` : '';
+    const hasCart = (Number(input.cartCount) || 0) > 0 || (Number(input.cartTotal) || 0) > 0;
+    const cartDesc = hasCart
+      ? ` · ⚠️ Dejó ${input.cartCount || 1} producto(s) en el carrito (${input.cartTotal ? `${input.cartTotal} €` : ''})`
+      : '';
+    const lastPageClean = (input.lastPage || '').replace(/\s*[-|]\s*Escapes y Más.*$/i, '').trim();
+    const lastText = lastPageClean && lastPageClean !== '/' ? ` · Última: ${lastPageClean.slice(0, 35)}` : '';
+
+    await sendNotificationToAll({
+      category: 'visitor_activity',
+      title: hasCart ? '👋 Visitante sale con carrito sin pagar' : '👋 Visitante ha salido de la tienda',
+      body: `Estuvo ${durText}${pagesText}${cartDesc}${lastText}`,
+      url: hasCart ? adminUrl('carts') : adminUrl('stats'),
+      tag: `visitor-${sid}`,
+      data: { sessionId: sid, duration, cartTotal: input.cartTotal, lastPage: input.lastPage },
+    });
+
+    return { success: true, notified: 'leave' };
   }
 
   return { success: true, skipped: 'unknown_event' };

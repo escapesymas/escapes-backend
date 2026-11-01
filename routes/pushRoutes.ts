@@ -51,7 +51,11 @@ pushRouter.post('/push/visitor-event', visitorLimiter, async (req, res) => {
   try {
     const ip = (req as any).clientIp || req.ip || '';
     const userAgent = String(req.headers['user-agent'] || '');
-    const result = await handleVisitorEvent({ ...req.body, ip, userAgent });
+    let payload = req.body || {};
+    if (typeof payload === 'string') {
+      try { payload = JSON.parse(payload); } catch {}
+    }
+    const result = await handleVisitorEvent({ ...payload, ip, userAgent });
     return res.json({ success: true, ...result });
   } catch (err: any) {
     console.error('[PUSH VISITOR EVENT ERROR]:', err.message);
