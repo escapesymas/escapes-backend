@@ -263,22 +263,25 @@ export interface VerifyEmailData {
 }
 
 export function verifyEmail(d: VerifyEmailData): RenderedEmail {
-  const subject = `Confirma tu email en ${BRAND}`;
+  const subject = `Confirma tu email en ${BRAND} y activa tu 5% de bienvenida`;
   const text = `Hola${d.name ? ` ${d.name}` : ''},
 
 Gracias por registrarte en ${BRAND}. Para activar tu cuenta, confirma tu email abriendo este enlace:
 
 ${d.url}
 
+🎁 Como bienvenida a nuestra comunidad, en cuanto confirmes tu cuenta puedes usar el cupón BIENVENIDA5 en tu primera compra para obtener un 5% de descuento en todo el catálogo.
+
 El enlace caduca en 24 horas. Si no has creado tú esta cuenta, ignora este mensaje.${signature}`;
   const html = shell(`
     ${heading('Confirma tu email')}
     ${greeting(d.name)}
-    ${p(`Gracias por registrarte en ${BRAND}. Pulsa el botón para activar tu cuenta:`)}
+    ${p(`Gracias por registrarte en ${BRAND}. Pulsa el botón para activar tu cuenta y desbloquear tu <strong>5% de descuento de bienvenida</strong>:`)}
     ${button(d.url, 'Confirmar mi email')}
+    ${panel(`<strong>🎁 Tu cupón de bienvenida:</strong> Usa el código <span style="font-family:monospace;font-weight:bold;color:${C.accent};font-size:13px;">BIENVENIDA5</span> en tu primer pedido y llévate un 5% de descuento directo en cualquier escape o recambio.`, true)}
     ${fallbackLink(d.url)}
     ${note('El enlace caduca en 24 horas. Si no has creado tú esta cuenta, ignora este mensaje.')}
-  `, 'Activa tu cuenta con un clic. El enlace caduca en 24 horas.');
+  `, 'Activa tu cuenta con un clic y obtén un 5% en tu primer pedido.');
   return { subject, text, html };
 }
 

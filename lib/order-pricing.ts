@@ -38,6 +38,8 @@ export interface QuoteInput {
   cart: CartLine[]; country?: string; postcode?: string; promoCode?: string | null;
   /** Precios con descuento del asesor: no admiten descuentos por importe ni cupones. */
   overrides?: PriceOverride[];
+  userId?: number | null;
+  userEmail?: string | null;
 }
 
 export interface Quote {
@@ -148,14 +150,26 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
     let error: string | undefined;
     if (!found) {
       error = 'Cupón no válido o caducado';
-    } else if (subtotalCents < minCents) {
+    } else if (code === 'BIENVENIDA5' && !input.userId) {
+      error = 'El cupón BIENVENIDA5 es exclusivo para usuarios registrados. Inicia sesión o regístrate para aplicarlo.';
+    } else if (code === 'BIENVENIDA5' && input.userId) {
+      const prev = (await pool.query(
+        `SELECT id FROM orders WHERE user_id = $1 AND status NOT IN ('cancelled', 'failed') LIMIT 1`,
+        [input.userId]
+      )).rows;
+      if (prev.length > 0) {
+        error = 'El cupón BIENVENIDA5 solo es válido para tu primera compra.';
+      }
+    }
+
+    if (!error && subtotalCents < minCents) {
       error = `Este cupón requiere una compra mínima de ${(minCents / 100).toFixed(2).replace('.', ',')} €`;
-    } else if (opts.redeemCoupon) {
+    } else if (!error && opts.redeemCoupon) {
       // Canje atómico: límite de usos y caducidad comprobados en la misma sentencia.
       applied = (await pool.query(`UPDATE coupons SET times_used = times_used + 1
           WHERE id = (SELECT id ${sqlCheck} LIMIT 1) RETURNING type, value`, [code])).rows[0] || null;
       if (!applied) error = 'Cupón no válido o caducado';
-    } else {
+    } else if (!error) {
       applied = found;
     }
     promo = { code, valid: !!applied, type: applied?.type, minAmount: minCents / 100, error };

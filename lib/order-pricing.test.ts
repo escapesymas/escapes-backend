@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Productos y cupones de prueba que devuelve la BD simulada.
-const db = vi.hoisted(() => ({ products: [] as any[], coupon: null as any }));
+const db = vi.hoisted(() => ({ products: [] as any[], coupon: null as any, orders: [] as any[] }));
 
 vi.mock('../db.js', () => ({
   pool: {
@@ -10,6 +10,7 @@ vi.mock('../db.js', () => ({
       if (sql.includes('FROM shipping_zones')) return { rows: [{ id: 1, regions: ['ES'] }] };
       if (sql.includes('FROM shipping_methods')) return { rows: [{ zone_id: 1, cost: 1999, free_shipping_threshold: 200 }] };
       if (sql.includes('FROM coupons')) return { rows: db.coupon ? [db.coupon] : [] };
+      if (sql.includes('FROM orders')) return { rows: db.orders || [] };
       return { rows: [] };
     }),
   },
@@ -30,6 +31,8 @@ function netMargin(q: Awaited<ReturnType<typeof quoteOrder>>, cost: number, qty 
   const shippingPaid = q.shippingCents;
   return (paid - shippingPaid) / 1.21 - cost * qty - (paid * 0.015 + 25) + shippingPaid / 1.21 - SHIPPING_REAL_COST_CENTS / 1.21;
 }
+
+const roomy = (price: number) => [{ id: 1, price, sale_price: 0, promo_price: null, stock: 5, cost: Math.round(price * 0.3) }];
 
 describe('quoteOrder: tope de descuentos extra', () => {
   beforeEach(() => { db.products = []; db.coupon = null; });
@@ -81,7 +84,6 @@ describe('quoteOrder: tope de descuentos extra', () => {
 
 describe('quoteOrder: máximo del 10 % de descuento extra (margen para los asesores)', () => {
   beforeEach(() => { db.products = []; db.coupon = null; });
-  const roomy = (price: number) => [{ id: 1, price, sale_price: 0, promo_price: null, stock: 5, cost: Math.round(price * 0.3) }];
 
   it('el tramo más alto es el 10 % (ya no hay 15 % desde 500 €)', async () => {
     db.products = roomy(80000);
@@ -115,5 +117,35 @@ describe('quoteOrder: máximo del 10 % de descuento extra (margen para los aseso
     const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'VUELVE10-X' });
     expect(q.discountCents).toBe(1000);
     expect(q.promo?.note).toBeUndefined();
+  });
+});
+
+describe('quoteOrder: cupón de bienvenida BIENVENIDA5', () => {
+  beforeEach(() => {
+    db.products = roomy(10000);
+    db.coupon = { type: 'percent', value: 5, min_amount: 0 };
+    db.orders = [];
+  });
+
+  it('rechaza BIENVENIDA5 si no hay usuario registrado', async () => {
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'BIENVENIDA5' });
+    expect(q.promo?.valid).toBe(false);
+    expect(q.promo?.error).toContain('usuarios registrados');
+    expect(q.discountCents).toBe(0);
+  });
+
+  it('rechaza BIENVENIDA5 si el usuario ya tiene pedidos previos', async () => {
+    db.orders = [{ id: 101 }];
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'BIENVENIDA5', userId: 42 });
+    expect(q.promo?.valid).toBe(false);
+    expect(q.promo?.error).toContain('primera compra');
+    expect(q.discountCents).toBe(0);
+  });
+
+  it('aplica el 5 % con BIENVENIDA5 en la primera compra de un usuario registrado', async () => {
+    db.orders = [];
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'BIENVENIDA5', userId: 42 });
+    expect(q.promo?.valid).toBe(true);
+    expect(q.discountCents).toBe(500);
   });
 });

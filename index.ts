@@ -5476,6 +5476,26 @@ app.post('/api/coupons/validate', couponLimiter, async (req: any, res: any) => {
     const used = c.max_uses !== null && c.times_used >= c.max_uses;
     if (expired || used) return res.json({ valid: false, error: 'El cupón ha caducado o ya se ha usado' });
 
+    if (codeUpper === 'BIENVENIDA5') {
+      if (!req.user?.user_id) {
+        return res.json({
+          valid: false,
+          requiresAuth: true,
+          error: 'El cupón BIENVENIDA5 es exclusivo para usuarios registrados. Inicia sesión o crea tu cuenta gratis para aplicarlo.'
+        });
+      }
+      const prevOrders = (await pool.query(
+        `SELECT id FROM orders WHERE user_id = $1 AND status NOT IN ('cancelled', 'failed') LIMIT 1`,
+        [req.user.user_id]
+      )).rows;
+      if (prevOrders.length > 0) {
+        return res.json({
+          valid: false,
+          error: 'El cupón BIENVENIDA5 solo es válido para tu primera compra.'
+        });
+      }
+    }
+
     // Importe mínimo: subtotal en euros (productos con IVA, antes de descuentos).
     const minEur = (Number(c.min_amount) || 0) / 100;
     if (minEur > 0 && subtotal !== undefined && Number(subtotal) < minEur) {
@@ -5563,7 +5583,15 @@ app.post('/api/cart/quote', async (req: any, res: any) => {
       .map((i: any) => ({ id: parseInt(i?.id), quantity: parseInt(i?.quantity) }))
       .filter((l: any) => Number.isInteger(l.id) && l.id > 0 && Number.isInteger(l.quantity) && l.quantity >= 1 && l.quantity <= 99);
     const overrides = await proposalOverrides(chatProposal, req.user?.user_id ?? null);
-    const q = await quoteOrder({ cart: lines, country, postcode, promoCode, overrides });
+    const q = await quoteOrder({
+      cart: lines,
+      country,
+      postcode,
+      promoCode,
+      overrides,
+      userId: req.user?.user_id ?? null,
+      userEmail: req.user?.email ?? null,
+    });
     // Precio unitario que se cobra por producto (el del catálogo con su descuento,
     // o el del asesor): el carrito lo muestra en cada línea.
     const byProduct = new Map<number, { cents: number; qty: number }>();
@@ -5635,6 +5663,8 @@ app.post('/api/orders/create', async (req: any, res: any) => {
       promoCode,
       // Descuentos pactados con un asesor del chat (solo para ese cliente).
       overrides: await proposalOverrides(req.body?.chatProposal, dbUserId),
+      userId: dbUserId,
+      userEmail,
     };
     // Primero se valida sin gastar el cupón; solo si el pedido es válido se canjea.
     const check = await quoteOrder(quoteInput);
