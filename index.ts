@@ -56,6 +56,7 @@ import { agentRouter } from './routes/agentRoutes.js';
 import { chatToolsRouter, startChatJobs } from './routes/chatToolsRoutes.js';
 import { mfaRouter } from './routes/mfaRoutes.js';
 import { motoAlertRouter } from './routes/motoAlertRoutes.js';
+import { analyticsRouter } from './routes/analyticsRoutes.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -739,6 +740,7 @@ app.use('/api', agentRouter);
 app.use('/api', chatToolsRouter);
 app.use('/api', mfaRouter);
 app.use('/api', motoAlertRouter);
+app.use('/api', analyticsRouter);
 
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
 // /uploads se sirve como estático en el mismo origen, así que nunca se debe
