@@ -36,6 +36,8 @@ export const NOTIFICATION_CATEGORIES = [
   { key: 'review', label: 'Reseñas', description: 'Opiniones nuevas de productos', urgent: false },
   { key: 'abandoned_cart', label: 'Carritos abandonados', description: 'Clientes que dejan productos sin comprar', urgent: false },
   { key: 'new_user', label: 'Clientes', description: 'Altas y bajas de cuentas', urgent: false },
+  { key: 'visitor_entry', label: 'Nuevos visitantes', description: 'Entrada de un nuevo visitante real a la tienda', urgent: false },
+  { key: 'visitor_activity', label: 'Avance de visitantes', description: 'Visitante explorando productos, navegando o avanzando en la tienda', urgent: false },
   { key: 'system', label: 'Sistema', description: 'Sincronizaciones con Bihr y correos que no se han podido enviar', urgent: false },
   { key: 'daily_summary', label: 'Resumen diario', description: 'Ventas, reembolsos y pendientes del día a las 21:00', urgent: false },
   { key: 'social_content', label: 'Contenido TikTok', description: 'Avisa cuando toca publicar y el contenido ya está preparado', urgent: true },
@@ -499,3 +501,209 @@ export async function notifyDailySummary(s: {
     tag: 'daily-summary',
   });
 }
+
+// ── Avisos de nuevos visitantes y avance en tienda ──────────────────────
+
+export interface VisitorEventInput {
+  sessionId?: string;
+  event: 'visit' | 'engaged';
+  page?: string;
+  title?: string;
+  referrer?: string;
+  source?: string;
+  action?: 'view_product' | 'browse' | 'add_to_cart' | 'checkout';
+  productName?: string;
+  productPrice?: number;
+  cartTotal?: number;
+  pageCount?: number;
+  durationSeconds?: number;
+  ip?: string;
+  userAgent?: string;
+}
+
+const BOT_REGEX = /bot|crawl|spider|slurp|facebookexternalhit|whatsapp|google|bing|yandex|duckduckgo|baidu|semrush|ahrefs|lighthouse|headless|curl|wget|python|php|httpclient/i;
+
+export function isBot(userAgent?: string): boolean {
+  if (!userAgent || typeof userAgent !== 'string') return true;
+  const ua = userAgent.trim();
+  if (ua.length < 15) return true;
+  return BOT_REGEX.test(ua);
+}
+
+interface VisitorSessionRecord {
+  firstSeen: number;
+  entryNotified: boolean;
+  actionsNotified: Set<string>;
+  lastActivityNotified: number;
+}
+
+const visitorSessions = new Map<string, VisitorSessionRecord>();
+const ipLastVisitNotice = new Map<string, number>();
+
+// Limpieza periódica de sesiones e IPs antiguas (cada 15 min, retiene 2 h)
+if (typeof setInterval !== 'undefined') {
+  setInterval(() => {
+    const cutoff = Date.now() - 2 * 3600 * 1000;
+    for (const [sid, rec] of visitorSessions.entries()) {
+      if (rec.firstSeen < cutoff) visitorSessions.delete(sid);
+    }
+    for (const [ip, t] of ipLastVisitNotice.entries()) {
+      if (t < cutoff) ipLastVisitNotice.delete(ip);
+    }
+  }, 15 * 60 * 1000).unref();
+}
+
+/**
+ * Procesa un evento de visitante (entrada o avance en catálogo/carrito).
+ * Aplica deduplicación estricta, filtros de bots y cooldown para no saturar al administrador.
+ */
+export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ success: boolean; skipped?: string; notified?: string }> {
+  // 1. Filtrar bots y rastreadores
+  if (isBot(input.userAgent)) {
+    return { success: true, skipped: 'bot_or_crawler' };
+  }
+
+  const sid = (typeof input.sessionId === 'string' && input.sessionId.trim().length >= 6)
+    ? input.sessionId.trim().slice(0, 64)
+    : `anon_${Math.random().toString(36).slice(2, 10)}`;
+
+  let session = visitorSessions.get(sid);
+  if (!session) {
+    session = {
+      firstSeen: Date.now(),
+      entryNotified: false,
+      actionsNotified: new Set<string>(),
+      lastActivityNotified: 0,
+    };
+    visitorSessions.set(sid, session);
+  }
+
+  const now = Date.now();
+  const ip = (input.ip || '').trim();
+
+  // ── Caso 1: Nueva visita a la tienda ────────────────────────────────────
+  if (input.event === 'visit') {
+    if (session.entryNotified) {
+      return { success: true, skipped: 'already_notified_session' };
+    }
+    // Cooldown por IP: al menos 5 min entre visitas de la misma IP para no duplicar por pestañas/recargas
+    if (ip) {
+      const lastIpTime = ipLastVisitNotice.get(ip) || 0;
+      if (now - lastIpTime < 5 * 60 * 1000) {
+        return { success: true, skipped: 'ip_cooldown' };
+      }
+    }
+
+    session.entryNotified = true;
+    if (ip) ipLastVisitNotice.set(ip, now);
+
+    const source = input.source ? `Desde ${input.source}` : (input.referrer ? `Ref: ${input.referrer.slice(0, 30)}` : 'Acceso directo');
+    const rawPage = input.title || input.page || 'la portada';
+    const cleanPage = rawPage.replace(/\s*[-|]\s*Escapes y Más.*$/i, '').trim() || 'la portada';
+    const displayPage = cleanPage.length > 45 ? `${cleanPage.slice(0, 42)}…` : cleanPage;
+
+    await sendNotificationToAll({
+      category: 'visitor_entry',
+      title: '👀 Nuevo visitante en la tienda',
+      body: `${source} · Viendo ${displayPage}`,
+      url: adminUrl('stats'),
+      tag: `visitor-${sid}`,
+      data: { sessionId: sid, page: input.page, source: input.source },
+    });
+
+    return { success: true, notified: 'visit' };
+  }
+
+  // ── Caso 2: El cliente avanza en la tienda ──────────────────────────────
+  if (input.event === 'engaged') {
+    // Cooldown de 15 segundos entre avisos de actividad para el mismo visitante
+    if (now - session.lastActivityNotified < 15 * 1000) {
+      return { success: true, skipped: 'activity_cooldown' };
+    }
+
+    const action = input.action || 'browse';
+
+    if (action === 'add_to_cart') {
+      const prodName = (input.productName || 'un producto').slice(0, 50);
+      const actionKey = `cart_${prodName}`;
+      if (session.actionsNotified.has(actionKey)) return { success: true, skipped: 'action_already_notified' };
+      session.actionsNotified.add(actionKey);
+      session.lastActivityNotified = now;
+
+      const priceText = input.productPrice ? ` (${input.productPrice} €)` : '';
+      const cartText = input.cartTotal ? ` · Carrito: ${input.cartTotal} €` : '';
+
+      await sendNotificationToAll({
+        category: 'visitor_activity',
+        title: '🛒 Producto añadido al carrito',
+        body: `Ha añadido "${prodName}"${priceText}${cartText}`,
+        url: adminUrl('carts'),
+        tag: `visitor-${sid}`,
+        data: { sessionId: sid, action: 'add_to_cart', product: prodName },
+      });
+      return { success: true, notified: 'add_to_cart' };
+    }
+
+    if (action === 'checkout') {
+      const actionKey = 'checkout';
+      if (session.actionsNotified.has(actionKey)) return { success: true, skipped: 'action_already_notified' };
+      session.actionsNotified.add(actionKey);
+      session.lastActivityNotified = now;
+
+      const totalText = input.cartTotal ? ` con ${input.cartTotal} €` : '';
+      await sendNotificationToAll({
+        category: 'visitor_activity',
+        title: '💳 Visitante en la pasarela de pago',
+        body: `Ha iniciado el proceso de compra${totalText}`,
+        url: adminUrl('orders'),
+        tag: `visitor-${sid}`,
+        data: { sessionId: sid, action: 'checkout' },
+      });
+      return { success: true, notified: 'checkout' };
+    }
+
+    if (action === 'view_product') {
+      const prodName = (input.productName || input.title || 'un escape')
+        .replace(/\s*[-|]\s*Escapes y Más.*$/i, '').trim().slice(0, 50);
+      const actionKey = `prod_${prodName.slice(0, 30)}`;
+      if (session.actionsNotified.has(actionKey)) return { success: true, skipped: 'action_already_notified' };
+      session.actionsNotified.add(actionKey);
+      session.lastActivityNotified = now;
+
+      const priceText = input.productPrice ? ` (${input.productPrice} €)` : '';
+      const pageText = input.pageCount ? ` · Página ${input.pageCount}` : '';
+
+      await sendNotificationToAll({
+        category: 'visitor_activity',
+        title: '🔥 Visitante consultando producto',
+        body: `Viendo "${prodName}"${priceText}${pageText}`,
+        url: adminUrl('products'),
+        tag: `visitor-${sid}`,
+        data: { sessionId: sid, action: 'view_product', page: input.page },
+      });
+      return { success: true, notified: 'view_product' };
+    }
+
+    if (action === 'browse') {
+      const milestone = Math.floor((input.pageCount || 3) / 3);
+      const actionKey = `browse_${milestone}`;
+      if (session.actionsNotified.has(actionKey)) return { success: true, skipped: 'action_already_notified' };
+      session.actionsNotified.add(actionKey);
+      session.lastActivityNotified = now;
+
+      const dur = input.durationSeconds ? ` en ${Math.round(input.durationSeconds)} s` : '';
+      await sendNotificationToAll({
+        category: 'visitor_activity',
+        title: '🚀 Visitante navegando activamente',
+        body: `Lleva ${input.pageCount || 3} páginas vistas${dur}`,
+        url: adminUrl('stats'),
+        tag: `visitor-${sid}`,
+        data: { sessionId: sid, action: 'browse', pageCount: input.pageCount },
+      });
+      return { success: true, notified: 'browse' };
+    }
+  }
+
+  return { success: true, skipped: 'unknown_event' };
+}
+

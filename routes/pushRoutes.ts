@@ -1,14 +1,25 @@
 import { Router } from 'express';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import {
   getVapidPublicKey, saveSubscription, removeSubscription, sendNotificationToAll, updatePreferences,
   getSubscriptionPreferences, listNotifications, markNotificationsRead, unreadCount, NOTIFICATION_CATEGORIES,
-  listAgentNotifications, markAgentNotificationsRead,
+  listAgentNotifications, markAgentNotificationsRead, handleVisitorEvent,
 } from '../pushService.js';
 import { addStreamClient, writeEvent } from '../lib/agent-stream.js';
 import { authenticateRequest } from '../utils.js';
 import { requireAgent } from '../lib/agent-auth.js';
 
 export const pushRouter = Router();
+
+// Límite para eventos de visitantes: evita abuso de push y sobrecarga
+const visitorLimiter = rateLimit({
+  keyGenerator: (req: any) => ipKeyGenerator(req.clientIp || req.ip || 'unknown'),
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas peticiones. Inténtalo más tarde.' },
+});
 
 /** Los avisos llevan datos de clientes y pedidos: solo para administradores. */
 function requireAdmin(req: any, res: any): any | null {
@@ -33,6 +44,19 @@ function requireAdminOrAgent(req: any, res: any): any | null {
 // GET /api/push/vapid-public-key
 pushRouter.get('/push/vapid-public-key', (_req, res) => {
   return res.json({ publicKey: getVapidPublicKey() });
+});
+
+// POST /api/push/visitor-event — eventos de visita y avance desde la tienda pública
+pushRouter.post('/push/visitor-event', visitorLimiter, async (req, res) => {
+  try {
+    const ip = (req as any).clientIp || req.ip || '';
+    const userAgent = String(req.headers['user-agent'] || '');
+    const result = await handleVisitorEvent({ ...req.body, ip, userAgent });
+    return res.json({ success: true, ...result });
+  } catch (err: any) {
+    console.error('[PUSH VISITOR EVENT ERROR]:', err.message);
+    return res.status(500).json({ error: 'Error procesando evento de visitante' });
+  }
 });
 
 // POST /api/push/subscribe
