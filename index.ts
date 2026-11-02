@@ -4381,6 +4381,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         return res.json({ success: true, message: 'Token de notificación registrado' });
       }
 
+      case 'send-cart-recovery-email':
       case 'send-abandoned-email': {
         if (req.method !== 'POST') return res.status(405).end();
         const { cartId, email, firstName, items } = req.body;
@@ -4388,11 +4389,16 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         try {
           const cartDb = await db.execute(sql`
-            SELECT session_token FROM carts WHERE id = ${parseInt(cartId)}
+            SELECT session_token, items FROM carts WHERE id = ${parseInt(cartId)}
           `);
           const sessionToken = cartDb.rows[0] ? (cartDb.rows[0] as any).session_token : '';
 
-          const itemsList = Array.isArray(items) ? items : [];
+          let itemsList = Array.isArray(items) ? items : [];
+          if (itemsList.length === 0 && cartDb.rows[0] && (cartDb.rows[0] as any).items) {
+            try {
+              itemsList = JSON.parse((cartDb.rows[0] as any).items);
+            } catch {}
+          }
           // Los precios del carrito de sesión vienen en euros.
           let total = 0;
           for (const item of itemsList) total += (parseFloat(item.price || 0) || 0) * (parseInt(item.quantity || 1) || 1);
@@ -4435,6 +4441,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         const usersRes = await db.execute(sql`
           SELECT 
             u.id, 
+            u.wp_id as "wpId",
             u.email, 
             u.username,
             u.first_name as "firstName", 
@@ -4445,6 +4452,7 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
             u.created_at as "createdAt", 
             u.billing,
             u.garage as "userGarageJson",
+            u.cart as "userCart",
             (
               SELECT COALESCE(
                 json_agg(
