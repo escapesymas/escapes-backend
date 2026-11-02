@@ -525,17 +525,19 @@ IMPORTANTE: una sola fotografía vertical continua de arriba abajo. Nada de una 
   return saveBufferAsFile(buffer!, 'png');
 }
 
-/** Imagen solo a partir de texto con MiniMax (sin producto: escena genérica sin marcas). */
+/** Imagen solo a partir de texto con MiniMax (escenas y fotos de ambiente). */
 export async function minimaxGenerateImage(prompt: string): Promise<string> {
   if (!process.env.MINIMAX_API_KEY) throw new Error('MINIMAX_API_KEY no configurada');
   const res = await fetch('https://api.minimax.io/v1/image_generation', {
     method: 'POST',
     headers: { Authorization: `Bearer ${process.env.MINIMAX_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'image-01', prompt, n: 1, aspect_ratio: '9:16' }),
+    body: JSON.stringify({ model: 'image-01', prompt, n: 1, aspect_ratio: '9:16', prompt_optimizer: true }),
     signal: AbortSignal.timeout(90_000),
   });
   if (!res.ok) throw new Error(`MiniMax imagen ${res.status}`);
   const data: any = await res.json();
+  const code = data?.base_resp?.status_code;
+  if (code && code !== 0) throw new Error(data?.base_resp?.status_msg || `MiniMax error ${code}`);
   const url = data?.data?.image_urls?.[0];
   if (!url) throw new Error('MiniMax no devolvió imagen');
   const imgRes = await fetch(url);
@@ -544,10 +546,11 @@ export async function minimaxGenerateImage(prompt: string): Promise<string> {
 
 /**
  * Imágenes del hueco. Con producto: sus fotos reales (1 para foto/vídeo, hasta
- * 4 para carrusel) y, si Gemini responde, una escena de ambiente al principio
- * hecha a partir de la foto real. Sin producto: escenas genéricas sin marcas.
+ * 4 para carrusel) y una escena de ambiente al principio hecha con Gemini (con la
+ * foto real de referencia) o con MiniMax si Gemini no tiene cuota o no responde.
+ * Sin producto: escenas genéricas sin marcas.
  */
-/** Escena de ambiente con el producto real como referencia (Gemini). null si Gemini no responde. */
+/** Escena de ambiente con el producto real como referencia (Gemini o MiniMax). null si ninguna responde. */
 export async function productScene(p: SlotProduct, focus: string): Promise<string | null> {
   if (!p.images.length) return null;
   const reference = await loadImage(p.images[0]);
@@ -560,8 +563,15 @@ Sin ningún texto, cartel, letrero, valla ni logotipo en el escenario. La foto o
 arriba, fondo sencillo (cielo, pared o desenfoque) porque ahí irán los logotipos, y la mitad inferior tranquila para poner texto encima.`,
       reference);
   } catch (err: any) {
-    console.warn('[SOCIAL CONTENT] escena de producto:', err.message);
-    return null;
+    console.warn('[SOCIAL CONTENT] Gemini escena de producto falló, uso MiniMax:', err.message);
+    try {
+      const prompt = `Fotografía publicitaria realista en vertical (9:16), buena luz, estilo cinematográfico motero. ${focus}
+Ambiente publicitario para moteros con ${p.brand} ${p.name}. Sin texto, letras ni marcas de agua en el fondo. La foto ocupa todo el encuadre de borde a borde. Arriba fondo limpio y mitad inferior tranquila.`;
+      return await minimaxGenerateImage(prompt);
+    } catch (minimaxErr: any) {
+      console.warn('[SOCIAL CONTENT] MiniMax escena de producto falló:', minimaxErr.message);
+      return null;
+    }
   }
 }
 
@@ -583,10 +593,17 @@ en la parte superior, fondo sencillo (cielo, pared o desenfoque) porque ahí ir�
           `${scene}\nColoca EXACTAMENTE el producto de la foto adjunta (${p.brand} ${p.name}) en la escena, sin cambiar su forma, colores ni logotipos.`,
           reference);
       } catch (err: any) {
-        notes.push(/ 429$/.test(err.message)
-          ? 'Sin imagen de ambiente: la cuenta de Gemini no tiene cuota para imágenes (plan gratuito). Activa la facturación en Google AI Studio. Se usan las fotos reales del producto.'
-          : 'No se pudo crear la imagen de ambiente (Gemini no responde); se usan las fotos reales del producto.');
-        console.warn('[SOCIAL CONTENT] imagen de ambiente:', err.message);
+        console.warn('[SOCIAL CONTENT] Gemini imagen falló, uso MiniMax:', err.message);
+        try {
+          const minimaxPrompt = `${scene}\nAmbiente publicitario realista para moteros relacionado con ${p.brand} ${p.name}. Sin textos ni letras añadidas.`;
+          ambient = await minimaxGenerateImage(minimaxPrompt);
+          notes.push('Imagen de ambiente generada con MiniMax (Gemini no disponible).');
+        } catch (minimaxErr: any) {
+          notes.push(/ 429$/.test(err.message)
+            ? 'Sin imagen de ambiente: la cuenta de Gemini no tiene cuota para imágenes (plan gratuito) y MiniMax tampoco respondió. Se usan las fotos reales del producto.'
+            : 'No se pudo crear la imagen de ambiente; se usan las fotos reales del producto.');
+          console.warn('[SOCIAL CONTENT] MiniMax imagen también falló:', minimaxErr.message);
+        }
       }
     }
     return { urls: ambient ? [ambient, ...real].slice(0, Math.max(real.length, opts.format === 'carousel' ? 4 : 2)) : real, notes };
