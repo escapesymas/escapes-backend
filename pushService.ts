@@ -38,6 +38,7 @@ export const NOTIFICATION_CATEGORIES = [
   { key: 'new_user', label: 'Clientes', description: 'Altas y bajas de cuentas', urgent: false },
   { key: 'visitor_entry', label: 'Nuevos visitantes', description: 'Entrada de un nuevo visitante real a la tienda', urgent: false },
   { key: 'visitor_activity', label: 'Avance de visitantes', description: 'Visitante explorando productos, navegando o avanzando en la tienda', urgent: false },
+  { key: 'visitor_leave', label: 'Abandono de visitantes', description: 'Avisa cuando un visitante sale de la tienda o finaliza su sesión', urgent: false },
   { key: 'system', label: 'Sistema', description: 'Sincronizaciones con Bihr y correos que no se han podido enviar', urgent: false },
   { key: 'daily_summary', label: 'Resumen diario', description: 'Ventas, reembolsos y pendientes del día a las 21:00', urgent: false },
   { key: 'social_content', label: 'Contenido TikTok', description: 'Avisa cuando toca publicar y el contenido ya está preparado', urgent: true },
@@ -753,7 +754,7 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
     const lastText = lastPageClean && lastPageClean !== '/' ? ` · Última: ${lastPageClean.slice(0, 35)}` : '';
 
     await sendNotificationToAll({
-      category: 'visitor_activity',
+      category: 'visitor_leave',
       title: hasCart ? '👋 Visitante sale con carrito sin pagar' : '👋 Visitante ha salido de la tienda',
       body: `Estuvo ${durText}${pagesText}${cartDesc}${lastText}`,
       url: hasCart ? adminUrl('carts') : adminUrl('stats'),
