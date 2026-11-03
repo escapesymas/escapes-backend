@@ -57,6 +57,8 @@ import { chatToolsRouter, startChatJobs } from './routes/chatToolsRoutes.js';
 import { mfaRouter } from './routes/mfaRoutes.js';
 import { motoAlertRouter } from './routes/motoAlertRoutes.js';
 import { analyticsRouter } from './routes/analyticsRoutes.js';
+import { andreaniRouter } from './routes/andreani.js';
+import { startAndreaniStockCron } from './lib/andreani-service.js';
 import { ensureCompatModels } from './lib/compat.js';
 import { runMigrations } from './lib/migrate.js';
 import { backfillCatalogColumns } from './lib/catalog-backfill.js';
@@ -741,6 +743,7 @@ app.use('/api', chatToolsRouter);
 app.use('/api', mfaRouter);
 app.use('/api', motoAlertRouter);
 app.use('/api', analyticsRouter);
+app.use('/api', andreaniRouter);
 
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:
 // /uploads se sirve como estático en el mismo origen, así que nunca se debe
@@ -7353,6 +7356,7 @@ app.listen(PORT, () => {
   // Placed after listen() so the boot banner is printed first even if the
   // initial run takes a few seconds.
   startBihrStockCron();
+  startAndreaniStockCron();
   // Promociones con fechas (DTO2): se activan y se retiran solas.
   const promoTick = () => applyPromotions()
     .then((r) => { if (r.applied || r.removed) { console.log(`[PROMOS] ${r.applied} aplicadas, ${r.removed} retiradas`); return cacheBust('cache:products'); } })
