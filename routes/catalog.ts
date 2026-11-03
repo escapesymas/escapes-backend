@@ -1371,8 +1371,43 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', refreshStockLimiter, as
       return res.json({ stock: currentStock, inStock: currentStock > 0 });
     }
 
+    const sku = String(product.sku || '');
     const supplierCode = String(product.supplier_code || product.sku || '');
     if (!supplierCode) {
+      return res.json({ stock: currentStock, inStock: currentStock > 0 });
+    }
+
+    // Si es producto de Andreani (SKU AND-*), consultar API de Andreani / ApproSearch (o mantener stock sincronizado)
+    if (sku.startsWith('AND-')) {
+      const quinceMinutos = 15 * 60 * 1000;
+      const necesitaActualizacion = !product.updated_at || (Date.now() - new Date(product.updated_at).getTime() > quinceMinutos);
+      if (!necesitaActualizacion) {
+        return res.json({ stock: currentStock, inStock: currentStock > 0 });
+      }
+
+      try {
+        const cleanRef = (product.supplier_code || sku.replace(/^AND-/, '')).trim().toUpperCase();
+        const apiUrl = `https://api.approsearch.com/api/v1/search?api_key=aps_yArpUYoJVuph6jDyEWpkgy02k_ilLQKD&q=${encodeURIComponent(cleanRef)}&limit=5`;
+        const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(4000) });
+        if (resp.ok) {
+          const data = (await resp.json()) as any;
+          const prods = data?.data?.products || [];
+          const match = prods.find((p: any) => String(p?.reference || '').trim().toUpperCase() === cleanRef);
+          if (match && match.stock !== undefined) {
+            const safeStock = Math.max(0, parseInt(match.stock, 10) || 0);
+            const inStock = safeStock > 0;
+            await db.execute(sql`
+              UPDATE products 
+              SET stock = ${safeStock}, updated_at = NOW() 
+              WHERE id = ${product.id}
+            `);
+            console.log(`[ANDREANI LIVE STOCK REFRESH] Updated stock for ${product.sku} to ${safeStock} (inStock: ${inStock})`);
+            return res.json({ stock: safeStock, inStock });
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[ANDREANI LIVE STOCK REFRESH WARN] Error consultando stock para ${product.sku}:`, e.message);
+      }
       return res.json({ stock: currentStock, inStock: currentStock > 0 });
     }
 
