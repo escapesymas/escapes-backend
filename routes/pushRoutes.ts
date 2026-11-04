@@ -2,7 +2,7 @@ import { Router } from 'express';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import {
   getVapidPublicKey, saveSubscription, removeSubscription, sendNotificationToAll, updatePreferences,
-  getSubscriptionPreferences, listNotifications, markNotificationsRead, unreadCount, NOTIFICATION_CATEGORIES,
+  getSubscriptionPreferences, getUserPreferences, listNotifications, markNotificationsRead, unreadCount, NOTIFICATION_CATEGORIES,
   listAgentNotifications, markAgentNotificationsRead, handleVisitorEvent,
 } from '../pushService.js';
 import { addStreamClient, writeEvent } from '../lib/agent-stream.js';
@@ -78,10 +78,16 @@ pushRouter.post('/push/subscribe', async (req, res) => {
 
 // GET /api/push/preferences?endpoint=…  → preferencias y categorías disponibles
 pushRouter.get('/push/preferences', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  const auth = requireAdmin(req, res);
+  if (!auth) return;
   try {
     const endpoint = String(req.query.endpoint || '');
-    const preferences = endpoint ? await getSubscriptionPreferences(endpoint) : null;
+    let preferences = null;
+    if (endpoint) {
+      preferences = await getSubscriptionPreferences(endpoint);
+    } else if (auth.user_id) {
+      preferences = await getUserPreferences(auth.user_id);
+    }
     return res.json({ preferences, categories: NOTIFICATION_CATEGORIES });
   } catch (err: any) {
     console.error('[PUSH GET PREFERENCES ERROR]:', err.message);
@@ -91,11 +97,14 @@ pushRouter.get('/push/preferences', async (req, res) => {
 
 // POST /api/push/preferences
 pushRouter.post('/push/preferences', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  const auth = requireAdmin(req, res);
+  if (!auth) return;
   try {
     const { endpoint, preferences } = req.body || {};
-    if (!endpoint || !preferences) return res.status(400).json({ error: 'Endpoint y preferencias requeridos' });
-    await updatePreferences(endpoint, preferences);
+    if (!preferences || typeof preferences !== 'object') {
+      return res.status(400).json({ error: 'Preferencias requeridas' });
+    }
+    await updatePreferences(endpoint || null, preferences, auth.user_id);
     return res.json({ success: true, message: 'Preferencias actualizadas' });
   } catch (err: any) {
     console.error('[PUSH UPDATE PREFERENCES ERROR]:', err.message);
@@ -135,15 +144,17 @@ pushRouter.post('/push/test', async (req, res) => {
 
 // GET /api/push/history?limit=&before=&category=&unread=1
 pushRouter.get('/push/history', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  const auth = requireAdmin(req, res);
+  if (!auth) return;
   try {
     const items = await listNotifications({
       limit: parseInt(String(req.query.limit || '30')) || 30,
       before: parseInt(String(req.query.before || '')) || undefined,
       category: req.query.category ? String(req.query.category) : undefined,
       unread: req.query.unread === '1',
+      userId: auth.user_id,
     });
-    return res.json({ items, unread: await unreadCount() });
+    return res.json({ items, unread: await unreadCount(auth.user_id) });
   } catch (err: any) {
     console.error('[PUSH HISTORY ERROR]:', err.message);
     return res.status(500).json({ error: 'No se pudo leer el historial' });
@@ -152,9 +163,10 @@ pushRouter.get('/push/history', async (req, res) => {
 
 // GET /api/push/unread-count
 pushRouter.get('/push/unread-count', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  const auth = requireAdmin(req, res);
+  if (!auth) return;
   try {
-    return res.json({ unread: await unreadCount() });
+    return res.json({ unread: await unreadCount(auth.user_id) });
   } catch {
     return res.json({ unread: 0 });
   }
@@ -162,11 +174,12 @@ pushRouter.get('/push/unread-count', async (req, res) => {
 
 // POST /api/push/history/read  { ids: number[] } | { all: true }
 pushRouter.post('/push/history/read', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  const auth = requireAdmin(req, res);
+  if (!auth) return;
   try {
     const { ids, all } = req.body || {};
     await markNotificationsRead(all ? 'all' : (Array.isArray(ids) ? ids.map((x: any) => parseInt(x)).filter(Number.isFinite) : []));
-    return res.json({ success: true, unread: await unreadCount() });
+    return res.json({ success: true, unread: await unreadCount(auth.user_id) });
   } catch (err: any) {
     console.error('[PUSH READ ERROR]:', err.message);
     return res.status(500).json({ error: 'No se pudo actualizar' });

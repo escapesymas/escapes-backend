@@ -100,17 +100,37 @@ export async function removeSubscription(endpoint: string) {
   await db.execute(sql`DELETE FROM push_subscriptions WHERE endpoint = ${endpoint}`);
 }
 
-export async function updatePreferences(endpoint: string, prefs: Partial<NotificationPreferences>) {
+export async function updatePreferences(endpoint: string | null | undefined, prefs: Partial<NotificationPreferences>, userId?: number) {
   // Solo se guardan claves conocidas y valores booleanos.
   const clean: Record<string, boolean> = {};
   for (const c of NOTIFICATION_CATEGORIES) {
     if (typeof (prefs as any)?.[c.key] === 'boolean') clean[c.key] = (prefs as any)[c.key];
   }
-  await db.execute(sql`
-    UPDATE push_subscriptions
-    SET preferences = COALESCE(preferences, '{}'::jsonb) || ${JSON.stringify(clean)}::jsonb
-    WHERE endpoint = ${endpoint};
-  `);
+  const cleanJson = JSON.stringify(clean);
+  if (userId) {
+    await db.execute(sql`
+      UPDATE push_subscriptions
+      SET preferences = COALESCE(preferences, '{}'::jsonb) || ${cleanJson}::jsonb
+      WHERE user_id = ${userId};
+    `);
+  } else if (endpoint) {
+    await db.execute(sql`
+      UPDATE push_subscriptions
+      SET preferences = COALESCE(preferences, '{}'::jsonb) || ${cleanJson}::jsonb
+      WHERE endpoint = ${endpoint};
+    `);
+  }
+}
+
+export async function getUserPreferences(userId: number): Promise<NotificationPreferences> {
+  const res = await pool.query(`SELECT preferences FROM push_subscriptions WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [userId]);
+  const row = res.rows[0];
+  return { ...DEFAULT_PREFERENCES, ...(row?.preferences || {}) };
+}
+
+export async function getDisabledCategoriesForUser(userId: number): Promise<string[]> {
+  const prefs = await getUserPreferences(userId);
+  return Object.keys(prefs).filter((key) => (prefs as any)[key] === false);
 }
 
 export async function getSubscriptionPreferences(endpoint: string): Promise<NotificationPreferences> {
@@ -143,22 +163,32 @@ export interface AdminNotification {
 export async function sendNotificationToAll(payload: AdminNotification) {
   const category: NotificationCategory = payload.category || 'system';
   const url = payload.url || adminUrl('notifications');
-  let historyId: number | null = null;
-  try {
-    const ins = await pool.query(
-      `INSERT INTO admin_notifications (category, title, body, url, data) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [category, payload.title.slice(0, 200), payload.body.slice(0, 1000), url, JSON.stringify(payload.data || {})]);
-    historyId = ins.rows[0]?.id ?? null;
-  } catch (err: any) {
-    console.error('[PUSH HISTORY ERROR]:', err.message);
-  }
 
   try {
-    // Solo suscripciones de administradores.
+    // 1. Consultar administradores y sus preferencias
     const res = await pool.query(
       `SELECT s.endpoint, s.p256dh, s.auth, s.preferences
          FROM push_subscriptions s JOIN users u ON u.id = s.user_id
-        WHERE u.role = 'admin'`);
+        WHERE u.role = 'admin'`
+    );
+
+    // Si hay administradores y todos han desactivado explícitamente esta categoría, no guardamos ni enviamos nada
+    const anyActive = res.rows.length === 0 || res.rows.some((sub: any) => !sub.preferences || sub.preferences[category] !== false);
+    if (!anyActive) {
+      return;
+    }
+
+    // 2. Guardar en admin_notifications
+    let historyId: number | null = null;
+    try {
+      const ins = await pool.query(
+        `INSERT INTO admin_notifications (category, title, body, url, data) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [category, payload.title.slice(0, 200), payload.body.slice(0, 1000), url, JSON.stringify(payload.data || {})]);
+      historyId = ins.rows[0]?.id ?? null;
+    } catch (err: any) {
+      console.error('[PUSH HISTORY ERROR]:', err.message);
+    }
+
     if (!res.rows.length) return;
 
     const unread = await unreadCount().catch(() => 0);
@@ -278,17 +308,42 @@ export async function markAgentNotificationsRead(userId: number, ids: number[] |
 
 // ── Historial ────────────────────────────────────────────────────────────
 
-export async function unreadCount(): Promise<number> {
+export async function unreadCount(userId?: number): Promise<number> {
+  if (userId) {
+    const disabled = await getDisabledCategoriesForUser(userId);
+    if (disabled.length) {
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM admin_notifications WHERE read_at IS NULL AND NOT (category = ANY($1))`,
+        [disabled]
+      );
+      return r.rows[0]?.n || 0;
+    }
+  }
   const r = await pool.query('SELECT COUNT(*)::int AS n FROM admin_notifications WHERE read_at IS NULL');
   return r.rows[0]?.n || 0;
 }
 
-export async function listNotifications(opts: { limit?: number; before?: number; category?: string; unread?: boolean } = {}) {
+export async function listNotifications(opts: {
+  limit?: number;
+  before?: number;
+  category?: string;
+  unread?: boolean;
+  userId?: number;
+} = {}) {
   const limit = Math.min(Math.max(opts.limit || 30, 1), 100);
   const where: string[] = [];
   const params: any[] = [];
   if (opts.before) { params.push(opts.before); where.push(`id < $${params.length}`); }
-  if (opts.category) { params.push(opts.category); where.push(`category = $${params.length}`); }
+  if (opts.category) {
+    params.push(opts.category);
+    where.push(`category = $${params.length}`);
+  } else if (opts.userId) {
+    const disabled = await getDisabledCategoriesForUser(opts.userId);
+    if (disabled.length) {
+      params.push(disabled);
+      where.push(`NOT (category = ANY($${params.length}))`);
+    }
+  }
   if (opts.unread) where.push('read_at IS NULL');
   params.push(limit);
   const r = await pool.query(
