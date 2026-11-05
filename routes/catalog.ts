@@ -32,6 +32,7 @@ import {
 import { tyreOptions } from '../lib/tyres.js';
 import { submitIndexNowUrls } from '../lib/indexnow.js';
 import { requireAdminRole } from '../lib/agent-auth.js';
+import { feedPrices } from '../lib/google-feed.js';
 import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -381,20 +382,31 @@ catalogRouter.get('/vehicles', async (req, res) => {
   }
 });
 
-// GET /api/catalog/sitemap-skus — prioriza primero los productos con stock en los primeros sitemaps.
+// Productos que se le piden a Google en el sitemap: publicados, con precio, con stock y con foto propia.
+// Los agotados siguen existiendo y se indexan si Google los encuentra enlazados, pero no se le piden: el 7/11/2026
+// eran 38.000 de 107.000 y diluían el rastreo de un dominio nuevo. Los escapes van en su propio sitemap (prioridad).
+const SITEMAP_BASE = `p.status = 'published' AND p.price > 0 AND p.stock > 0
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p.images) = 'array' THEN p.images ELSE '[]'::jsonb END) e
+               WHERE COALESCE(CASE WHEN jsonb_typeof(e) = 'string' THEN e #>> '{}' ELSE e->>'src' END, '') LIKE '/uploads/%')`;
+const SITEMAP_IS_ESCAPE = `(c.slug = 'escapes' OR p.name ~* '\\m(escape|escapes|silenciador|silencioso)\\M')`;
+
+// GET /api/catalog/sitemap-skus?segment=escapes|resto — por defecto, primero los escapes y luego el resto.
 catalogRouter.get('/catalog/sitemap-skus', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(10000, Math.max(1, parseInt(req.query.limit as string) || 5000));
     const offset = (page - 1) * limit;
+    const segment = req.query.segment === 'escapes' || req.query.segment === 'resto' ? req.query.segment : 'todos';
+    const filter = segment === 'escapes' ? `AND ${SITEMAP_IS_ESCAPE}` : segment === 'resto' ? `AND NOT ${SITEMAP_IS_ESCAPE}` : '';
 
-    const result = await db.execute(sql`
-      SELECT sku, updated_at
-        FROM products
-       WHERE status = 'published' AND price > 0
-       ORDER BY (stock > 0) DESC, id ASC
-       LIMIT ${limit} OFFSET ${offset}
-    `);
+    const result = await pool.query(
+      `SELECT p.sku, p.updated_at
+         FROM products p LEFT JOIN categories c ON c.id = p.category_id
+        WHERE ${SITEMAP_BASE} ${filter}
+        ORDER BY ${SITEMAP_IS_ESCAPE} DESC, p.id ASC
+        LIMIT $1 OFFSET $2`,
+      [limit, offset],
+    );
     res.set('Cache-Control', 'public, max-age=3600');
     res.json(result.rows);
   } catch (err: any) {
@@ -402,12 +414,71 @@ catalogRouter.get('/catalog/sitemap-skus', async (req, res) => {
   }
 });
 
-// GET /api/catalog/sitemap-count — cuántos productos entran en el sitemap.
+// GET /api/catalog/sitemap-count — cuántos productos entran en el sitemap, en total y por segmento.
 catalogRouter.get('/catalog/sitemap-count', async (_req, res) => {
   try {
-    const r = await pool.query(`SELECT count(*)::int AS total FROM products WHERE status = 'published' AND price > 0`);
+    const r = await pool.query(
+      `SELECT count(*)::int AS total, (count(*) FILTER (WHERE esc))::int AS escapes
+         FROM (SELECT ${SITEMAP_IS_ESCAPE} AS esc
+                 FROM products p LEFT JOIN categories c ON c.id = p.category_id
+                WHERE ${SITEMAP_BASE}) t`,
+    );
+    const { total, escapes } = r.rows[0];
     res.set('Cache-Control', 'public, max-age=3600');
-    res.json({ total: r.rows[0].total });
+    res.json({ total, escapes, resto: total - escapes });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/catalog/related-links/:sku — enlaces internos de la ficha: los siguientes de su categoría y de su marca.
+// Van en el HTML del servidor para que Google llegue de una ficha a otras (antes cada ficha era un callejón sin salida).
+// Recorren los productos por id dando la vuelta al final: así cada ficha recibe enlaces de otras y no queda huérfana.
+catalogRouter.get('/catalog/related-links/:sku', async (req, res) => {
+  try {
+    const sku = String(req.params.sku || '').slice(0, 80);
+    const base = await pool.query(
+      `SELECT id, brand, family_code, category3_id, category2_id, category_id FROM products WHERE sku = $1 AND status = 'published'`,
+      [sku],
+    );
+    const me = base.rows[0];
+    if (!me) return res.json([]);
+
+    // Nivel de categoría más fino de esta ficha; la columna sale de una lista fija y así usa el índice de esa columna.
+    const catCol = me.category3_id ? 'category3_id' : me.category2_id ? 'category2_id' : 'category_id';
+    const cat = me[catCol];
+    const cols = `p.sku, p.name, p.brand, p.family_code, p.price, p.sale_price, p.promo_price, p.images`;
+    // $1 = id de esta ficha, $2 = su familia (las variantes de color/medida no cuentan como «otro producto»).
+    const where = `p.status = 'published' AND p.price > 0 AND p.stock > 0 AND p.id <> $1
+                   AND (p.family_code IS NULL OR $2::text IS NULL OR p.family_code <> $2::text)
+                   AND CASE WHEN jsonb_typeof(p.images) = 'array' THEN jsonb_array_length(p.images) ELSE 0 END > 0`;
+    // Los N siguientes por id dando la vuelta, una sola ficha por familia: primero los de id mayor y, si faltan, los de menor.
+    const ring = async (cond: string, params: unknown[], n: number) => {
+      const fetchN = n * 4;
+      const after = await pool.query(`SELECT ${cols} FROM products p WHERE ${where} AND ${cond} AND p.id > $1 ORDER BY p.id LIMIT ${fetchN}`, [me.id, me.family_code, ...params]);
+      const before = await pool.query(`SELECT ${cols} FROM products p WHERE ${where} AND ${cond} AND p.id < $1 ORDER BY p.id LIMIT ${fetchN}`, [me.id, me.family_code, ...params]);
+      const families = new Set<string>();
+      return [...after.rows, ...before.rows].filter((r) => {
+        const key = r.family_code || `sku:${r.sku}`;
+        if (families.has(key)) return false;
+        families.add(key);
+        return true;
+      }).slice(0, n);
+    };
+
+    const sameCategory = cat ? await ring(`p.${catCol} = $3`, [cat], 6) : [];
+    const sameBrand = me.brand && !/bihr/i.test(me.brand)
+      ? await ring(`p.brand = $3 AND p.${catCol} IS DISTINCT FROM $4::int`, [me.brand, cat ?? null], 3)
+      : [];
+
+    const seen = new Set<string>();
+    const items = [...sameCategory, ...sameBrand].filter((r) => (seen.has(r.sku) ? false : (seen.add(r.sku), true))).map((r) => {
+      const first = (Array.isArray(r.images) ? r.images : []).map((i: any) => (typeof i === 'string' ? i : i?.src || i?.url || '')).find((s: string) => s.startsWith('/uploads/'));
+      const { price, salePrice } = feedPrices(r.price, r.sale_price, r.promo_price);
+      return { sku: r.sku, name: r.name, brand: r.brand && !/bihr/i.test(r.brand) ? r.brand : null, price: (salePrice ?? price) / 100, image: first || null };
+    });
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json(items);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
