@@ -505,8 +505,10 @@ const app: any = express();
 // IP real del cliente: se saltan los proxies propios (Traefik y la red interna de
 // Docker, y el propio VPS cuando el frontend reenvía /api). Con `1` todas las
 // peticiones que llegaban vía escapesymas.com compartían la IP del servidor y,
-// con ella, el mismo cupo del rate limit.
-app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal', '212.227.134.161']);
+// con ella, el mismo cupo del rate limit. Se confía en la IP pública del VPS actual
+// (Contabo, desde el 5/11/2026) y en la del anterior (Piensasolutions), que mientras
+// caduca el DNS reenvía al nuevo y debe conservar la IP real del cliente.
+app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal', '13.140.220.42', '212.227.134.161']);
 app.disable('x-powered-by');
 
 // Las llamadas a /api desde la web pasan por Next (escapesymas.com/api → reescritura
