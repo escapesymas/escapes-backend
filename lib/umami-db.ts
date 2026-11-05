@@ -360,7 +360,7 @@ export async function getAnalyticsStats(
   const timeSeriesQuery = isHourly
     ? `
       SELECT 
-        TO_CHAR(e.created_at + INTERVAL '1 hour', 'HH24:00') AS label,
+        TO_CHAR((e.created_at AT TIME ZONE 'Europe/Madrid'), 'HH24:00') AS label,
         COUNT(DISTINCT s.session_id) AS visitors,
         COUNT(e.event_id) AS pageviews,
         COUNT(DISTINCT CASE WHEN e.referrer_domain LIKE '%google%' THEN s.session_id END) AS google
@@ -374,7 +374,7 @@ export async function getAnalyticsStats(
     `
     : `
       SELECT 
-        TO_CHAR(e.created_at + INTERVAL '1 hour', 'DD Mon') AS label,
+        TO_CHAR((e.created_at AT TIME ZONE 'Europe/Madrid'), 'DD Mon') AS label,
         COUNT(DISTINCT s.session_id) AS visitors,
         COUNT(e.event_id) AS pageviews,
         COUNT(DISTINCT CASE WHEN e.referrer_domain LIKE '%google%' THEN s.session_id END) AS google
@@ -383,8 +383,8 @@ export async function getAnalyticsStats(
       WHERE ${dateFilterClause}
         AND e.event_type = 1
         ${internalFilter}
-      GROUP BY TO_CHAR(e.created_at + INTERVAL '1 hour', 'YYYY-MM-DD'), 1
-      ORDER BY TO_CHAR(e.created_at + INTERVAL '1 hour', 'YYYY-MM-DD') ASC;
+      GROUP BY TO_CHAR((e.created_at AT TIME ZONE 'Europe/Madrid'), 'YYYY-MM-DD'), 1
+      ORDER BY TO_CHAR((e.created_at AT TIME ZONE 'Europe/Madrid'), 'YYYY-MM-DD') ASC;
     `;
 
   // 3. Páginas más vistas
@@ -596,7 +596,7 @@ export async function getSessionDetail(sessionId: string): Promise<SessionDetail
     SELECT 
       e.event_id,
       e.created_at,
-      TO_CHAR(e.created_at + INTERVAL '1 hour', 'HH24:MI:SS') AS time_formatted,
+      TO_CHAR((e.created_at AT TIME ZONE 'Europe/Madrid'), 'HH24:MI:SS') AS time_formatted,
       e.event_type,
       COALESCE(e.event_name, 'pageview') AS event_name,
       e.url_path,

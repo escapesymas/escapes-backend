@@ -34,6 +34,18 @@ export const SHIPPING_REAL_COST_CENTS = 2500;
 export interface CartLine { id: number; quantity: number }
 /** Precio pactado por un asesor del chat para un producto (hasta `maxQty` unidades). */
 export interface PriceOverride { productId: number; unitCents: number; maxQty: number }
+/** Estados de un pedido que NO es una compra hecha: sin pagar, fallido o cancelado. */
+const UNPAID_ORDER_STATUSES = new Set(['pending', 'pending_payment', 'payment_failed', 'payment_amount_mismatch', 'cancelled', 'failed']);
+
+/**
+ * ¿Ya compró antes este usuario? Solo cuentan los pedidos pagados: quien abandona en la pasarela y vuelve
+ * (su pedido queda «pending») sigue teniendo derecho al cupón de primera compra.
+ */
+export async function hasPreviousPaidOrder(userId: number): Promise<boolean> {
+  const { rows } = await pool.query(`SELECT status FROM orders WHERE user_id = $1 LIMIT 500`, [userId]);
+  return rows.some((r: any) => !UNPAID_ORDER_STATUSES.has(String(r.status)));
+}
+
 export interface QuoteInput {
   cart: CartLine[]; country?: string; postcode?: string; promoCode?: string | null;
   /** Precios con descuento del asesor: no admiten descuentos por importe ni cupones. */
@@ -153,11 +165,7 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
     } else if (code === 'BIENVENIDA5' && !input.userId) {
       error = 'El cupón BIENVENIDA5 es exclusivo para usuarios registrados. Inicia sesión o regístrate para aplicarlo.';
     } else if (code === 'BIENVENIDA5' && input.userId) {
-      const prev = (await pool.query(
-        `SELECT id FROM orders WHERE user_id = $1 AND status NOT IN ('cancelled', 'failed') LIMIT 1`,
-        [input.userId]
-      )).rows;
-      if (prev.length > 0) {
+      if (await hasPreviousPaidOrder(input.userId)) {
         error = 'El cupón BIENVENIDA5 solo es válido para tu primera compra.';
       }
     }

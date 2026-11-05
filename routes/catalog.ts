@@ -31,6 +31,7 @@ import {
 } from '../lib/brand-seo.js';
 import { tyreOptions } from '../lib/tyres.js';
 import { submitIndexNowUrls } from '../lib/indexnow.js';
+import { requireAdminRole } from '../lib/agent-auth.js';
 import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1615,6 +1616,8 @@ const indexNowLimiter = rateLimit({
 });
 
 catalogRouter.post('/catalog/indexnow', indexNowLimiter, async (req, res) => {
+  // Solo administradores: abierto, cualquiera podía mandar miles de URLs falsas de la tienda a Bing y Yandex.
+  if (!(await requireAdminRole(req, res))) return;
   try {
     const rawUrls = req.body?.urls || req.body?.urlList || req.body?.url;
     if (!rawUrls) {

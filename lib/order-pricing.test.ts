@@ -135,11 +135,24 @@ describe('quoteOrder: cupón de bienvenida BIENVENIDA5', () => {
   });
 
   it('rechaza BIENVENIDA5 si el usuario ya tiene pedidos previos', async () => {
-    db.orders = [{ id: 101 }];
+    db.orders = [{ id: 101, status: 'paid' }];
     const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'BIENVENIDA5', userId: 42 });
     expect(q.promo?.valid).toBe(false);
     expect(q.promo?.error).toContain('primera compra');
     expect(q.discountCents).toBe(0);
+  });
+
+  it('un pedido sin pagar o cancelado no cuenta como compra previa', async () => {
+    db.orders = [{ id: 101, status: 'pending' }, { id: 102, status: 'pending_payment' }, { id: 103, status: 'payment_failed' }, { id: 104, status: 'cancelled' }];
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'BIENVENIDA5', userId: 42 });
+    expect(q.promo?.valid).toBe(true);
+    expect(q.discountCents).toBe(500);
+  });
+
+  it('un pedido reembolsado sí cuenta: ya compró', async () => {
+    db.orders = [{ id: 101, status: 'refunded' }];
+    const q = await quoteOrder({ cart: [{ id: 1, quantity: 1 }], promoCode: 'BIENVENIDA5', userId: 42 });
+    expect(q.promo?.valid).toBe(false);
   });
 
   it('aplica el 5 % con BIENVENIDA5 en la primera compra de un usuario registrado', async () => {

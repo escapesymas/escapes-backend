@@ -39,7 +39,7 @@ import { formatOrderNumber } from './lib/email-templates.js';
 import { REFUND_REASONS, REFUNDABLE_STATUSES, REFUND_REASON_MIN, REFUND_REASON_MAX, refundEstimate, refundRequestsByOrder, refundRequestView, type RefundLine } from './lib/refunds.js';
 import Stripe from 'stripe';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
-import { quoteOrder, shippingFor, MAX_EXTRA_DISCOUNT_PERCENT } from './lib/order-pricing.js';
+import { quoteOrder, shippingFor, hasPreviousPaidOrder, MAX_EXTRA_DISCOUNT_PERCENT } from './lib/order-pricing.js';
 import { repriceProducts, pricingAuto, refreshDto2, applyPromotions, suggestBrandRules, saveBrandRules } from './lib/pricing.js';
 import { isIP } from 'node:net';
 import { catalogRouter } from './routes/catalog.js';
@@ -5497,11 +5497,7 @@ app.post('/api/coupons/validate', couponLimiter, async (req: any, res: any) => {
           error: 'El cupón BIENVENIDA5 es exclusivo para usuarios registrados. Inicia sesión o crea tu cuenta gratis para aplicarlo.'
         });
       }
-      const prevOrders = (await pool.query(
-        `SELECT id FROM orders WHERE user_id = $1 AND status NOT IN ('cancelled', 'failed') LIMIT 1`,
-        [req.user.user_id]
-      )).rows;
-      if (prevOrders.length > 0) {
+      if (await hasPreviousPaidOrder(req.user.user_id)) {
         return res.json({
           valid: false,
           error: 'El cupón BIENVENIDA5 solo es válido para tu primera compra.'

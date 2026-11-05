@@ -10,6 +10,7 @@ import webPush from 'web-push';
 import { db, pool } from './db.js';
 import { sql } from 'drizzle-orm';
 import { pushToUser, pushToAdmins } from './lib/agent-stream.js';
+import { createVisitorGuard, cleanText, cleanNumber, MAX_TRACKED_SESSIONS } from './lib/visitor-guard.js';
 
 // Claves VAPID. Las de respaldo son las que tiene ya registradas el iPhone del
 // administrador; si se configuran en el entorno, habrá que volver a activar
@@ -608,6 +609,7 @@ interface VisitorSessionRecord {
 
 const visitorSessions = new Map<string, VisitorSessionRecord>();
 const ipLastVisitNotice = new Map<string, number>();
+const visitorGuard = createVisitorGuard();
 
 // Limpieza periódica de sesiones e IPs antiguas (cada 15 min, retiene 2 h)
 if (typeof setInterval !== 'undefined') {
@@ -619,6 +621,7 @@ if (typeof setInterval !== 'undefined') {
     for (const [ip, t] of ipLastVisitNotice.entries()) {
       if (t < cutoff) ipLastVisitNotice.delete(ip);
     }
+    visitorGuard.sweep();
   }, 15 * 60 * 1000).unref();
 }
 
@@ -638,7 +641,21 @@ export async function notifyPaymentStart(p: { orderId: number; amountCents: numb
  * Procesa un evento de visitante (entrada, interacción con catálogo/carrito o salida).
  * Aplica deduplicación estricta, filtros de bots y cooldown para no saturar al administrador.
  */
-export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ success: boolean; skipped?: string; notified?: string }> {
+export async function handleVisitorEvent(raw: VisitorEventInput): Promise<{ success: boolean; skipped?: string; notified?: string }> {
+  // Lo que llega es del navegador de cualquiera: solo textos y números razonables, y eventos conocidos.
+  const input: VisitorEventInput = {
+    sessionId: cleanText(raw.sessionId, 64),
+    event: (['visit', 'engaged', 'leave'] as const).find((e) => e === raw.event) as VisitorEventInput['event'],
+    action: (['view_product', 'browse', 'add_to_cart', 'checkout'] as const).find((a) => a === raw.action),
+    page: cleanText(raw.page, 200), lastPage: cleanText(raw.lastPage, 200), title: cleanText(raw.title, 160),
+    referrer: cleanText(raw.referrer, 200), source: cleanText(raw.source, 30),
+    productName: cleanText(raw.productName, 80), cartProduct: cleanText(raw.cartProduct, 80),
+    productPrice: cleanNumber(raw.productPrice), cartTotal: cleanNumber(raw.cartTotal),
+    cartCount: cleanNumber(raw.cartCount, 1000), pageCount: cleanNumber(raw.pageCount, 1000),
+    durationSeconds: cleanNumber(raw.durationSeconds, 86_400),
+    ip: cleanText(raw.ip, 64), userAgent: typeof raw.userAgent === 'string' ? raw.userAgent : '',
+  };
+  if (!input.event) return { success: true, skipped: 'unknown_event' };
   // 1. Filtrar bots y rastreadores
   if (isBot(input.userAgent)) {
     return { success: true, skipped: 'bot_or_crawler' };
@@ -650,6 +667,10 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
 
   let session = visitorSessions.get(sid);
   if (!session) {
+    // Sesiones inventadas: cada IP solo puede abrir unas pocas por hora y la memoria tiene tope.
+    if (visitorSessions.size >= MAX_TRACKED_SESSIONS || !visitorGuard.allowNewSession(input.ip || '')) {
+      return { success: true, skipped: 'ip_session_limit' };
+    }
     session = {
       firstSeen: Date.now(),
       entryNotified: false,
@@ -661,6 +682,11 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
 
   const now = Date.now();
   const ip = (input.ip || '').trim();
+  // Avisos al equipo: tope por IP y hora, aunque cambie de sesión o de textos.
+  const notify: typeof sendNotificationToAll = async (payload) => {
+    if (!visitorGuard.allowNotice(ip, now)) return;
+    await sendNotificationToAll(payload);
+  };
 
   // ── Caso 1: Nueva visita a la tienda ────────────────────────────────────
   if (input.event === 'visit') {
@@ -683,7 +709,7 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
     const cleanPage = rawPage.replace(/\s*[-|]\s*Escapes y Más.*$/i, '').trim() || 'la portada';
     const displayPage = cleanPage.length > 45 ? `${cleanPage.slice(0, 42)}…` : cleanPage;
 
-    await sendNotificationToAll({
+    await notify({
       category: 'visitor_entry',
       title: '👀 Nuevo visitante en la tienda',
       body: `${source} · Viendo ${displayPage}`,
@@ -714,7 +740,7 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
       const priceText = input.productPrice ? ` (${input.productPrice} €)` : '';
       const cartText = input.cartTotal ? ` · Carrito: ${input.cartTotal} €` : '';
 
-      await sendNotificationToAll({
+      await notify({
         category: 'visitor_activity',
         title: '🛒 Producto añadido al carrito',
         body: `Ha añadido "${prodName}"${priceText}${cartText}`,
@@ -732,7 +758,7 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
       session.lastActivityNotified = now;
 
       const totalText = input.cartTotal ? ` con ${input.cartTotal} €` : '';
-      await sendNotificationToAll({
+      await notify({
         category: 'visitor_activity',
         title: '💳 Visitante en la pasarela de pago',
         body: `Ha iniciado el proceso de compra${totalText}`,
@@ -754,7 +780,7 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
       const priceText = input.productPrice ? ` (${input.productPrice} €)` : '';
       const pageText = input.pageCount ? ` · Página ${input.pageCount}` : '';
 
-      await sendNotificationToAll({
+      await notify({
         category: 'visitor_activity',
         title: '🔥 Visitante consultando producto',
         body: `Viendo "${prodName}"${priceText}${pageText}`,
@@ -773,7 +799,7 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
       session.lastActivityNotified = now;
 
       const dur = input.durationSeconds ? ` en ${Math.round(input.durationSeconds)} s` : '';
-      await sendNotificationToAll({
+      await notify({
         category: 'visitor_activity',
         title: '🚀 Visitante navegando activamente',
         body: `Lleva ${input.pageCount || 3} páginas vistas${dur}`,
@@ -808,7 +834,7 @@ export async function handleVisitorEvent(input: VisitorEventInput): Promise<{ su
     const lastPageClean = (input.lastPage || '').replace(/\s*[-|]\s*Escapes y Más.*$/i, '').trim();
     const lastText = lastPageClean && lastPageClean !== '/' ? ` · Última: ${lastPageClean.slice(0, 35)}` : '';
 
-    await sendNotificationToAll({
+    await notify({
       category: 'visitor_leave',
       title: hasCart ? '👋 Visitante sale con carrito sin pagar' : '👋 Visitante ha salido de la tienda',
       body: `Estuvo ${durText}${pagesText}${cartDesc}${lastText}`,
