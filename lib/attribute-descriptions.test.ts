@@ -56,6 +56,12 @@ describe('párrafo de la IA', () => {
     expect(supported(`${ok} Принадлежит al kit.`, facts)).toBe(false);
     expect(supported('Kit de cadena AFAM 520XRR3 para off-road con piñón de 14 dientes y corona de 50 dientes de aluminio, con eslabones de clip.', facts, words)).toBe(true);
   });
+  it('rechaza unidades que no están en los datos («paso de 520 pulgadas»)', () => {
+    expect(supported(`${ok} Con paso de 520 pulgadas.`, facts)).toBe(false);
+    expect(supported(`${ok} Mide 25 milímetros.`, facts)).toBe(false);
+    const wheel = { nombre: 'Llanta HAAN WHEELS 17x5,00 de 17 pulgadas', marca: 'HAAN WHEELS', categoria: 'Llantas' };
+    expect(supported('Llanta HAAN WHEELS de 17 pulgadas de diámetro y 5,00 de ancho, indicada para carretera.', wheel as any)).toBe(true);
+  });
   it('lee la respuesta aunque el modelo repita antes los datos', () => {
     expect(answerObject('{"f0":{"nombre":"X"}}\n\n{"f0":"Párrafo {con llaves} y \\"comillas\\"."}')).toEqual({ f0: 'Párrafo {con llaves} y "comillas".' });
     expect(answerObject('sin json')).toBeNull();

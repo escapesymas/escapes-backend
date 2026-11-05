@@ -153,6 +153,23 @@ const BANNED = /\b(mejor|mejores|excepcional|inigualable|perfect[oa]s?|líder|pr
 /** Palabras inglesas que se cuelan al copiar valores del catálogo (solo valen si están en los datos, p. ej. en un modelo). */
 const ENGLISH = /\b(the|and|with|for|from|of|supplied|spare|single|unit|frequented|black|white|front|rear|shocks?|endless|tooth|teeth|count|size|pair|chain|brake|clutch|sprocket)\b/gi;
 
+/**
+ * Unidades que la IA puede añadir por su cuenta («paso de 520 pulgadas»: el 520 es una denominación, no una medida).
+ * Solo valen si los datos traen esa unidad o su abreviatura.
+ */
+const UNITS: Array<[RegExp, RegExp]> = [
+  [/\bpulgadas?\b/i, /pulg|inch|[″”]|\d\s?"|\d\s?in\b/i],
+  [/\b(milímetros?|milimetros?)\b/i, /\bmm\b|\dmm|milím|milim/i],
+  [/\bcentímetros?\b/i, /\bcm\b|\dcm|centím/i],
+  [/\b(kilogramos?|kilos?)\b/i, /\bkgs?\b|\dkg|kilo/i],
+  [/\bgramos?\b/i, /\bg\b|\dg\b|gramo/i],
+  [/\blitros?\b/i, /\bl\b|\dl\b|litro|\bcc\b/i],
+  [/\b(vatios?|watios?)\b/i, /\bw\b|\dw\b|vatio|watt/i],
+  [/\bvoltios?\b/i, /\bv\b|\dv\b|voltio|volt/i],
+  [/\bamperios?\b/i, /\ba\b|\bah\b|\da\b|amper/i],
+  [/\bgrados?\b/i, /°|grado|º/i],
+];
+
 const numbersOf = (s: string) => (s.match(/\d+(?:[.,]\d+)?/g) || []).map((n) => n.replace(',', '.').replace(/\.0+$/, ''));
 
 const wordsOf = (s: string) => s.toLowerCase().split(/[^a-záéíóúüñ]+/).filter((w) => w.length >= 4);
@@ -186,6 +203,9 @@ export function supported(text: unknown, f: Facts, words?: Set<string>): text is
   const allowed = new Set(numbersOf(source));
   if (numbersOf(t).some((n) => !allowed.has(n))) return false;
   if (!CLAIMS.every((c) => !c.test(t) || c.test(source))) return false;
+  // Los datos como texto plano (en JSON, las comillas del propio formato harían creer que hay pulgadas).
+  const plain = [f.nombre, f.marca, f.categoria, ...(f.uso || []), ...(f.datos || []).flat(), ...(f.incluye || []).map((x) => x[1]), f.nota_fabricante, f.origen].filter(Boolean).join(' | ');
+  if (UNITS.some(([inText, inData]) => inText.test(t) && !inData.test(plain))) return false;
   if (words?.size) {
     const own = new Set(wordsOf(JSON.stringify(f)));
     // También en singular: «alomados» vale si los datos dicen «alomado».
