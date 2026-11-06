@@ -2528,6 +2528,37 @@ async function saveProductVariant(productId: number, b: any) {
   }
 }
 
+// Contadores de imágenes del dashboard. El panel los pide cada 15 s y antes eran 9 recorridos
+// completos de products (images::text LIKE), ~4 s de CPU de Postgres por petición. Ahora es un
+// solo recorrido (images::text se calcula una vez por fila) y el resultado se guarda unos minutos.
+const IMAGE_COUNTS_TTL_MS = 3 * 60 * 1000;
+let imageCountsCache: { at: number; value: any } | null = null;
+let imageCountsInflight: Promise<any> | null = null;
+
+async function getImageCounts(): Promise<any> {
+  if (imageCountsCache && Date.now() - imageCountsCache.at < IMAGE_COUNTS_TTL_MS) return imageCountsCache.value;
+  if (!imageCountsInflight) {
+    imageCountsInflight = pool.query(`
+      SELECT
+        count(*) FILTER (WHERE t LIKE '%/uploads/optimized/%') AS opt,
+        count(*) FILTER (WHERE t LIKE '%api.mybihr.com%' OR t LIKE '%static.bihr.pro%') AS pending,
+        count(*) FILTER (WHERE t LIKE '%placehold.co%') AS place,
+        count(*) FILTER (WHERE t LIKE '%srcCardDesktop%') AS card,
+        count(*) FILTER (WHERE (provider_id IS NULL OR provider_id = 'bihr') AND t LIKE '%/uploads/optimized/%') AS bihr_opt,
+        count(*) FILTER (WHERE (provider_id IS NULL OR provider_id = 'bihr') AND (t LIKE '%api.mybihr.com%' OR t LIKE '%static.bihr.pro%')) AS bihr_pend,
+        count(*) FILTER (WHERE provider_id = 'andreani' AND t LIKE '%/uploads/optimized/%') AS andr_opt,
+        count(*) FILTER (WHERE provider_id = 'andreani' AND t LIKE '%andreanimhs.com%') AS andr_pend,
+        count(*) FILTER (WHERE provider_id = 'andreani' AND (images = '[]'::jsonb OR images IS NULL OR t = '[]')) AS andr_empty
+      FROM (SELECT provider_id, images, images::text AS t FROM products OFFSET 0) p`)
+      .then((r) => {
+        imageCountsCache = { at: Date.now(), value: r.rows[0] };
+        return r.rows[0];
+      })
+      .finally(() => { imageCountsInflight = null; });
+  }
+  return imageCountsInflight;
+}
+
 app.all('/api/admin', adminLimiter, async (req, res) => {
   const { action, userId, email } = req.query as any;
 
@@ -2665,21 +2696,12 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         // Stats de la base de datos
         try {
-          const optR = await db.execute(sql`SELECT count(*) as count FROM products WHERE images::text LIKE '%/uploads/optimized/%'`);
-          const pendingR = await db.execute(sql`SELECT count(*) as count FROM products WHERE images::text LIKE '%api.mybihr.com%' OR images::text LIKE '%static.bihr.pro%'`);
-          const placeR = await db.execute(sql`SELECT count(*) as count FROM products WHERE images::text LIKE '%placehold.co%'`);
-          const cardOptR = await db.execute(sql`SELECT count(*) as count FROM products WHERE images::text LIKE '%srcCardDesktop%'`);
-          // Contadores por proveedor
-          const bihrOptR = await db.execute(sql`SELECT count(*) as count FROM products WHERE (provider_id IS NULL OR provider_id = 'bihr') AND images::text LIKE '%/uploads/optimized/%'`);
-          const bihrPendR = await db.execute(sql`SELECT count(*) as count FROM products WHERE (provider_id IS NULL OR provider_id = 'bihr') AND (images::text LIKE '%api.mybihr.com%' OR images::text LIKE '%static.bihr.pro%')`);
-          const andrOptR = await db.execute(sql`SELECT count(*) as count FROM products WHERE provider_id = 'andreani' AND images::text LIKE '%/uploads/optimized/%'`);
-          const andrPendR = await db.execute(sql`SELECT count(*) as count FROM products WHERE provider_id = 'andreani' AND images::text LIKE '%andreanimhs.com%'`);
-          const andrEmptyR = await db.execute(sql`SELECT count(*) as count FROM products WHERE provider_id = 'andreani' AND (images = '[]'::jsonb OR images IS NULL OR images::text = '[]')`);
+          const c = await getImageCounts();
 
-          const optCount = Number(optR.rows[0]?.count || 0);
-          const pendingCount = Number(pendingR.rows[0]?.count || 0);
-          const placeCount = Number(placeR.rows[0]?.count || 0);
-          const cardOptCount = Number(cardOptR.rows[0]?.count || 0);
+          const optCount = Number(c.opt || 0);
+          const pendingCount = Number(c.pending || 0);
+          const placeCount = Number(c.place || 0);
+          const cardOptCount = Number(c.card || 0);
 
           imageStats.optimized = optCount;
           imageStats.omitted = placeCount;
@@ -2696,11 +2718,11 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
           imageStats.purgedTotal = optCount;
 
           // Por proveedor
-          imageStats.bihrOptimized = Number(bihrOptR.rows[0]?.count || 0);
-          imageStats.bihrPending = Number(bihrPendR.rows[0]?.count || 0);
-          imageStats.andreaniOptimized = Number(andrOptR.rows[0]?.count || 0);
-          imageStats.andreaniPending = Number(andrPendR.rows[0]?.count || 0);
-          imageStats.andreaniEmpty = Number(andrEmptyR.rows[0]?.count || 0);
+          imageStats.bihrOptimized = Number(c.bihr_opt || 0);
+          imageStats.bihrPending = Number(c.bihr_pend || 0);
+          imageStats.andreaniOptimized = Number(c.andr_opt || 0);
+          imageStats.andreaniPending = Number(c.andr_pend || 0);
+          imageStats.andreaniEmpty = Number(c.andr_empty || 0);
           imageStats.andreaniTotal = imageStats.andreaniOptimized + imageStats.andreaniPending + imageStats.andreaniEmpty;
 
           if (pendingCount === 0 && optCount > 0 && imageStats.cardPending === 0) {
