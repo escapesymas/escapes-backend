@@ -42,6 +42,12 @@ COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm (npm ci --legacy-peer-deps --omit=dev --prefer-offline || npm install --legacy-peer-deps --omit=dev) && \
     chown -R backend:nodejs /app/server/node_modules
 
+# npm, yarn y corepack ya no hacen falta tras instalar (el servicio arranca con `node`): se quitan para
+# no llevar dentro sus dependencias empaquetadas (tar, brace-expansion, ip-address) con avisos de seguridad.
+# Los endpoints que lanzan `npx tsx scripts/...` ya no funcionaban aquí: la imagen final no lleva scripts/ ni tsx.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-* \
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg
+
 # Copy compiled JavaScript dist & assets from builder stage
 COPY --chown=backend:nodejs --from=builder /app/server/dist ./dist
 COPY --chown=backend:nodejs templates/ ./templates/
