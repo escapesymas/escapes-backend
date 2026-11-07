@@ -180,6 +180,23 @@ function getInternalFilterSql(excludeInternal: boolean, sessionAlias: string = '
 }
 
 /**
+ * Umami guarda el referrer de cada página: la primera trae el de Google, pero las siguientes de la misma
+ * visita traen la página anterior de la propia web («Interno»). Para no perder el origen, cada vista hereda
+ * el referrer de la primera página de su visita: usar `vs.referrer_domain` en lugar de `e.referrer_domain`.
+ */
+function visitSourceJoin(eventAlias: string = 'e'): string {
+  return `
+    LEFT JOIN LATERAL (
+      SELECT f.referrer_domain
+      FROM website_event f
+      WHERE f.visit_id = ${eventAlias}.visit_id
+        AND f.event_type = 1
+      ORDER BY f.created_at ASC
+      LIMIT 1
+    ) vs ON true`;
+}
+
+/**
  * Consulta usuarios y actividad en tiempo real (últimos 30 minutos).
  */
 export async function getRealtimeData(excludeInternal: boolean = true): Promise<RealtimeStatsResponse> {
@@ -222,8 +239,9 @@ export async function getRealtimeData(excludeInternal: boolean = true): Promise<
       latest_event.referrer_domain
     FROM active_sessions a
     JOIN LATERAL (
-      SELECT url_path, page_title, referrer_domain
+      SELECT e.url_path, e.page_title, vs.referrer_domain
       FROM website_event e
+      ${visitSourceJoin('e')}
       WHERE e.session_id = a.session_id
       ORDER BY e.created_at DESC
       LIMIT 1
@@ -239,12 +257,13 @@ export async function getRealtimeData(excludeInternal: boolean = true): Promise<
       ROUND(EXTRACT(EPOCH FROM (NOW() - e.created_at))) AS seconds_ago,
       e.url_path,
       COALESCE(e.page_title, '') AS page_title,
-      e.referrer_domain,
+      vs.referrer_domain,
       COALESCE(s.city, 'Desconocida') AS city,
       COALESCE(s.country, 'ES') AS country,
       COALESCE(s.device, 'desktop') AS device
     FROM website_event e
     JOIN session s ON s.session_id = e.session_id
+    ${visitSourceJoin('e')}
     WHERE e.event_type = 1
       AND e.created_at >= NOW() - INTERVAL '30 minutes'
       ${internalFilter}
@@ -346,11 +365,12 @@ export async function getAnalyticsStats(
     SELECT 
       COUNT(DISTINCT s.session_id) AS total_visitors,
       COUNT(e.event_id) AS total_pageviews,
-      COUNT(DISTINCT CASE WHEN e.referrer_domain LIKE '%google%' THEN s.session_id END) AS google_visitors,
-      COUNT(DISTINCT CASE WHEN e.referrer_domain IS NULL OR e.referrer_domain = '' THEN s.session_id END) AS direct_visitors,
+      COUNT(DISTINCT CASE WHEN vs.referrer_domain LIKE '%google%' THEN s.session_id END) AS google_visitors,
+      COUNT(DISTINCT CASE WHEN vs.referrer_domain IS NULL OR vs.referrer_domain = '' THEN s.session_id END) AS direct_visitors,
       COUNT(DISTINCT CASE WHEN s.device = 'mobile' THEN s.session_id END) AS mobile_visitors
     FROM session s
     JOIN website_event e ON e.session_id = s.session_id
+    ${visitSourceJoin('e')}
     WHERE ${dateFilterClause}
       AND e.event_type = 1
       ${internalFilter};
@@ -363,9 +383,10 @@ export async function getAnalyticsStats(
         TO_CHAR((e.created_at AT TIME ZONE 'Europe/Madrid'), 'HH24:00') AS label,
         COUNT(DISTINCT s.session_id) AS visitors,
         COUNT(e.event_id) AS pageviews,
-        COUNT(DISTINCT CASE WHEN e.referrer_domain LIKE '%google%' THEN s.session_id END) AS google
+        COUNT(DISTINCT CASE WHEN vs.referrer_domain LIKE '%google%' THEN s.session_id END) AS google
       FROM session s
       JOIN website_event e ON e.session_id = s.session_id
+      ${visitSourceJoin('e')}
       WHERE ${dateFilterClause}
         AND e.event_type = 1
         ${internalFilter}
@@ -377,9 +398,10 @@ export async function getAnalyticsStats(
         TO_CHAR((e.created_at AT TIME ZONE 'Europe/Madrid'), 'DD Mon') AS label,
         COUNT(DISTINCT s.session_id) AS visitors,
         COUNT(e.event_id) AS pageviews,
-        COUNT(DISTINCT CASE WHEN e.referrer_domain LIKE '%google%' THEN s.session_id END) AS google
+        COUNT(DISTINCT CASE WHEN vs.referrer_domain LIKE '%google%' THEN s.session_id END) AS google
       FROM session s
       JOIN website_event e ON e.session_id = s.session_id
+      ${visitSourceJoin('e')}
       WHERE ${dateFilterClause}
         AND e.event_type = 1
         ${internalFilter}
@@ -407,20 +429,21 @@ export async function getAnalyticsStats(
   const topReferrersQuery = `
     SELECT 
       CASE 
-        WHEN e.referrer_domain LIKE '%google%' THEN 'Google Orgánico'
-        WHEN e.referrer_domain IS NULL OR e.referrer_domain = '' THEN 'Directo / Sin Referrer'
-        WHEN e.referrer_domain LIKE '%bing%' THEN 'Bing'
-        WHEN e.referrer_domain LIKE '%duckduckgo%' THEN 'DuckDuckGo'
-        WHEN e.referrer_domain LIKE '%yahoo%' THEN 'Yahoo'
-        WHEN e.referrer_domain LIKE '%instagram%' THEN 'Instagram'
-        WHEN e.referrer_domain LIKE '%tiktok%' THEN 'TikTok'
-        WHEN e.referrer_domain LIKE '%facebook%' THEN 'Facebook'
-        ELSE COALESCE(e.referrer_domain, 'Otros')
+        WHEN vs.referrer_domain LIKE '%google%' THEN 'Google Orgánico'
+        WHEN vs.referrer_domain IS NULL OR vs.referrer_domain = '' THEN 'Directo / Sin Referrer'
+        WHEN vs.referrer_domain LIKE '%bing%' THEN 'Bing'
+        WHEN vs.referrer_domain LIKE '%duckduckgo%' THEN 'DuckDuckGo'
+        WHEN vs.referrer_domain LIKE '%yahoo%' THEN 'Yahoo'
+        WHEN vs.referrer_domain LIKE '%instagram%' THEN 'Instagram'
+        WHEN vs.referrer_domain LIKE '%tiktok%' THEN 'TikTok'
+        WHEN vs.referrer_domain LIKE '%facebook%' THEN 'Facebook'
+        ELSE COALESCE(vs.referrer_domain, 'Otros')
       END AS domain,
       COUNT(DISTINCT s.session_id) AS visitors,
       COUNT(e.event_id) AS views
     FROM session s
     JOIN website_event e ON e.session_id = s.session_id
+    ${visitSourceJoin('e')}
     WHERE ${dateFilterClause}
       AND e.event_type = 1
       ${internalFilter}
