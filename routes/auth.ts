@@ -232,13 +232,17 @@ async function verifyPassword(password: string, storedHash: string): Promise<boo
   return storedHash === password;
 }
 
+// Un solo coste para todos los hashes (las cuentas más antiguas ya lo tenían a 12; index.ts también): si hubiera
+// mezcla, el tiempo del login delataría qué cuentas existen. Los de menor coste se suben solos al iniciar sesión.
+const BCRYPT_COST = 12;
+
 async function hashPassword(password: string): Promise<string> {
-  return bcrypt.hash(password, 10);
+  return bcrypt.hash(password, BCRYPT_COST);
 }
 
 // Hash de relleno (mismo coste que los reales): un login con un usuario que no existe tarda lo mismo que
 // uno con la contraseña mal, y el tiempo de respuesta no delata qué cuentas existen.
-const DECOY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
+const DECOY_PASSWORD_HASH: Promise<string> = bcrypt.hash(crypto.randomBytes(16).toString('hex'), BCRYPT_COST);
 
 /**
  * Alta con un email que ya tiene cuenta. A quien la pide se le responde igual que en un alta nueva (no se
@@ -781,7 +785,7 @@ authRouter.post('/auth', async (req, res) => {
 
       // Mismo mensaje y mismo tiempo si no existe o si la contraseña no es: no revela qué cuentas existen.
       if (userRes.rows.length === 0) {
-        await bcrypt.compare(password || '', DECOY_PASSWORD_HASH);
+        await bcrypt.compare(password || '', await DECOY_PASSWORD_HASH);
         return res.status(401).json({ error: 'Email o contraseña incorrectos' });
       }
 
@@ -792,7 +796,9 @@ authRouter.post('/auth', async (req, res) => {
         return res.status(401).json({ error: 'Email o contraseña incorrectos' });
       }
 
-      if (user.password_hash && isLegacyPasswordHash(user.password_hash)) {
+      // Hash antiguo (SHA-256) o bcrypt de menor coste que el actual: se renueva ahora que se conoce la contraseña.
+      const lowCostBcrypt = /^\$2[aby]\$/.test(user.password_hash || '') && bcrypt.getRounds(user.password_hash) < BCRYPT_COST;
+      if (user.password_hash && (isLegacyPasswordHash(user.password_hash) || lowCostBcrypt)) {
         const newHash = await hashPassword(password || '');
         await db.execute(sql`UPDATE users SET password_hash = ${newHash} WHERE id = ${user.id}`);
       }
