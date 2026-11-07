@@ -15,6 +15,7 @@ import {
   STAFF_ROLES,
 } from '../utils.js';
 import { getMfaMethods } from './mfaRoutes.js';
+import { checkRateLimit } from '../redis.js';
 
 // ── Verificación del email en el registro ─────────────────────────────────
 const SITE_URL = process.env.PUBLIC_BASE_URL || 'https://escapesymas.com';
@@ -233,6 +234,36 @@ async function verifyPassword(password: string, storedHash: string): Promise<boo
 
 async function hashPassword(password: string): Promise<string> {
   return bcrypt.hash(password, 10);
+}
+
+// Hash de relleno (mismo coste que los reales): un login con un usuario que no existe tarda lo mismo que
+// uno con la contraseña mal, y el tiempo de respuesta no delata qué cuentas existen.
+const DECOY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
+
+/**
+ * Alta con un email que ya tiene cuenta. A quien la pide se le responde igual que en un alta nueva (no se
+ * revela qué emails están registrados) y el aviso le llega al dueño de la cuenta.
+ */
+async function notifyExistingAccountOnRegister(email: string) {
+  // Un aviso cada 6 h por cuenta: registrarse con el email de otro no sirve para llenarle la bandeja.
+  const { allowed } = await checkRateLimit(`register-existing:${email.toLowerCase()}`, 1, 6 * 60 * 60 * 1000);
+  if (!allowed) return;
+  const r = await db.execute(sql`
+    SELECT id, email, first_name, username, email_verified FROM users
+    WHERE LOWER(email) = LOWER(${email}) LIMIT 1`);
+  const user = r.rows[0] as any;
+  if (!user) return;
+  // Sin confirmar todavía: lo que necesita es un enlace nuevo, como en «Reenviar».
+  if (user.email_verified === false) {
+    await sendVerificationEmail(user);
+    return;
+  }
+  const name = user.first_name || user.username || '';
+  await sendTemplatedEmail('generic', user.email, {
+    subject: 'Ya tienes una cuenta en Escapes y Más',
+    body: `Hola${name ? ` ${name}` : ''},\n\nAlguien ha intentado crear una cuenta con este email, pero ya tienes una en Escapes y Más. Si has sido tú, entra con tu contraseña de siempre.\n\nSi no has sido tú, puedes ignorar este mensaje: tu cuenta no ha cambiado.`,
+    cta: { label: 'Acceder a mi cuenta', url: `${SITE_URL}/login` },
+  });
 }
 
 // POST /api/auth/logout
@@ -748,8 +779,9 @@ authRouter.post('/auth', async (req, res) => {
         WHERE LOWER(email) = LOWER(${username}) OR LOWER(username) = LOWER(${username})
       `);
 
-      // Mismo mensaje si no existe o si la contraseña no es: no revela qué cuentas existen.
+      // Mismo mensaje y mismo tiempo si no existe o si la contraseña no es: no revela qué cuentas existen.
       if (userRes.rows.length === 0) {
+        await bcrypt.compare(password || '', DECOY_PASSWORD_HASH);
         return res.status(401).json({ error: 'Email o contraseña incorrectos' });
       }
 
@@ -817,12 +849,16 @@ authRouter.post('/auth', async (req, res) => {
         return res.status(400).json({ error: `La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.` });
       }
 
+      // El hash va antes de mirar si el email existe: el tiempo de respuesta no delata las cuentas.
+      const passHash = await hashPassword(password);
+
       const existing = await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = LOWER(${email})`);
       if (existing.rows.length > 0) {
-        return res.status(400).json({ error: 'El email ya está registrado' });
+        // Misma respuesta que un alta nueva (no se revela qué emails están registrados): el aviso va al dueño de la cuenta.
+        notifyExistingAccountOnRegister(String(email)).catch((e) => console.error('[AUTH REGISTER EXISTING NOTICE ERROR]:', e.message));
+        return res.json({ verificationRequired: true, email, emailSent: true });
       }
 
-      const passHash = await hashPassword(password);
       const userNick = username || email.split('@')[0];
 
       const inserted = await db.execute(sql`
@@ -841,10 +877,11 @@ authRouter.post('/auth', async (req, res) => {
       try {
         const { notifyNewUser } = await import('../pushService.js');
         const name = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username;
-        await notifyNewUser({
+        // En segundo plano: el alta no puede tardar más que la respuesta de «ya existe» (que delataría el email).
+        notifyNewUser({
           name,
           email: user.email
-        });
+        }).catch((pushErr: any) => console.error('[AUTH REGISTER PUSH ERROR]:', pushErr.message));
       } catch (pushErr: any) {
         console.error('[AUTH REGISTER PUSH ERROR]:', pushErr.message);
       }

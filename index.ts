@@ -671,12 +671,13 @@ app.use('/uploads', express.static(uploadDir, {
 const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW_MS = 60000;
 
-const rateLimitSkipPaths = ['/uploads', '/api/health', '/api/catalog', '/api/image-proxy'];
+const rateLimitSkipPaths = ['/uploads', '/api/catalog', '/api/image-proxy'];
 
 app.use((req: any, res: any, next: any) => {
   const path = req.path || req.url || '';
 
-  if (rateLimitSkipPaths.some(p => path.startsWith(p))) {
+  // /api/health exacto (healthcheck de Docker): con startsWith se saltaba también /api/health/stripe.
+  if (path === '/api/health' || rateLimitSkipPaths.some(p => path.startsWith(p))) {
     return next();
   }
 
@@ -1399,30 +1400,24 @@ function clearAuthCookie(res: any) {
 // ================================================================
 // HEALTH CHECK
 // ================================================================
-app.get('/api/health', async (_req, res) => {
-  let dbStatus = 'disconnected';
-  let dbLatency = 0;
+// Público y mínimo (lo usa el healthcheck de Docker): el estado de la base de datos va en /api/health/diag.
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok' });
+});
 
+// Diagnostic endpoint: shows env state without exposing secrets.
+app.get('/api/health/diag', requireAdmin, async (_req, res) => {
+  let dbStatus = 'disconnected';
+  let dbLatencyMs = 0;
   try {
     const start = Date.now();
     await pool.query('SELECT 1');
-    dbLatency = Date.now() - start;
+    dbLatencyMs = Date.now() - start;
     dbStatus = 'connected';
   } catch (e) {
     dbStatus = 'error';
   }
 
-  res.json({
-    status: 'ok',
-    version: '1.0.0',
-    db: dbStatus,
-    dbLatency: `${dbLatency}ms`,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Diagnostic endpoint: shows env state without exposing secrets.
-app.get('/api/health/diag', requireAdmin, async (_req, res) => {
   // Audit 2026-08-15, finding #52: this endpoint used to expose
   // `ADMIN_KEY_starts`, `ADMIN_KEY_matches_expected`, etc. — which let an
   // unauthenticated attacker confirm whether the bundled default
@@ -1430,6 +1425,8 @@ app.get('/api/health/diag', requireAdmin, async (_req, res) => {
   // only booleans, never the value or any prefix.
   res.json({
     ok: true,
+    db: dbStatus,
+    dbLatencyMs,
     env: {
       NODE_ENV: process.env.NODE_ENV,
       PORT: process.env.PORT,
@@ -1444,7 +1441,8 @@ app.get('/api/health/diag', requireAdmin, async (_req, res) => {
   });
 });
 
-app.get('/api/health/stripe', async (_req: any, res: any) => {
+// Solo administradores: cada llamada consulta Stripe en vivo y revela el modo (live/test).
+app.get('/api/health/stripe', requireAdmin, async (_req: any, res: any) => {
   try {
     if (!stripeLiveKey) {
       return res.status(503).json({
@@ -5438,10 +5436,12 @@ app.all('/api/forum', async (req: any, res) => {
 // ================================================================
 // USER RANK (nativo PostgreSQL)
 // ================================================================
-app.get('/api/user/:id/rank', async (req, res) => {
+app.get('/api/user/:id/rank', requireAuth, async (req: any, res) => {
   try {
     const userId = parseInt(req.params.id);
     if (!userId || isNaN(userId)) return res.status(400).json({ error: 'ID inválido' });
+    // Solo el propio usuario o un administrador: antes cualquiera recorría los ids y mapeaba la base de clientes.
+    if (req.user.user_id !== userId && req.user.role !== 'admin') return res.status(403).json({ error: 'Acceso denegado' });
 
     const uRes = await db.execute(sql`SELECT rank_xp, rank_level, username FROM users WHERE id = ${userId}`);
     if (uRes.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });

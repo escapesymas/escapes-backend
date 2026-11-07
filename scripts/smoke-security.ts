@@ -86,6 +86,12 @@ async function main() {
   await check('email-stats como cliente', 403, '/api/admin/email-stats', { auth: A });
   await check('health/diag sin sesión', 401, '/api/health/diag');
   await check('health/diag como admin', 200, '/api/health/diag', { auth: ADMIN });
+  await check('health/stripe sin sesión', 401, '/api/health/stripe');
+  await check('health/stripe como cliente', 403, '/api/health/stripe', { auth: A });
+  // El rango de un usuario solo lo ve él mismo (o un admin): antes se podían recorrer los ids.
+  await check('rank sin sesión', 401, '/api/user/900001/rank');
+  await check('rank de otro usuario', 403, '/api/user/900001/rank', { auth: B });
+  await check('rank propio', 200, '/api/user/900001/rank', { auth: A });
   // Verificación en dos pasos: un admin que solo ha puesto la contraseña no entra al panel.
   await check('health/diag como admin sin 2FA', [401, 403], '/api/health/diag', { auth: ADMIN_SIN_2FA });
   await check('mfa/status como admin sin 2FA', 200, '/api/mfa/status', { auth: ADMIN_SIN_2FA });
