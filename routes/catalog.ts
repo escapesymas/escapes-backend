@@ -507,7 +507,10 @@ catalogRouter.get('/catalog/sitemap-motos', async (_req, res) => {
     for (const b of activeBrands) {
       const list = dir.modelsByBrandSlug[b.slug] || [];
       for (const m of list) {
-        if (m.hasProducts) {
+        // Solo las fichas que la página sabe resolver: el directorio sale de más fuentes que el índice de modelos
+        // de /api/catalog/motos/:marca/:modelo, y lo que da 404 no se le puede pedir a Google en el sitemap.
+        const resolved = m.hasProducts ? resolveModelSlug(b.slug, m.slug) : null;
+        if (resolved && !resolved.needsRedirect) {
           activeModels.push({ brandSlug: b.slug, modelSlug: m.slug, escapeCount: m.escapeCount });
         }
       }

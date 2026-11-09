@@ -97,20 +97,38 @@ export async function findCompatibleSkus(brand: string, model?: string, year?: s
   }).slice(0, y ? MAX_MODELS : MAX_MODELS * 4);
   if (matches.length === 0) return [];
 
-  // Una condición @> por (marca, año, modelo): el planner las combina con un
-  // BitmapOr sobre el índice GIN.
+  // Una condición @> por modelo (y por año solo si se pide uno): el planner las combina con un BitmapOr
+  // sobre el índice GIN. Sin año basta una por modelo distinto: con una por cada año, la Kawasaki Z 1000 SX
+  // (57 variantes) tardaba minutos y varias a la vez dejaban Postgres al 580 % de CPU (9/11/2026).
+  const targets = y ? matches : [...new Map(matches.map((r: any) => [r.model, r])).values()];
   const params: string[] = [];
-  const conds = matches.map((r: any) => {
-    const yearNum = Number(r.year);
+  const conds = targets.map((r: any) => {
     const item: Record<string, unknown> = { brand: b, model: r.model };
-    if (Number.isFinite(yearNum)) item.year = yearNum;
+    if (y) {
+      const yearNum = Number(r.year);
+      if (Number.isFinite(yearNum)) item.year = yearNum;
+    }
     params.push(JSON.stringify([item]));
     return `compatibility @> $${params.length}::jsonb`;
   });
   params.push(String(limit));
-  const res = await pool.query(
-    `SELECT sku FROM products WHERE status = 'published' AND (${conds.join(' OR ')}) LIMIT $${params.length}::int`,
-    params
-  );
-  return res.rows.map((r: any) => r.sku).filter(Boolean);
+
+  // Tope de tiempo: si una consulta se pone mal, se corta a los 10 s en vez de seguir quemando CPU cuando
+  // la petición que la lanzó ya se ha rendido.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL statement_timeout = '10s'`);
+    const res = await client.query(
+      `SELECT sku FROM products WHERE status = 'published' AND (${conds.join(' OR ')}) LIMIT $${params.length}::int`,
+      params
+    );
+    await client.query('COMMIT');
+    return res.rows.map((r: any) => r.sku).filter(Boolean);
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
