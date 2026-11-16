@@ -19,6 +19,7 @@ import { promisify } from 'util';
 import { pool } from '../db.js';
 import { getBihrToken } from '../bihrService.js';
 import { cacheBust } from './cache.js';
+import { parseForecast } from './bihr-live-stock.js';
 
 const run = promisify(execFile);
 const BIHR_API_BASE = process.env.BIHR_API_BASE || 'https://api.bihr.net';
@@ -39,6 +40,19 @@ export interface DiscontinuedResult {
   hidden?: number;
   restored?: number;
   keptWithStock?: number;
+  /** Copia del stock del catálogo «Stocks» a products (ver syncStockFromCatalog). */
+  stock?: StockSyncResult;
+  error?: string;
+}
+
+export interface StockSyncResult {
+  /** false = solo se ha calculado qué cambiaría (catalog_meta 'bihr_stock' no vale 'on'). */
+  applied: boolean;
+  matched?: number;
+  changes?: number;
+  /** Productos que pasan de tener stock a no tenerlo, y al revés. */
+  toZero?: number;
+  fromZero?: number;
   error?: string;
 }
 
@@ -151,6 +165,82 @@ export async function readStocks(file: string): Promise<Map<string, number>> {
   return stocks;
 }
 
+export interface StockInfo { value: number; forecast: string | null }
+
+/** Stock y fecha prevista de reaprovisionamiento (ForecastAvailabilityDateTime) de cada referencia del catálogo «Stocks». */
+export async function readStockDetails(file: string): Promise<Map<string, StockInfo>> {
+  const out = new Map<string, StockInfo>();
+  let code = '';
+  let cur: StockInfo | null = null;
+  await scan(file, /"PartNumber"\s*:\s*"([^"]*)"|"Value"\s*:\s*(-?[\d.]+)|"ForecastAvailabilityDateTime"\s*:\s*"([^"]*)"/g, (m) => {
+    if (m[1] !== undefined) { code = m[1].trim().toLowerCase(); cur = null; }
+    else if (m[2] !== undefined && code) { cur = { value: Number(m[2]) || 0, forecast: null }; out.set(code, cur); }
+    else if (m[3] !== undefined && cur) cur.forecast = parseForecast(m[3]);
+  });
+  return out;
+}
+
+export interface StockRow { id: number; sku: string | null; part_number: string | null; stock: number | string | null; restock_date: string | null }
+
+export interface StockPlan { ids: number[]; stocks: number[]; dates: string[]; matched: number; toZero: number; fromZero: number }
+
+/**
+ * Qué productos de Bihr cambian de stock o de fecha de reaprovisionamiento (sin tocar la BD). La referencia de Bihr es
+ * `part_number`; el sku solo si no hay otra. La fecha solo vale mientras el stock es 0.
+ */
+export function planStockSync(rows: StockRow[], details: Map<string, StockInfo>): StockPlan {
+  const plan: StockPlan = { ids: [], stocks: [], dates: [], matched: 0, toZero: 0, fromZero: 0 };
+  const key = (c: string | null) => String(c || '').trim().toLowerCase();
+  for (const r of rows) {
+    const info = details.get(key(r.part_number)) ?? details.get(key(r.sku));
+    if (!info) continue;
+    plan.matched++;
+    const value = Math.max(0, Math.floor(info.value));
+    const date = value === 0 ? info.forecast : null;
+    const old = Number(r.stock) || 0;
+    if (old === value && (r.restock_date ?? null) === date) continue;
+    plan.ids.push(r.id); plan.stocks.push(value); plan.dates.push(date ?? '');
+    if (old > 0 && value === 0) plan.toZero++;
+    if (old === 0 && value > 0) plan.fromZero++;
+  }
+  return plan;
+}
+
+async function applyStockPlan(plan: StockPlan): Promise<void> {
+  const CHUNK = 2000; // por trozos: no se bloquean decenas de miles de filas de golpe
+  for (let i = 0; i < plan.ids.length; i += CHUNK) {
+    await pool.query(
+      `UPDATE products p SET stock = v.stock, restock_date = NULLIF(v.restock_date, '')::date
+         FROM (SELECT unnest($1::int[]) AS id, unnest($2::int[]) AS stock, unnest($3::text[]) AS restock_date) v
+        WHERE p.id = v.id`,
+      [plan.ids.slice(i, i + CHUNK), plan.stocks.slice(i, i + CHUNK), plan.dates.slice(i, i + CHUNK)]);
+  }
+}
+
+/**
+ * Copia el stock del catálogo «Stocks» a products para los productos de Bihr (no los de Andreani, que tienen el suyo).
+ * Mientras catalog_meta 'bihr_stock' no valga 'on' solo calcula qué cambiaría. No lanza nunca. Ojo: el catálogo se genera
+ * cada cierto tiempo (campo Generated), no al momento: lo que se muestra y se vende se contrasta además en vivo
+ * (lib/bihr-live-stock.ts).
+ */
+export async function syncStockFromCatalog(details: Map<string, StockInfo>): Promise<StockSyncResult> {
+  try {
+    const flag = await pool.query(`SELECT value FROM catalog_meta WHERE key = 'bihr_stock'`);
+    const apply = flag.rows[0]?.value === 'on';
+    const { rows } = await pool.query<StockRow>(
+      `SELECT id, sku, part_number, stock, restock_date::text AS restock_date FROM products
+        WHERE status IN ('published', $1) AND COALESCE(supplier_name, '') <> 'Andreani MHS' AND sku NOT LIKE 'AND-%'`, [DISCONTINUED_STATUS]);
+    const plan = planStockSync(rows, details);
+    if (apply && plan.ids.length) {
+      await applyStockPlan(plan);
+      await Promise.all([cacheBust('cache:products'), cacheBust('compat:prod'), cacheBust('cache:suggest')]).catch(() => {});
+    }
+    return { applied: apply, matched: plan.matched, changes: plan.ids.length, toZero: plan.toZero, fromZero: plan.fromZero };
+  } catch (err: any) {
+    return { applied: false, error: err?.message || String(err) };
+  }
+}
+
 export interface ProductRow { id: number; sku: string | null; part_number: string | null; status: string }
 
 /** Qué productos ocultar y cuáles volver a publicar (sin tocar la BD). */
@@ -182,7 +272,8 @@ async function doSync(): Promise<DiscontinuedResult> {
     result.catalogDiscontinued = [...status.main.values()].filter(Boolean).length;
     if (total < MIN_CATALOG_PRODUCTS) throw new Error(`el catálogo de productos de Bihr parece incompleto (${total} productos)`);
     const stocksFile = await downloadCatalog('Stocks', dir);
-    const stocks = await readStocks(stocksFile);
+    const stockDetails = await readStockDetails(stocksFile);
+    const stocks = new Map([...stockDetails].map(([k, v]) => [k, v.value] as const));
     result.stockRows = stocks.size;
     if (stocks.size < MIN_STOCK_ROWS) throw new Error(`el catálogo de stock de Bihr parece incompleto (${stocks.size} referencias)`);
 
@@ -196,6 +287,7 @@ async function doSync(): Promise<DiscontinuedResult> {
       await Promise.all([cacheBust('cache:products'), cacheBust('compat:prod'), cacheBust('cache:suggest')]).catch(() => {});
     }
     Object.assign(result, { status: 'done', hidden: hide.length, restored: restore.length, keptWithStock });
+    result.stock = await syncStockFromCatalog(stockDetails);
     // Con el catálogo ya descargado se aprovecha para rellenar descripciones (no falla: guarda su propio resultado).
     await (await import('./bihr-descriptions.js')).fillDescriptions(productsFile);
     // Lo que sigue sin texto se apunta para describirlo con sus datos (lib/attribute-descriptions.ts).

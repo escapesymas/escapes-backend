@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import { processImage, detectImageType, ImageRejected, IMAGE_MIME } from '../lib/image-sandbox.js';
 import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
-import { getLiveStockValue } from '../bihrService.js';
+import { refreshLiveBihrStock } from '../lib/bihr-live-stock.js';
 import { getCatalogData, compatibleSkus } from '../lib/moto-catalog.js';
 import {
   resolveBrandSlug,
@@ -43,7 +43,7 @@ export const catalogRouter = Router();
 // Columnas necesarias para pintar una tarjeta de producto en listados. Evita
 // enviar descripción HTML, atributos y compatibilidades (cientos de KB por
 // producto en algunos casos: la sección de compatibles llegaba a 17 MB).
-const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, promo_price, promo_id, stock, images, category_id, status, brand, dropshipping, ondemand, family_code, variant_options`;
+const PRODUCT_CARD_COLUMNS = `id, sku, name, price, sale_price, promo_price, promo_id, stock, images, category_id, status, brand, dropshipping, ondemand, family_code, variant_options, restock_date::text AS restock_date`;
 
 /** Agrupa filas de tarjeta por modelo: una tarjeta por familia con resumen de variantes. */
 function groupCardsByFamily(rows: any[]): any[] {
@@ -213,6 +213,14 @@ function bestDescription(row: any): string {
   return best.replace(/<[^>]*$/, '').trim(); // etiqueta cortada al final
 }
 
+/** Fecha de reaprovisionamiento como AAAA-MM-DD (llega como texto o, con SELECT *, como Date de pg). */
+function restockDateOf(v: any): string | null {
+  if (!v) return null;
+  if (v instanceof Date) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v));
+  return m ? m[1] : null;
+}
+
 export function mapProductToFrontend(row: any) {
   const priceEur = (row.price || 0) / 100;
   // Lo que paga el cliente: precio de promoción, si no DTO1 (sale_price); price es el PVP.
@@ -282,6 +290,9 @@ export function mapProductToFrontend(row: any) {
     usualPrice: row.promo_price > 0 && row.sale_price > 0 ? row.sale_price / 100 : null,
     stock: typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0),
     inStock: (typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0)) > 0,
+    // Sin stock pero con fecha prevista de Bihr: «en reaprovisionamiento».
+    restockDate: restockDateOf(row.restock_date),
+    restocking: (typeof row.stock === 'string' ? parseInt(row.stock, 10) : (row.stock || 0)) <= 0 && !!restockDateOf(row.restock_date),
     brand: row.brand || '',
     category_id: row.category_id,
     categoryId: row.category_id,
@@ -960,6 +971,32 @@ function cacheKeyFor(prefix: string, query: any): string {
   return `${prefix}:${crypto.createHash('sha256').update(s).digest('hex')}`;
 }
 
+/**
+ * Pone en las tarjetas el stock de Bihr de este momento (lib/bihr-live-stock.ts): sin esto se enseñaba el de la última
+ * copia (hasta un día) y se vendía lo que Bihr ya no tenía. Una familia con varias variantes sigue «en stock» si alguna lo está.
+ */
+async function withLiveStock<T extends { products: any[] }>(data: T): Promise<T> {
+  const live = await refreshLiveBihrStock(data.products.map((p) => p.id));
+  if (!live.size) return data;
+  return {
+    ...data,
+    products: data.products.map((p) => {
+      const lv = live.get(p.id);
+      if (!lv) return p;
+      const { stock, restockDate } = lv;
+      const single = !p.family || p.family.variantCount <= 1;
+      return {
+        ...p,
+        stock,
+        inStock: stock > 0,
+        restockDate,
+        restocking: stock <= 0 && !!restockDate,
+        ...(p.family ? { family: { ...p.family, inStock: single ? stock > 0 : (p.family.inStock || stock > 0) } } : {}),
+      };
+    }),
+  };
+}
+
 // GET /api/catalog/products
 // Lista MODELOS (una tarjeta por modelo con sus variantes) salvo group=0.
 catalogRouter.get('/catalog/products', async (req, res) => {
@@ -983,7 +1020,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
       res.setHeader('X-Search-Fuzzy', data.fuzzy ? '1' : '0');
       return res.json(data.products);
     };
-    if (cached) return send(cached);
+    if (cached) return send(await withLiveStock(cached));
 
     const params = parseCatalogParams(query);
     const { rows, total, refs, fuzzy, corrected } = await listFamilies(params, sort, pageNum, perPage);
@@ -1019,7 +1056,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
 
     const data = { products, total, refs, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy, corrected };
     await cacheSet(redisKey, data, 60);
-    return send(data);
+    return send(await withLiveStock(data));
   } catch (err: any) {
     console.error('[CATALOG PRODUCTS ROUTE ERROR]:', err);
     return res.status(500).json({ error: 'Error al cargar el catálogo' });
@@ -1431,7 +1468,7 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', refreshStockLimiter, as
     if (isNaN(productId)) return res.status(400).json({ error: 'ID de producto inválido' });
 
     const result = await db.execute(sql`
-      SELECT id, sku, supplier_code, stock, dropshipping, ondemand, updated_at 
+      SELECT id, sku, supplier_code, stock, dropshipping, ondemand, updated_at, restock_date::text AS restock_date
       FROM products 
       WHERE id = ${productId} AND status = 'published'
       LIMIT 1
@@ -1441,12 +1478,22 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', refreshStockLimiter, as
     const product = result.rows[0] as any;
     const currentStock = typeof product.stock === 'string' ? parseInt(product.stock, 10) : (product.stock || 0);
 
+    const sku = String(product.sku || '');
+
+    // Productos de Bihr (todos los que no son de Andreani, sean o no dropshipping): stock en vivo por su referencia de
+    // Bihr (lib/bihr-live-stock.ts). Si Bihr no contesta, se devuelve el guardado.
+    if (!sku.startsWith('AND-')) {
+      const live = (await refreshLiveBihrStock([product.id], { ttlSec: 120 })).get(product.id);
+      const stock = live ? live.stock : currentStock;
+      const restockDate = live ? live.restockDate : restockDateOf(product.restock_date);
+      return res.json({ stock, inStock: stock > 0, restockDate, restocking: stock <= 0 && !!restockDate });
+    }
+
     // Si no es dropshipping ni ondemand, retornamos el stock actual de inmediato
     if (!product.dropshipping && !product.ondemand) {
       return res.json({ stock: currentStock, inStock: currentStock > 0 });
     }
 
-    const sku = String(product.sku || '');
     const supplierCode = String(product.supplier_code || product.sku || '');
     if (!supplierCode) {
       return res.json({ stock: currentStock, inStock: currentStock > 0 });
@@ -1485,29 +1532,6 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', refreshStockLimiter, as
       }
       return res.json({ stock: currentStock, inStock: currentStock > 0 });
     }
-
-    // Throttle de 15 minutos: si se actualizó hace poco, no llamamos a la API de Bihr
-    const quinceMinutos = 15 * 60 * 1000;
-    const necesitaActualizacion = !product.updated_at || (Date.now() - new Date(product.updated_at).getTime() > quinceMinutos);
-
-    if (!necesitaActualizacion) {
-      return res.json({ stock: currentStock, inStock: currentStock > 0 });
-    }
-
-    // Llamamos a la API externa de Bihr para obtener el stock real numérico
-    const stock = await getLiveStockValue(supplierCode);
-    const safeStock = Number.isFinite(stock) && stock >= 0 ? Math.floor(stock) : 0;
-    const inStock = safeStock > 0;
-
-    // Actualizamos la base de datos
-    await db.execute(sql`
-      UPDATE products 
-      SET stock = ${safeStock}, updated_at = NOW() 
-      WHERE id = ${product.id}
-    `);
-
-    console.log(`[LIVE STOCK REFRESH] Updated stock for ${product.sku} to ${safeStock} (inStock: ${inStock})`);
-    return res.json({ stock: safeStock, inStock });
   } catch (err: any) {
     console.error('[LIVE STOCK REFRESH ERROR]:', err);
     // En caso de error de la API (ej: 429), devolvemos el stock cacheado para no romper la UI
@@ -1601,6 +1625,10 @@ catalogRouter.get('/catalog/stock-check', async (req, res) => {
     if (!ids) return res.status(400).json({ error: 'Falta ids' });
     const idsList = ids.split(',').map((id: string) => parseInt(id, 10)).filter((id: number) => !isNaN(id) && id > 0);
     if (idsList.length === 0) return res.json({ checks: [] });
+
+    // Stock de Bihr de este momento: el carrito no puede dar por bueno lo que Bihr ya no tiene. Se guarda en la base de
+    // datos al consultarlo, así que la lectura de abajo ya lo trae.
+    await refreshLiveBihrStock(idsList, { ttlSec: 120 });
 
     const result = await db.execute(sql`
       SELECT id, sku, name, stock

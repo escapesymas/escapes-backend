@@ -6,8 +6,9 @@ import path from 'path';
 vi.mock('../db.js', () => ({ pool: { query: vi.fn() } }));
 vi.mock('../bihrService.js', () => ({ getBihrToken: vi.fn() }));
 vi.mock('./cache.js', () => ({ cacheBust: vi.fn() }));
+vi.mock('./bihr-live-stock.js', async (orig) => ({ ...(await orig<typeof import('./bihr-live-stock.js')>()), refreshLiveBihrStock: vi.fn() }));
 
-import { readCatalogStatus, readStocks, planDiscontinued, DISCONTINUED_STATUS, type CatalogStatus } from './bihr-discontinued.js';
+import { readCatalogStatus, readStocks, readStockDetails, planStockSync, planDiscontinued, DISCONTINUED_STATUS, type CatalogStatus } from './bihr-discontinued.js';
 
 const tmp = (name: string, content: string) => {
   const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bihr-test-')), name);
@@ -54,5 +55,35 @@ describe('qué ocultar y qué recuperar', () => {
   ];
   it('oculta solo los descatalogados sin stock en Bihr, manda la referencia actual y recupera los reactivados', () => {
     expect(planDiscontinued(rows, status, stocks)).toEqual({ hide: [1, 3], restore: [5, 6, 9], keptWithStock: 1 });
+  });
+});
+
+describe('stock y reaprovisionamiento del catálogo «Stocks»', () => {
+  const f = () => tmp('s2.json', JSON.stringify({ Stocks: [
+    { PartNumber: '1078960', Value: 0, ForecastAvailabilityDateTime: '2026-12-21T00:00:00.0000000', UpdateDateTime: 'x' },
+    { PartNumber: '1000000', Value: 7, UpdateDateTime: 'x' },
+    { PartNumber: '1000002', Value: 0, UpdateDateTime: 'x' },
+  ] }, null, 2));
+
+  it('lee la fecha prevista solo de quien la tiene', async () => {
+    const d = await readStockDetails(f());
+    expect(Object.fromEntries(d)).toEqual({
+      '1078960': { value: 0, forecast: '2026-12-21' },
+      '1000000': { value: 7, forecast: null },
+      '1000002': { value: 0, forecast: null },
+    });
+  });
+
+  it('calcula qué cambia: usa la referencia de Bihr, no toca lo que ya coincide y cuenta los que se agotan', async () => {
+    const d = await readStockDetails(f());
+    const plan = planStockSync([
+      { id: 1, sku: '30400041', part_number: '1078960', stock: 39, restock_date: null }, // Bihr: 0 y reaprovisionando -> cambia
+      { id: 2, sku: '1000000', part_number: '1000000', stock: 7, restock_date: null },   // coincide -> no cambia
+      { id: 3, sku: 'X3', part_number: '1000002', stock: 0, restock_date: null },        // coincide -> no cambia
+      { id: 4, sku: '1000000', part_number: null, stock: 0, restock_date: null },        // sin part_number: por sku -> le entra stock
+      { id: 5, sku: 'PROPIO', part_number: 'zzz', stock: 5, restock_date: null },        // no es de Bihr -> se deja
+      { id: 6, sku: 'S6', part_number: '1078960', stock: 0, restock_date: '2026-12-01' },// solo cambia la fecha
+    ], d);
+    expect(plan).toEqual({ ids: [1, 4, 6], stocks: [0, 7, 0], dates: ['2026-12-21', '', '2026-12-21'], matched: 5, toZero: 1, fromZero: 1 });
   });
 });
