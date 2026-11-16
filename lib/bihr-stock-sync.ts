@@ -1,4 +1,9 @@
 /**
+ * NO ACTIVAR (ENABLE_BIHR_STOCK_CRON): está apagado a propósito y el stock de Bihr se mantiene de otra forma:
+ * en vivo al mostrar/vender (lib/bihr-live-stock.ts) y con la copia diaria del catálogo «Stocks»
+ * (lib/bihr-discontinued.ts). Este cron pregunta por `supplier_code` (que casi siempre es la referencia del
+ * fabricante, no la de Bihr) y `getLiveStockValue` devuelve 0 ante cualquier error, que se guardaría como stock.
+ *
  * Bihr stock sync — periodic reconciliation of products.stock against the
  * Bihr Inventory API.
  *

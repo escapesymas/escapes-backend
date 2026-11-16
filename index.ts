@@ -29,6 +29,7 @@ import { cacheGet, cacheSet, cacheBust } from './lib/cache.js';
 import { initSentry, sentryErrorHandler } from './lib/sentry.js';
 import { cdnUrl, cdnBanner } from './lib/uploads-cdn.js';
 import { syncBihrStock, startBihrStockCron, lastBihrStockSync } from './lib/bihr-stock-sync.js';
+import { refreshLiveBihrStock } from './lib/bihr-live-stock.js';
 import { meiliSearchProducts, reindexMeilisearch, lastReindexSummary, isMeilisearchEnabled, meilisearchBanner } from './lib/search.js';
 import { processStripeEvent, processStripeWebhookRetryQueue, stripeWebhookStats } from './lib/stripe-webhook.js';
 import { constructStripeEvent, handleStripeWebhookEvent } from './lib/stripe-webhook-service.js';
@@ -3152,17 +3153,17 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
 
         const avgOrderTotalCents = Number(aovRes.rows[0]?.avg_order_total_cents || 0);
 
-        // ── Live stock from Bihr — bihrService calls have their own 8s timeout ──
-        let liveStock = { quantity: null as number | null, status: null as string | null };
-        const productCode = product.supplier_code || product.barcode;
-        if (productCode) {
-          try {
-            const [status, quantity] = await Promise.all([
-              getLiveStockLevel(productCode),
-              getLiveStockValue(productCode),
-            ]);
-            liveStock = { quantity, status };
-          } catch (_) { /* non-critical: leave as null */ }
+        // ── Stock de Bihr en vivo, por su referencia (part_number; lib/bihr-live-stock.ts). Los de Andreani no. ──
+        let liveStock = { quantity: null as number | null, status: null as string | null, restockDate: null as string | null };
+        if (!String(product.sku || '').startsWith('AND-')) {
+          const live = (await refreshLiveBihrStock([product.id], { ttlSec: 60 })).get(product.id);
+          if (live) {
+            liveStock = {
+              quantity: live.stock,
+              status: live.stock > 0 ? 'InStock' : live.restockDate ? 'Reaprovisionando' : 'OutOfStock',
+              restockDate: live.restockDate,
+            };
+          }
         }
 
         return res.json({
