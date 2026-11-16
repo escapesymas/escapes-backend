@@ -1507,9 +1507,17 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', refreshStockLimiter, as
         return res.json({ stock: currentStock, inStock: currentStock > 0 });
       }
 
+      // La clave de ApproSearch va en APPROSEARCH_API_KEY, nunca en el código (el repositorio es público). Sin ella no se
+      // consulta a Andreani y se sirve el stock guardado.
+      const approKey = process.env.APPROSEARCH_API_KEY;
+      if (!approKey) {
+        console.warn('[ANDREANI LIVE STOCK REFRESH] Falta APPROSEARCH_API_KEY: se sirve el stock guardado');
+        return res.json({ stock: currentStock, inStock: currentStock > 0 });
+      }
+
       try {
         const cleanRef = (product.supplier_code || sku.replace(/^AND-/, '')).trim().toUpperCase();
-        const apiUrl = `https://api.approsearch.com/api/v1/search?api_key=aps_yArpUYoJVuph6jDyEWpkgy02k_ilLQKD&q=${encodeURIComponent(cleanRef)}&limit=5`;
+        const apiUrl = `https://api.approsearch.com/api/v1/search?api_key=${encodeURIComponent(approKey)}&q=${encodeURIComponent(cleanRef)}&limit=5`;
         const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(4000) });
         if (resp.ok) {
           const data = (await resp.json()) as any;
