@@ -7,10 +7,15 @@
 
 export type PeriodPreset = 'today' | 'yesterday' | '7d' | '30d' | 'month' | 'prev_month' | 'year' | 'custom';
 
+/** Con qué se compara: el periodo anterior equivalente o las mismas fechas del año pasado. */
+export type ComparisonMode = 'prev' | 'yoy';
+export const COMPARISON_MODES: ComparisonMode[] = ['prev', 'yoy'];
+
 export const PERIOD_PRESETS: PeriodPreset[] = ['today', 'yesterday', '7d', '30d', 'month', 'prev_month', 'year', 'custom'];
 
 export interface ResolvedPeriod {
   preset: PeriodPreset;
+  compare: ComparisonMode;
   label: string;
   /** Primer día (YYYY-MM-DD, hora de Madrid), incluido. */
   from: string;
@@ -57,6 +62,13 @@ function isRealDate(s: unknown): s is string {
   return fromUtc(toUtc(s)) === s;
 }
 
+/** La misma fecha un año antes (el 29 de febrero cae en el 28). */
+export function minusOneYear(date: string): string {
+  const y = Number(date.slice(0, 4)) - 1;
+  const same = `${y}${date.slice(4)}`;
+  return isRealDate(same) ? same : `${y}-02-28`;
+}
+
 function firstOfMonth(date: string): string {
   return `${date.slice(0, 7)}-01`;
 }
@@ -77,7 +89,7 @@ function monthName(date: string): string {
   return `${MONTHS[m - 1]} de ${y}`;
 }
 
-function rangeText(from: string, to: string): string {
+export function rangeText(from: string, to: string): string {
   return from === to ? shortDate(from) : `${shortDate(from)} – ${shortDate(to)}`;
 }
 
@@ -85,9 +97,10 @@ function rangeText(from: string, to: string): string {
  * Convierte lo que pide el panel (`preset`, y `from`/`to` si es personalizado) en un periodo concreto.
  * Un periodo personalizado incorrecto (fechas inventadas, al revés, demasiado largo) se corrige: nunca falla.
  */
-export function resolvePeriod(input: { preset?: unknown; from?: unknown; to?: unknown }, now: Date = new Date()): ResolvedPeriod {
+export function resolvePeriod(input: { preset?: unknown; from?: unknown; to?: unknown; compare?: unknown }, now: Date = new Date()): ResolvedPeriod {
   const today = madridToday(now);
   const preset: PeriodPreset = PERIOD_PRESETS.includes(input.preset as PeriodPreset) ? (input.preset as PeriodPreset) : '30d';
+  const compare: ComparisonMode = input.compare === 'yoy' ? 'yoy' : 'prev';
 
   let from = today;
   let to = today;
@@ -178,7 +191,14 @@ export function resolvePeriod(input: { preset?: unknown; from?: unknown; to?: un
       break;
   }
 
-  return { preset, label, from, to, days: daysBetween(from, to), prevFrom, prevTo, prevLabel };
+  // Mismas fechas del año pasado: sustituye al periodo anterior calculado arriba.
+  if (compare === 'yoy') {
+    prevFrom = minusOneYear(from);
+    prevTo = minusOneYear(to);
+    prevLabel = from.slice(0, 4) === to.slice(0, 4) ? `Mismo periodo de ${Number(from.slice(0, 4)) - 1}` : 'Mismo periodo del año pasado';
+  }
+
+  return { preset, compare, label, from, to, days: daysBetween(from, to), prevFrom, prevTo, prevLabel };
 }
 
 /** Lista de días (YYYY-MM-DD) de un periodo, para rellenar los huecos de las series. */

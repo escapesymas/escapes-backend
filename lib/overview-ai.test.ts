@@ -26,6 +26,15 @@ describe('datos que ve la IA', () => {
     expect(text).toContain('Búsquedas SIN resultados: «aceite honda dulan» (3)');
   });
 
+  it('con la comparación del año pasado lo dice, y los datos sin periodo de comparación salen como «sin datos»', () => {
+    const t = reportToPromptText(makeReport({ yoyNoData: true }));
+    expect(t).toContain('el mismo periodo del año pasado');
+    expect(t).toMatch(/Visitantes únicos \| 1\.200 \| sin datos/);
+    expect(t).toContain('Visitantes: 1200 | sin datos');
+    expect(t).toContain('Hay datos de la tienda desde 2026-05-16');
+    expect(SYSTEM_PROMPT).toMatch(/sin datos/);
+  });
+
   it('no lleva correos de clientes', () => {
     expect(text).not.toContain('a@b.c');
   });

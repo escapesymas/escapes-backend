@@ -79,7 +79,9 @@ function kpiCards(doc: Doc, kpis: Kpi[]): void {
     doc.font('Helvetica').fontSize(7).fillColor(C.muted).text(winAnsi(k.label.toUpperCase()), x + 8, y + 8, { width: cw - 16, height: 18, ellipsis: true });
     doc.font('Helvetica-Bold').fontSize(16).fillColor(C.ink).text(winAnsi(fmtValue(k.value, k.unit)), x + 8, y + 27, { width: cw - 16, lineBreak: false });
     const d = deltaOf(k);
-    if (d.dir !== 'none') {
+    if (k.noPrev) {
+      doc.font('Helvetica').fontSize(7.5).fillColor(C.muted).text('Sin datos de comparación', x + 8, y + 50, { width: cw - 16, lineBreak: false });
+    } else if (d.dir !== 'none') {
       deltaMark(doc, x + 8, y + 51, d);
       doc.font('Helvetica-Bold').fontSize(8).fillColor(deltaColor(d)).text(winAnsi(`${d.text}  vs. anterior`), x + (d.dir === 'flat' ? 8 : 18), y + 49, { width: cw - 24, lineBreak: false });
     } else {
@@ -122,11 +124,12 @@ function table(doc: Doc, x: number, y: number, cols: Col[], rows: (string | { te
 }
 
 /** Gráfica de barras (una por día) con la cifra máxima y las fechas de los extremos. */
-function barChart(doc: Doc, x: number, y: number, w: number, h: number, title: string, data: { label: string; value: number }[], format: (v: number) => string, color: string): void {
+function barChart(doc: Doc, x: number, y: number, w: number, h: number, title: string, data: { label: string; value: number }[], format: (v: number) => string, color: string, compare?: (number | null)[], compareLabel?: string): void {
   doc.font('Helvetica-Bold').fontSize(8.5).fillColor(C.ink).text(winAnsi(title), x, y, { width: w, lineBreak: false });
   const top = y + 16;
   const plotH = h - 16 - 14;
-  const max = Math.max(...data.map((d) => d.value), 0);
+  const cmp = compare && compare.length === data.length && compare.some((v) => v != null) ? compare : null;
+  const max = Math.max(...data.map((d) => d.value), ...(cmp || []).map((v) => v ?? 0), 0);
   doc.rect(x, top, w, plotH).lineWidth(0.5).strokeColor(C.line).stroke();
   if (!data.length || max <= 0) {
     doc.font('Helvetica').fontSize(8).fillColor(C.muted).text('Sin datos en el periodo', x, top + plotH / 2 - 4, { width: w, align: 'center', lineBreak: false });
@@ -139,8 +142,21 @@ function barChart(doc: Doc, x: number, y: number, w: number, h: number, title: s
     const bh = Math.max(0.8, (d.value / max) * (plotH - 4));
     doc.rect(x + i * slot + (slot - bw) / 2, top + plotH - bh, bw, bh).fill(color);
   });
+  // Periodo de comparación: línea gris por encima de las barras (los días sin dato la cortan).
+  if (cmp) {
+    doc.save().lineWidth(1).strokeColor('#64748B').dash(2, { space: 2 });
+    let open = false;
+    cmp.forEach((v, i) => {
+      if (v == null) { open = false; return; }
+      const px = x + i * slot + slot / 2;
+      const py = top + plotH - (v / max) * (plotH - 4);
+      if (!open) { doc.moveTo(px, py); open = true; } else doc.lineTo(px, py);
+    });
+    doc.stroke().undash().restore();
+  }
   doc.font('Helvetica').fontSize(7).fillColor(C.muted);
   doc.text(winAnsi(`máx. ${format(max)}`), x + 3, top + 2, { width: w - 6, align: 'right', lineBreak: false });
+  if (cmp && compareLabel) doc.text(winAnsi(`--- ${compareLabel}`), x + 3, top + 2, { width: w - 80, align: 'left', lineBreak: false });
   const first = data[0].label, last = data[data.length - 1].label, mid = data[Math.floor(data.length / 2)].label;
   doc.text(winAnsi(first), x, top + plotH + 3, { width: w / 3, align: 'left', lineBreak: false });
   if (data.length > 2) doc.text(winAnsi(mid), x + w / 3, top + plotH + 3, { width: w / 3, align: 'center', lineBreak: false });
@@ -160,9 +176,9 @@ function funnel(doc: Doc, steps: OverviewReport['funnel']): void {
     const bw = Math.max(2, (s.current / max) * barMax);
     doc.rect(barX, y + 2, barMax, 14).fill(C.zebra);
     doc.rect(barX, y + 2, bw, 14).fill(C.amber);
-    doc.font('Helvetica-Bold').fontSize(9).fillColor(C.ink).text(winAnsi(String(s.current)), barX + barMax + 8, y + 4, { width: 40, lineBreak: false });
+    doc.font('Helvetica-Bold').fontSize(9).fillColor(C.ink).text(winAnsi(fmtValue(s.current, 'int')), barX + barMax + 8, y + 4, { width: 40, lineBreak: false });
     const prevStep = i > 0 ? steps[i - 1].current : 0;
-    const conv = i > 0 && prevStep > 0 ? `${((s.current / prevStep) * 100).toFixed(1).replace('.', ',')} % del paso anterior` : i === 0 ? `antes: ${s.previous}` : '';
+    const conv = i > 0 && prevStep > 0 ? `${((s.current / prevStep) * 100).toFixed(1).replace('.', ',')} % del paso anterior` : i === 0 ? `comparación: ${s.previous == null ? 'sin datos' : fmtValue(s.previous, 'int')}` : '';
     doc.font('Helvetica').fontSize(7.5).fillColor(C.muted).text(winAnsi(conv), barX + barMax + 44, y + 5, { width: 90, lineBreak: false });
     doc.y = y + 22;
     doc.x = M;
@@ -250,8 +266,8 @@ export function buildOverviewPdf(report: OverviewReport, aiText?: string): Promi
       ensureSpace(doc, 150);
       const gy = doc.y + 4;
       const half = (W - 14) / 2;
-      barChart(doc, M, gy, half, 120, 'Ventas por día (€)', report.sales.byDay.map((d) => ({ label: fmtDay(d.date), value: d.revenue })), eurFmt, C.amber);
-      barChart(doc, M + half + 14, gy, half, 120, 'Visitantes por día', (report.visits?.byDay || []).map((d) => ({ label: fmtDay(d.date), value: d.visitors })), (v) => String(Math.round(v)), C.head);
+      barChart(doc, M, gy, half, 120, 'Ventas por día (€)', report.sales.byDay.map((d) => ({ label: fmtDay(d.date), value: d.revenue })), eurFmt, C.amber, report.compareSeries?.revenue, report.period.prevLabel);
+      barChart(doc, M + half + 14, gy, half, 120, 'Visitantes por día', (report.visits?.byDay || []).map((d) => ({ label: fmtDay(d.date), value: d.visitors })), (v) => String(Math.round(v)), C.head, report.compareSeries?.visitors, report.period.prevLabel);
       doc.y = gy + 128;
       doc.x = M;
 
@@ -267,7 +283,7 @@ export function buildOverviewPdf(report: OverviewReport, aiText?: string): Promi
         if (!ks.length) continue;
         ensureSpace(doc, 17 * Math.min(ks.length, 4) + 60);
         sectionTitle(doc, GROUP_TITLES[g]);
-        const cols: Col[] = [{ title: 'Indicador', width: 230 }, { title: 'Periodo', width: 95, align: 'right' }, { title: 'Anterior', width: 95, align: 'right' }, { title: 'Variación', width: 95, align: 'right' }];
+        const cols: Col[] = [{ title: 'Indicador', width: 230 }, { title: 'Periodo', width: 95, align: 'right' }, { title: 'Comparación', width: 95, align: 'right' }, { title: 'Variación', width: 95, align: 'right' }];
         // La tabla se parte por páginas de 30 filas como máximo para no cortarse a mitad de una fila.
         for (let i = 0; i < ks.length; ) {
           const room = Math.floor((BOTTOM - doc.y - 6) / 17) - 1;
@@ -278,7 +294,7 @@ export function buildOverviewPdf(report: OverviewReport, aiText?: string): Promi
             return [
               k.label,
               { text: fmtValue(k.value, k.unit), bold: true },
-              k.prev == null ? { text: 'foto del momento', color: C.muted } : fmtValue(k.prev, k.unit),
+              k.prev == null ? { text: k.noPrev ? 'sin datos' : 'foto del momento', color: C.muted } : fmtValue(k.prev, k.unit),
               { text: d.text || '-', color: deltaColor(d), bold: true },
             ];
           });

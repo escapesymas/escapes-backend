@@ -59,6 +59,7 @@ import { mfaRouter } from './routes/mfaRoutes.js';
 import { motoAlertRouter } from './routes/motoAlertRoutes.js';
 import { analyticsRouter } from './routes/analyticsRoutes.js';
 import { overviewRouter } from './routes/overviewRoutes.js';
+import { startOverviewEmailJob } from './lib/overview-email.js';
 import { andreaniRouter } from './routes/andreani.js';
 import { startAndreaniStockCron } from './lib/andreani-service.js';
 import { ensureCompatModels } from './lib/compat.js';
@@ -7364,6 +7365,8 @@ app.use(sentryErrorHandler());
 app.listen(PORT, () => {
   // Tareas del chat con asesor: cierre por inactividad y recordatorio de pedidos sin pagar.
   startChatJobs();
+  // Informes de la Vista general por correo (diario, semanal y mensual según Ajustes › Informes).
+  startOverviewEmailJob();
   resetInterruptedGenerations().catch((e) => console.error('[SOCIAL CONTENT] reset:', e.message));
   console.log(`
 ╔══════════════════════════════════════════════════════╗

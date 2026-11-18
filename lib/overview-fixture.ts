@@ -29,9 +29,12 @@ export function makeData(over: Partial<OverviewData> = {}): OverviewData {
   };
 }
 
-export function makeReport(over: { visits?: boolean } = {}): OverviewReport {
-  const period = resolvePeriod({ preset: '7d' }, new Date('2026-11-18T11:00:00Z'));
-  const data = makeData(over.visits === false ? { visitsCur: null, visitsPrev: null, googleCur: null, googlePrev: null } : {});
+export function makeReport(over: { visits?: boolean; yoyNoData?: boolean } = {}): OverviewReport {
+  const period = resolvePeriod({ preset: '7d', compare: over.yoyNoData ? 'yoy' : 'prev' }, new Date('2026-11-18T11:00:00Z'));
+  const data = makeData({
+    ...(over.visits === false ? { visitsCur: null, visitsPrev: null, googleCur: null, googlePrev: null } : {}),
+    ...(over.yoyNoData ? { prevAvail: { store: false, visits: false } } : {}),
+  });
   const days = ['2026-11-12', '2026-11-13', '2026-11-14', '2026-11-15', '2026-11-16', '2026-11-17', '2026-11-18'];
   return {
     period, generatedAt: '2026-11-18T21:30:00.000Z', excludeInternal: true,
@@ -53,12 +56,16 @@ export function makeReport(over: { visits?: boolean } = {}): OverviewReport {
       noResultSearches: [{ term: 'aceite honda dulan', count: 3 }],
       topBikes: [{ term: 'yamaha mt-09 (2021)', count: 6 }],
     },
+    compareSeries: over.yoyNoData
+      ? { revenue: days.map(() => null), visitors: days.map(() => null), carts: days.map(() => null) }
+      : { revenue: days.map((_, i) => (i === 2 ? null : i * 20)), visitors: days.map((_, i) => 90 + i * 8), carts: days.map((_, i) => i % 3) },
+    dataSince: { store: '2026-05-16', visits: '2026-01-01' },
     funnel: over.visits === false ? [] : [
-      { key: 'visitors', label: 'Visitantes', current: 1200, previous: 800 },
-      { key: 'product', label: 'Ven una ficha', current: 400, previous: 250 },
-      { key: 'cart', label: 'Añaden al carrito', current: 40, previous: 20 },
-      { key: 'checkout', label: 'Empiezan a pagar', current: 12, previous: 5 },
-      { key: 'order', label: 'Pedido pagado', current: 4, previous: 2 },
+      { key: 'visitors', label: 'Visitantes', current: 1200, previous: over.yoyNoData ? null : 800 },
+      { key: 'product', label: 'Ven una ficha', current: 400, previous: over.yoyNoData ? null : 250 },
+      { key: 'cart', label: 'Añaden al carrito', current: 40, previous: over.yoyNoData ? null : 20 },
+      { key: 'checkout', label: 'Empiezan a pagar', current: 12, previous: over.yoyNoData ? null : 5 },
+      { key: 'order', label: 'Pedido pagado', current: 4, previous: over.yoyNoData ? null : 2 },
     ],
     carts: { active: data.cartsNow.active, top: [{ id: 964, email: null, value: 303.05, items: 6, updatedAt: '2026-11-18T13:40:32.101Z' }, { id: 970, email: 'a@b.c', value: 120, items: 2, updatedAt: '2026-11-17T10:00:00.000Z' }] },
     warnings: over.visits === false ? ['Las estadísticas de visitas no están disponibles ahora; el informe sale sin ese apartado.'] : [],

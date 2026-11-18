@@ -219,3 +219,28 @@ export async function getVisitsDetail(from: string, to: string, excludeInternal 
     topBikes: termList('bike_selected'),
   };
 }
+
+/** Visitantes y visitantes con carrito por día (solo las series que se dibujan en la gráfica de comparación). */
+export async function getVisitsDays(from: string, to: string, excludeInternal = true): Promise<{ date: string; visitors: number; carts: number }[]> {
+  const internal = getInternalFilterSql(excludeInternal, 's');
+  const { rows } = await getUmamiPool().query(
+    `SELECT to_char(e.created_at AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD') AS d,
+            COUNT(DISTINCT e.session_id) FILTER (WHERE e.event_type = 1) AS visitors,
+            COUNT(DISTINCT e.session_id) FILTER (WHERE e.event_name = 'add_to_cart') AS carts
+       FROM website_event e JOIN session s ON s.session_id = e.session_id
+      WHERE ${RANGE} ${internal}
+      GROUP BY 1 ORDER BY 1`,
+    [from, to]);
+  return rows.map((r: any) => ({ date: r.d, visitors: n(r.visitors), carts: n(r.carts) }));
+}
+
+let visitsSinceCache: { at: number; value: string | null } | null = null;
+
+/** Día (YYYY-MM-DD, hora de Madrid) del primer dato de visitas: antes de esa fecha no hay con qué comparar. */
+export async function getVisitsSince(): Promise<string | null> {
+  if (visitsSinceCache && Date.now() - visitsSinceCache.at < 6 * 3_600_000) return visitsSinceCache.value;
+  const { rows } = await getUmamiPool().query(`SELECT to_char(MIN(created_at) AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD') AS d FROM website_event`);
+  const value = rows[0]?.d ? String(rows[0].d) : null;
+  visitsSinceCache = { at: Date.now(), value };
+  return value;
+}

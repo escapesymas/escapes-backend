@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { addDays, daysBetween, listDays, madridToday, resolvePeriod } from './overview-period.js';
+import { addDays, daysBetween, listDays, madridToday, minusOneYear, resolvePeriod } from './overview-period.js';
 
 // 18 de noviembre de 2026, mediodía en Madrid.
 const NOW = new Date('2026-11-18T11:00:00Z');
@@ -78,5 +78,32 @@ describe('periodos del informe', () => {
   it('un preset desconocido o con inyección usa los últimos 30 días', () => {
     expect(resolvePeriod({ preset: "x'; DROP TABLE orders;--" }, NOW).preset).toBe('30d');
     expect(resolvePeriod({}, NOW).preset).toBe('30d');
+  });
+});
+
+describe('comparar con el mismo periodo del año pasado', () => {
+  it('por defecto se compara con el periodo anterior', () => {
+    expect(resolvePeriod({ preset: '30d' }, NOW).compare).toBe('prev');
+    expect(resolvePeriod({ preset: '30d', compare: 'otra-cosa' }, NOW).compare).toBe('prev');
+  });
+
+  it('las mismas fechas un año antes, para cualquier periodo', () => {
+    const month = resolvePeriod({ preset: 'month', compare: 'yoy' }, NOW);
+    expect([month.from, month.to, month.prevFrom, month.prevTo, month.compare]).toEqual(['2026-11-01', '2026-11-18', '2025-11-01', '2025-11-18', 'yoy']);
+    expect(month.prevLabel).toBe('Mismo periodo de 2025');
+    const w = resolvePeriod({ preset: '7d', compare: 'yoy' }, NOW);
+    expect([w.prevFrom, w.prevTo]).toEqual(['2025-11-12', '2025-11-18']);
+    const today = resolvePeriod({ preset: 'today', compare: 'yoy' }, NOW);
+    expect([today.prevFrom, today.prevTo]).toEqual(['2025-11-18', '2025-11-18']);
+    const prevMonth = resolvePeriod({ preset: 'prev_month', compare: 'yoy' }, NOW);
+    expect([prevMonth.prevFrom, prevMonth.prevTo]).toEqual(['2025-10-01', '2025-10-31']);
+  });
+
+  it('el 29 de febrero cae en el 28 y un periodo a caballo de dos años tiene su etiqueta', () => {
+    expect(minusOneYear('2028-02-29')).toBe('2027-02-28');
+    expect(minusOneYear('2026-11-18')).toBe('2025-11-18');
+    const across = resolvePeriod({ preset: 'custom', from: '2025-12-20', to: '2026-01-10', compare: 'yoy' }, NOW);
+    expect([across.prevFrom, across.prevTo]).toEqual(['2024-12-20', '2025-01-10']);
+    expect(across.prevLabel).toBe('Mismo periodo del año pasado');
   });
 });

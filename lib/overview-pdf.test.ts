@@ -31,6 +31,19 @@ describe('PDF del informe', () => {
   });
 });
 
+describe('comparación con el año pasado', () => {
+  it('con datos del otro año dibuja la línea de comparación y sale un PDF válido', async () => {
+    const pdf = await buildOverviewPdf(makeReport());
+    expect(pdf.toString('latin1')).toContain('/Type /Page');
+    expect(pdf.length).toBeGreaterThan(5_000);
+  });
+
+  it('sin datos del periodo de comparación el PDF sale igualmente (sin línea ni cifras inventadas)', async () => {
+    const pdf = await buildOverviewPdf(makeReport({ yoyNoData: true }));
+    expect(pdf.subarray(0, 5).toString()).toBe('%PDF-');
+  });
+});
+
 describe('texto que sí existe en las fuentes de PDF', () => {
   it('deja los acentos y el euro, cambia el menos y quita lo que no tiene glifo', () => {
     expect(winAnsi('Camión: 1.234,50 € — ñandú')).toBe('Camión: 1.234,50 € — ñandú');

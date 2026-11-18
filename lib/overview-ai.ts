@@ -20,8 +20,10 @@ REGLAS
 - Escribe en español de España, claro, directo y sin jerga innecesaria.
 - Usa SOLO los datos que se te dan. No inventes cifras, causas ni hechos. Cita las cifras tal y como vienen (no recalcules porcentajes).
 - La tienda es pequeña: con pocos pedidos o pocas visitas una variación no es una tendencia. Si la muestra es pequeña, dilo en una frase y no saques conclusiones fuertes.
-- Si el periodo anterior vale 0, no hables de porcentaje: di la cifra y que antes no había.
-- Compara con el periodo anterior cuando haya dato. Distingue lo que mejora de lo que empeora según la columna «bueno si».
+- El informe compara el periodo con un periodo de comparación (el periodo anterior o el mismo periodo del año pasado; los datos dicen cuál). Menciona siempre con cuál se compara.
+- Si el periodo de comparación vale 0, no hables de porcentaje: di la cifra y que antes no había.
+- Si un dato pone «sin datos» en el periodo de comparación, no compares ese dato: di que de ese periodo no hay datos.
+- Compara con el periodo de comparación cuando haya dato. Distingue lo que mejora de lo que empeora según la columna «bueno si».
 - Escribe SOLO con el alfabeto latino: nunca caracteres chinos ni de otros alfabetos, ni palabras en inglés.
 - Conjuga bien los verbos: «ha bajado», «han subido», «ha mejorado» (nunca «ha bajar»).
 - No menciones nombres de proveedores ni mayoristas.
@@ -32,7 +34,7 @@ export interface Section { title: string; brief: string; words: string }
 
 /** Secciones del informe, en el orden en que salen. */
 export const SECTIONS: Section[] = [
-  { title: 'Resumen ejecutivo', brief: 'Lo más importante del periodo en 3 o 4 frases: qué ha pasado, si va mejor o peor que antes y qué destaca.', words: '60 a 90' },
+  { title: 'Resumen ejecutivo', brief: 'Lo más importante del periodo en 3 o 4 frases: qué ha pasado, si va mejor o peor que en el periodo de comparación y qué destaca.', words: '60 a 90' },
   { title: 'Ventas y márgenes', brief: 'Ventas, pedidos, ticket medio, margen, cupones, reembolsos y productos más vendidos.', words: '60 a 100' },
   { title: 'Visitas y origen del tráfico', brief: 'Visitantes, páginas vistas, rebote, de dónde vienen, dispositivos, páginas más vistas, búsquedas (también las que no dan resultados) y errores 404.', words: '70 a 110' },
   { title: 'Embudo y carritos', brief: 'Cómo pasan los visitantes de ver una ficha a pagar, los carritos activos y su valor, los abandonados y los recuperados.', words: '70 a 110' },
@@ -45,21 +47,22 @@ export const SECTIONS: Section[] = [
 export function reportToPromptText(r: OverviewReport): string {
   const L: string[] = [];
   L.push(`PERIODO: ${r.period.label} (${r.period.from} a ${r.period.to}, ${r.period.days} día${r.period.days === 1 ? '' : 's'}).`);
-  L.push(`COMPARADO CON: ${r.period.prevLabel} (${r.period.prevFrom} a ${r.period.prevTo}).`);
+  L.push(`COMPARADO CON: ${r.period.prevLabel} (${r.period.prevFrom} a ${r.period.prevTo}) — ${r.period.compare === 'yoy' ? 'el mismo periodo del año pasado' : 'el periodo anterior equivalente'}.`);
+  L.push(`Hay datos de la tienda desde ${r.dataSince.store ?? 'siempre'} y de las visitas desde ${r.dataSince.visits ?? 'nunca'}.`);
   L.push(`Tráfico propio de Canarias ${r.excludeInternal ? 'excluido' : 'incluido'} en las visitas.`);
   for (const g of GROUP_ORDER) {
     const ks = r.kpis.filter((k) => k.group === g);
     if (!ks.length) continue;
-    L.push('', `## ${GROUP_TITLES[g]}`, 'indicador | periodo | periodo anterior | variación | bueno si');
+    L.push('', `## ${GROUP_TITLES[g]}`, 'indicador | periodo | periodo de comparación | variación | bueno si');
     for (const k of ks) {
       const d = deltaOf(k);
-      const prev = k.prev == null ? 'foto del momento' : fmtValue(k.prev, k.unit);
+      const prev = k.prev == null ? (k.noPrev ? 'sin datos' : 'foto del momento') : fmtValue(k.prev, k.unit);
       L.push(`${k.label} | ${fmtValue(k.value, k.unit)} | ${prev} | ${d.text || '-'} | ${k.good === 'up' ? 'subir' : k.good === 'down' ? 'bajar' : 'neutro'}${k.hint ? ` (${k.hint})` : ''}`);
     }
   }
   if (r.funnel.length) {
-    L.push('', '## Embudo (visitantes que llegan a cada paso; periodo | anterior)');
-    for (const f of r.funnel) L.push(`${f.label}: ${f.current} | ${f.previous}`);
+    L.push('', '## Embudo (visitantes que llegan a cada paso; periodo | comparación)');
+    for (const f of r.funnel) L.push(`${f.label}: ${f.current} | ${f.previous ?? 'sin datos'}`);
   }
   if (r.sales.topProducts.length) {
     L.push('', '## Productos más vendidos');

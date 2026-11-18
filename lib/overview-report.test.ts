@@ -4,7 +4,7 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../db.js', () => ({ pool: { query: vi.fn() } }));
 vi.mock('./overview-visits.js', () => ({ getVisitsSummary: vi.fn(), getVisitsDetail: vi.fn() }));
 
-const { buildKpis } = await import('./overview-report.js');
+const { alignSeries, applyAvailability, buildKpis } = await import('./overview-report.js');
 const { makeData, makeReport } = await import('./overview-fixture.js');
 
 const kpi = (list: ReturnType<typeof buildKpis>, id: string) => {
@@ -67,5 +67,51 @@ describe('KPIs de la Vista general', () => {
     const none = buildKpis(makeData({ peopleCur: { ...makeData().peopleCur, advisorWaitMin: null }, peoplePrev: { ...makeData().peoplePrev, advisorWaitMin: null } }));
     expect(none.find((x) => x.id === 'advisor_wait')).toBeUndefined();
     expect(kpi(kpis, 'advisor_wait').value).toBe(4.5);
+  });
+});
+
+describe('comparación sin datos del otro periodo', () => {
+  it('si no hay datos de visitas del periodo de comparación, esos KPIs salen sin comparar (no «nuevo»)', () => {
+    const k = buildKpis(makeData({ prevAvail: { store: true, visits: false } }));
+    for (const id of ['visitors', 'bounce_rate', 'carts_added', 'carts_added_value', 'cart_to_checkout', 'conv_rate']) {
+      expect(kpi(k, id), id).toMatchObject({ prev: null, noPrev: true });
+    }
+    // lo de la tienda sí se compara
+    expect(kpi(k, 'sales_revenue')).toMatchObject({ prev: 200 });
+    expect(kpi(k, 'sales_revenue').noPrev).toBeUndefined();
+    expect(kpi(k, 'abandoned_detected')).toMatchObject({ prev: 3 });
+  });
+
+  it('si no hay datos de la tienda, las ventas, clientes y atención salen sin comparar y las visitas sí', () => {
+    const k = buildKpis(makeData({ prevAvail: { store: false, visits: true } }));
+    for (const id of ['sales_revenue', 'customers_new', 'ai_chats', 'abandoned_recovered', 'conv_rate']) expect(kpi(k, id), id).toMatchObject({ prev: null, noPrev: true });
+    expect(kpi(k, 'visitors')).toMatchObject({ prev: 800 });
+  });
+
+  it('las fotos del momento no se marcan como «sin datos»: nunca tuvieron comparación', () => {
+    const k = buildKpis(makeData({ prevAvail: { store: false, visits: false } }));
+    expect(kpi(k, 'carts_active').noPrev).toBeUndefined();
+    expect(kpi(k, 'customers_total').noPrev).toBeUndefined();
+  });
+
+  it('con datos de los dos lados no cambia nada', () => {
+    const list = buildKpis(makeData());
+    expect(applyAvailability(list, { store: true, visits: true })).toEqual(list);
+    expect(applyAvailability(list, undefined)).toBe(list);
+  });
+});
+
+describe('series del periodo de comparación', () => {
+  it('se alinean por posición con las del periodo y rellenan con ceros los días sin dato', () => {
+    const prev = ['2025-11-12', '2025-11-13', '2025-11-14'];
+    expect(alignSeries(prev, new Map([['2025-11-13', 50]]), 3, true)).toEqual([0, 50, 0]);
+  });
+
+  it('si el periodo de comparación es más corto, el resto queda vacío (null)', () => {
+    expect(alignSeries(['2025-02-27', '2025-02-28'], new Map([['2025-02-28', 7]]), 3, true)).toEqual([0, 7, null]);
+  });
+
+  it('sin datos disponibles todo es null', () => {
+    expect(alignSeries(['2025-11-12'], new Map([['2025-11-12', 9]]), 2, false)).toEqual([null, null]);
   });
 });

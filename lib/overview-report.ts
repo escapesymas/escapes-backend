@@ -10,8 +10,8 @@
  *  · Carritos «ahora» es una foto del momento: no tiene periodo anterior con el que comparar.
  */
 import { pool } from '../db.js';
-import { listDays, resolvePeriod, type ResolvedPeriod } from './overview-period.js';
-import { getVisitsDetail, getVisitsSummary, type VisitsDetail, type VisitsSummary } from './overview-visits.js';
+import { listDays, resolvePeriod, type ComparisonMode, type ResolvedPeriod } from './overview-period.js';
+import { getVisitsDays, getVisitsDetail, getVisitsSince, getVisitsSummary, type VisitsDetail, type VisitsSummary } from './overview-visits.js';
 
 export type KpiUnit = 'eur' | 'int' | 'pct' | 'dec';
 export type KpiGroup = 'ventas' | 'visitas' | 'carritos' | 'clientes' | 'atencion' | 'catalogo';
@@ -21,15 +21,17 @@ export interface Kpi {
   group: KpiGroup;
   label: string;
   value: number;
-  /** Valor del periodo anterior; null si el dato es una foto del momento o no hay con qué comparar. */
+  /** Valor del periodo de comparación; null si el dato es una foto del momento o no hay datos de ese periodo (`noPrev`). */
   prev: number | null;
   unit: KpiUnit;
   /** Qué dirección es buena: «up» (subir es bueno), «down» (bajar es bueno) o neutro. */
   good: 'up' | 'down' | null;
   hint?: string;
+  /** El periodo de comparación es anterior a los primeros datos que hay: no se compara (no es lo mismo que «cero»). */
+  noPrev?: boolean;
 }
 
-export interface FunnelStep { key: string; label: string; current: number; previous: number }
+export interface FunnelStep { key: string; label: string; current: number; previous: number | null }
 
 export interface OverviewReport {
   period: ResolvedPeriod;
@@ -45,6 +47,10 @@ export interface OverviewReport {
     coupons: { code: string; orders: number; discount: number }[];
   };
   visits: VisitsDetail | null;
+  /** Series por día del periodo de comparación, alineadas por posición con las del periodo (null = sin dato). */
+  compareSeries: { revenue: (number | null)[]; visitors: (number | null)[]; carts: (number | null)[] } | null;
+  /** Primer día con datos de la tienda y de las estadísticas web (YYYY-MM-DD). */
+  dataSince: { store: string | null; visits: string | null };
   funnel: FunnelStep[];
   carts: {
     active: { count: number; value: number; guests: number; stale: number };
@@ -196,6 +202,8 @@ export interface OverviewData {
   customersTotal: number;
   products: { published: number; inStock: number };
   cartsNow: OverviewReport['carts'];
+  /** ¿Hay datos del periodo de comparación? (tienda: pedidos, clientes, chats…; visitas: estadísticas web). Por defecto sí. */
+  prevAvail?: { store: boolean; visits: boolean };
 }
 
 const k = (id: string, group: KpiGroup, label: string, value: number, prev: number | null, unit: KpiUnit, good: Kpi['good'], hint?: string): Kpi =>
@@ -284,7 +292,18 @@ export function buildKpis(d: OverviewData): Kpi[] {
     k('products_in_stock', 'catalogo', 'Productos con stock', d.products.inStock, null, 'int', null, 'Foto del momento (copia diaria del catálogo del proveedor).'),
     k('products_in_stock_pct', 'catalogo', 'Productos publicados con stock (%)', pct(d.products.inStock, d.products.published), null, 'pct', null),
   );
-  return out;
+  return applyAvailability(out, d.prevAvail);
+}
+
+/** KPIs que salen de las estadísticas web (el resto sale de la base de datos de la tienda). */
+const VISITS_KPIS = new Set(['carts_added', 'carts_added_rate', 'carts_added_value', 'carts_avg_value', 'checkout_starts', 'cart_to_checkout']);
+const sources = (kpi: Kpi): ('store' | 'visits')[] =>
+  kpi.id === 'conv_rate' ? ['store', 'visits'] : kpi.group === 'visitas' || VISITS_KPIS.has(kpi.id) ? ['visits'] : ['store'];
+
+/** Si no hay datos del periodo de comparación, el KPI no se compara (`noPrev`) en lugar de comparar con un cero inventado. */
+export function applyAvailability(list: Kpi[], avail?: { store: boolean; visits: boolean }): Kpi[] {
+  if (!avail) return list;
+  return list.map((x) => (x.prev == null || sources(x).every((s) => avail[s]) ? x : { ...x, prev: null, noPrev: true }));
 }
 
 const HEADLINE = ['sales_revenue', 'sales_orders', 'sales_avg', 'visitors', 'conv_rate', 'carts_added', 'carts_active_value', 'customers_new'];
@@ -295,12 +314,29 @@ function fillSalesDays(rows: { d: string; orders: unknown; revenue: unknown }[],
   return listDays(from, to).map((date) => ({ date, ...(byDate.get(date) || { orders: 0, revenue: 0 }) }));
 }
 
+let storeSinceCache: { at: number; value: string | null } | null = null;
+
+/** Primer día con datos de la tienda (pedidos o clientes), en hora de Madrid. */
+async function getStoreSince(): Promise<string | null> {
+  if (storeSinceCache && Date.now() - storeSinceCache.at < 6 * 3_600_000) return storeSinceCache.value;
+  const { rows } = await pool.query(
+    `SELECT to_char((LEAST((SELECT MIN(created_at) FROM orders), (SELECT MIN(created_at) FROM users)) AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD') AS d`);
+  const value = rows[0]?.d ? String(rows[0].d) : null;
+  storeSinceCache = { at: Date.now(), value };
+  return value;
+}
+
+/** Alinea por posición una serie de días del periodo de comparación con la del periodo (mismo número de huecos). */
+export function alignSeries(prevDays: string[], values: Map<string, number>, length: number, available: boolean): (number | null)[] {
+  return Array.from({ length }, (_, i) => (available && i < prevDays.length ? values.get(prevDays[i]) ?? 0 : null));
+}
+
 const cache = new Map<string, { at: number; result: Promise<OverviewReport> }>();
 const CACHE_MS = 60_000;
 
-export function getOverviewReport(input: { preset?: unknown; from?: unknown; to?: unknown }, excludeInternal = true): Promise<OverviewReport> {
+export function getOverviewReport(input: { preset?: unknown; from?: unknown; to?: unknown; compare?: unknown }, excludeInternal = true): Promise<OverviewReport> {
   const period = resolvePeriod(input);
-  const key = `${period.from}|${period.to}|${excludeInternal}`;
+  const key = `${period.from}|${period.to}|${period.compare}|${excludeInternal}`;
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.result;
   const result = computeReport(period, excludeInternal);
@@ -328,13 +364,19 @@ async function computeReport(period: ResolvedPeriod, excludeInternal: boolean): 
     }
   };
 
-  const [salesCur, salesPrev, peopleCur, peoplePrev, abandonCur, abandonPrev, cartsNow, visitsCur, visitsPrev, visitsDetail, google, extra] = await Promise.all([
+  const [storeSince, visitsSince] = await Promise.all([getStoreSince().catch(() => null), getVisitsSince().catch(() => null)]);
+  // Sin datos de ese periodo (anterior a lo primero que hay) no se compara: «0» sería inventado.
+  const prevAvail = { store: !storeSince || period.prevTo >= storeSince, visits: !!visitsSince && period.prevTo >= visitsSince };
+  const partial = (since: string | null, what: string) =>
+    since && period.prevFrom < since && period.prevTo >= since ? `${what} solo hay datos desde el ${since.split('-').reverse().join('/')}: la comparación cubre solo parte del periodo.` : null;
+
+  const [salesCur, salesPrev, peopleCur, peoplePrev, abandonCur, abandonPrev, cartsNow, visitsCur, visitsPrev, visitsDetail, google, extra, prevSeries] = await Promise.all([
     salesAgg(from, to), salesAgg(pFrom, pTo),
     peopleAgg(from, to), peopleAgg(pFrom, pTo),
     abandonAgg(from, to), abandonAgg(pFrom, pTo),
     activeCarts(),
     safe('Las estadísticas de visitas', getVisitsSummary(from, to, excludeInternal)),
-    safe('Las estadísticas de visitas del periodo anterior', getVisitsSummary(pFrom, pTo, excludeInternal)),
+    safe('Las estadísticas de visitas del periodo de comparación', getVisitsSummary(pFrom, pTo, excludeInternal)),
     safe('El detalle de visitas', getVisitsDetail(from, to, excludeInternal)),
     safe('Los orígenes de tráfico', googleCounts(from, to, pFrom, pTo, excludeInternal)),
     Promise.all([
@@ -356,8 +398,15 @@ async function computeReport(period: ResolvedPeriod, excludeInternal: boolean): 
            FROM orders o WHERE ${ORDER_RANGE} AND ${PAID} AND COALESCE(o.promo_code, '') <> ''
           GROUP BY 1 ORDER BY orders DESC LIMIT 5`, [from, to]),
     ]),
+    Promise.all([
+      pool.query(
+        `SELECT to_char((o.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD') AS d, COALESCE(SUM(o.total), 0) AS revenue
+           FROM orders o WHERE ${ORDER_RANGE} AND ${PAID} GROUP BY 1`, [pFrom, pTo]),
+      safe('Las visitas por día del periodo de comparación', getVisitsDays(pFrom, pTo, excludeInternal)),
+    ]),
   ]);
   const [customers, products, byDay, topProducts, payments, coupons] = extra;
+  const [prevSales, prevVisitDays] = prevSeries;
 
   const data: OverviewData = {
     salesCur, salesPrev, peopleCur, peoplePrev, abandonCur, abandonPrev,
@@ -366,15 +415,25 @@ async function computeReport(period: ResolvedPeriod, excludeInternal: boolean): 
     customersTotal: n(customers.rows[0]?.n),
     products: { published: n(products.rows[0]?.pub), inStock: n(products.rows[0]?.in_stock) },
     cartsNow,
+    prevAvail,
   };
 
   const funnel: FunnelStep[] = visitsCur && visitsPrev ? [
-    { key: 'visitors', label: 'Visitantes', current: visitsCur.visitors, previous: visitsPrev.visitors },
-    { key: 'product', label: 'Ven una ficha', current: visitsCur.productViews, previous: visitsPrev.productViews },
-    { key: 'cart', label: 'Añaden al carrito', current: visitsCur.addToCart, previous: visitsPrev.addToCart },
-    { key: 'checkout', label: 'Empiezan a pagar', current: visitsCur.checkout, previous: visitsPrev.checkout },
-    { key: 'order', label: 'Pedido pagado', current: salesCur.orders, previous: salesPrev.orders },
+    { key: 'visitors', label: 'Visitantes', current: visitsCur.visitors, previous: prevAvail.visits ? visitsPrev.visitors : null },
+    { key: 'product', label: 'Ven una ficha', current: visitsCur.productViews, previous: prevAvail.visits ? visitsPrev.productViews : null },
+    { key: 'cart', label: 'Añaden al carrito', current: visitsCur.addToCart, previous: prevAvail.visits ? visitsPrev.addToCart : null },
+    { key: 'checkout', label: 'Empiezan a pagar', current: visitsCur.checkout, previous: prevAvail.visits ? visitsPrev.checkout : null },
+    { key: 'order', label: 'Pedido pagado', current: salesCur.orders, previous: prevAvail.visits && prevAvail.store ? salesPrev.orders : null },
   ] : [];
+
+  const currentDays = listDays(period.from, period.to);
+  const prevDays = listDays(period.prevFrom, period.prevTo);
+  const compareSeries: OverviewReport['compareSeries'] = {
+    revenue: alignSeries(prevDays, new Map((prevSales.rows as any[]).map((r) => [r.d, eur(r.revenue)])), currentDays.length, prevAvail.store),
+    visitors: alignSeries(prevDays, new Map((prevVisitDays || []).map((r) => [r.date, r.visitors])), currentDays.length, prevAvail.visits && !!prevVisitDays),
+    carts: alignSeries(prevDays, new Map((prevVisitDays || []).map((r) => [r.date, r.carts])), currentDays.length, prevAvail.visits && !!prevVisitDays),
+  };
+  for (const w of [partial(storeSince, 'De las ventas, los clientes y la atención de ese periodo'), partial(visitsSince, 'De las visitas')]) if (w) warnings.push(w);
 
   return {
     period,
@@ -389,6 +448,8 @@ async function computeReport(period: ResolvedPeriod, excludeInternal: boolean): 
       coupons: coupons.rows.map((r: any) => ({ code: String(r.code), orders: n(r.orders), discount: eur(r.discount) })),
     },
     visits: visitsDetail,
+    compareSeries,
+    dataSince: { store: storeSince, visits: visitsSince },
     funnel,
     carts: cartsNow,
     warnings,
