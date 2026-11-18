@@ -34,7 +34,7 @@ import { tyreOptions } from '../lib/tyres.js';
 import { submitIndexNowUrls } from '../lib/indexnow.js';
 import { requireAdminRole } from '../lib/agent-auth.js';
 import { feedPrices } from '../lib/google-feed.js';
-import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey } from '../lib/catalog-query.js';
+import { listFamilies, facets, familyTitle, compareOptionValues, familyVariants, normalizeText, type CatalogParams, type SortKey, type InterpretedInfo } from '../lib/catalog-query.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1009,13 +1009,18 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     const sort: SortKey = (['relevance', 'price_asc', 'price_desc', 'name_asc', 'newest'] as SortKey[])
       .includes(sortParam as SortKey) ? (sortParam as SortKey) : (query.search || query.q ? 'relevance' : 'relevance');
 
-    const redisKey = cacheKeyFor('cache:products:v6', query);
-    type Payload = { products: any[]; total: number; refs?: number; totalPages: number; fuzzy: boolean; corrected?: string | null };
+    const redisKey = cacheKeyFor('cache:products:v7', query);
+    type Payload = { products: any[]; total: number; refs?: number; totalPages: number; fuzzy: boolean; corrected?: string | null; interpreted?: InterpretedInfo | null };
     const cached = await cacheGet<Payload>(redisKey);
     const send = (data: Payload) => {
-      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages, X-Total-Refs, X-Search-Fuzzy, X-Search-Corrected');
+      res.setHeader('Access-Control-Expose-Headers', 'X-WP-Total, X-WP-TotalPages, X-Total-Refs, X-Search-Fuzzy, X-Search-Corrected, X-Search-Vehicle, X-Search-Relaxed, X-Search-Category');
       res.setHeader('X-Total-Refs', String(data.refs ?? data.total));
       if (data.corrected) res.setHeader('X-Search-Corrected', encodeURIComponent(data.corrected));
+      // Lo que se ha entendido de una búsqueda sin resultados: la moto («WOTTAN») y/o la categoría; con X-Search-Relaxed la pieza
+      // pedida no existe para esa moto y se enseña lo compatible con ella.
+      if (data.interpreted?.vehicle) res.setHeader('X-Search-Vehicle', encodeURIComponent(data.interpreted.vehicle));
+      if (data.interpreted?.relaxed) res.setHeader('X-Search-Relaxed', '1');
+      if (data.interpreted?.categories?.length) res.setHeader('X-Search-Category', encodeURIComponent(data.interpreted.categories[0]));
       res.setHeader('X-WP-Total', String(data.total));
       res.setHeader('X-WP-TotalPages', String(data.totalPages));
       res.setHeader('X-Search-Fuzzy', data.fuzzy ? '1' : '0');
@@ -1024,7 +1029,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
     if (cached) return send(await withLiveStock(cached));
 
     const params = parseCatalogParams(query);
-    const { rows, total, refs, fuzzy, corrected } = await listFamilies(params, sort, pageNum, perPage);
+    const { rows, total, refs, fuzzy, corrected, interpreted } = await listFamilies(params, sort, pageNum, perPage);
 
     const repIds = rows.map((r) => r.rep_id);
     const repRes = repIds.length
@@ -1055,7 +1060,7 @@ catalogRouter.get('/catalog/products', async (req, res) => {
       return cardView(mapped);
     }).filter(Boolean);
 
-    const data = { products, total, refs, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy, corrected };
+    const data = { products, total, refs, totalPages: Math.max(1, Math.ceil(total / perPage)), fuzzy, corrected, interpreted };
     await cacheSet(redisKey, data, 60);
     return send(await withLiveStock(data));
   } catch (err: any) {

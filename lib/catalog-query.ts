@@ -14,6 +14,7 @@
  *     (word_similarity de pg_trgm).
  */
 import { pool } from '../db.js';
+import { interpretSearch } from './search-interpret.js';
 
 export type SortKey = 'relevance' | 'price_asc' | 'price_desc' | 'name_asc' | 'newest';
 
@@ -29,6 +30,10 @@ export interface CatalogParams {
   universal?: boolean;
   /** Solo estas referencias (p. ej. las compatibles con una moto, para el asistente). */
   skus?: string[];
+  /** Solo lo compatible con alguna de estas motos: contenciones JSON `[{brand, model?}]` para `compatibility @>` (lib/search-interpret.ts). */
+  compat?: string[];
+  /** Por palabra de la búsqueda, categorías en las que también vale que esté aunque no figure en el nombre. */
+  categoryTerms?: Record<string, number[]>;
 }
 
 // Palabra en español → términos que aparecen en los nombres del proveedor.
@@ -184,14 +189,20 @@ export type Exclude = 'brand' | 'price' | { attr: string } | null;
 /** Umbral de similitud para la búsqueda tolerante a erratas (pg_trgm, 0-1). */
 const FUZZY_THRESHOLD = 0.4;
 
-/** Ejecuta una consulta; en modo tolerante baja el umbral de pg_trgm solo para ella. */
-async function q(text: string, values: unknown[], fuzzy = false) {
-  if (!fuzzy) return pool.query(text, values);
+/**
+ * Ejecuta una consulta; en modo tolerante baja el umbral de pg_trgm solo para ella y, con `timeoutMs`, la corta si tarda más
+ * (una consulta de compatibilidades mal planteada puede quemar CPU aunque quien la pidió ya se haya rendido).
+ */
+async function q(text: string, values: unknown[], fuzzy = false, timeoutMs?: number) {
+  if (!fuzzy && !timeoutMs) return pool.query(text, values);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(`SET LOCAL pg_trgm.word_similarity_threshold = ${FUZZY_THRESHOLD}`);
-    await client.query(`SET LOCAL pg_trgm.similarity_threshold = ${FUZZY_THRESHOLD}`);
+    if (timeoutMs) await client.query(`SET LOCAL statement_timeout = ${Math.floor(timeoutMs)}`);
+    if (fuzzy) {
+      await client.query(`SET LOCAL pg_trgm.word_similarity_threshold = ${FUZZY_THRESHOLD}`);
+      await client.query(`SET LOCAL pg_trgm.similarity_threshold = ${FUZZY_THRESHOLD}`);
+    }
     const res = await client.query(text, values);
     await client.query('COMMIT');
     return res;
@@ -234,8 +245,19 @@ export function buildConditions(params: CatalogParams, opts: { fuzzy?: boolean; 
       q.add(`AND (${ors})`, ...variants);
     } else {
       const ors = variants.map(() => `p.search_text LIKE ? ESCAPE '\\'`).join(' OR ');
-      q.add(`AND (${ors})`, ...variants.map((v) => `%${likeEscape(v)}%`));
+      const likes = variants.map((v) => `%${likeEscape(v)}%`);
+      // Una palabra que es el nombre de una categoría («frenos») vale también por la categoría del producto.
+      const cats = params.categoryTerms?.[term];
+      if (cats?.length) {
+        q.add(`AND (${ors} OR p.category_id = ANY(?) OR p.category2_id = ANY(?) OR p.category3_id = ANY(?))`, ...likes, cats, cats, cats);
+      } else {
+        q.add(`AND (${ors})`, ...likes);
+      }
     }
+  }
+
+  if (params.compat?.length) {
+    q.add(`AND (${params.compat.map(() => 'p.compatibility @> ?::jsonb').join(' OR ')})`, ...params.compat);
   }
 
   if (params.categoryId) {
@@ -382,9 +404,9 @@ export async function correctSearch(search: string): Promise<string | null> {
 export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page: number, perPage: number,
                                    opts: { exact?: boolean } = {}) {
   const params = withSizeFromSearch(rawParams);
-  const run = async (fuzzy: boolean) => {
-    const cond = await resolve(params, buildConditions(params, { fuzzy }));
-    const terms = params.search ? searchTerms(params.search) : [];
+  const run = async (fuzzy: boolean, p: CatalogParams = params, timeoutMs?: number) => {
+    const cond = await resolve(p, buildConditions(p, { fuzzy }));
+    const terms = p.search ? searchTerms(p.search) : [];
     const values: unknown[] = [...cond.values];
     const ph = (v: unknown) => { values.push(v); return `$${values.length}`; };
     // Relevancia por palabra: nombre que empieza por ella (3) > palabra dentro
@@ -402,7 +424,7 @@ export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page
       return `(${cases.length > 1 ? `GREATEST(${cases.join(', ')})` : cases[0]} + word_similarity(${ph(term)}, ${nameNorm}))`;
     });
     const scoreExpr = terms.length
-      ? `(${termScores.join(' + ')}) + word_similarity(${ph(normalizeText(params.search!))}, p.search_text)`
+      ? `(${termScores.join(' + ')}) + word_similarity(${ph(normalizeText(p.search!))}, p.search_text)`
       : '0';
     const order = ORDER[sort === 'relevance' && !terms.length ? 'relevance' : sort] || ORDER.relevance;
     const offset = (page - 1) * perPage;
@@ -433,27 +455,82 @@ export async function listFamilies(rawParams: CatalogParams, sort: SortKey, page
                 WHERE b.family_code = page.family_code
                 GROUP BY k) o) AS opts
       FROM page`;
-    return q(sqlText, values, fuzzy);
+    return q(sqlText, values, fuzzy, timeoutMs);
   };
 
   let res = await run(false);
   let fuzzy = false;
   let corrected: string | null = null;
+  let interpreted: InterpretedInfo | null = null;
   if (res.rows.length === 0 && params.search && !opts.exact) {
-    // 1) ¿Errata? Probar con la consulta corregida por el vocabulario del catálogo.
+    // 1) ¿Moto o categoría? «escape wottan s2»: la moto no está en el nombre del producto, está en sus compatibilidades.
+    const alt = await interpretedSearch(params);
+    if (alt) {
+      try {
+        res = await run(false, alt.params, INTERPRET_TIMEOUT_MS);
+        interpreted = { vehicle: alt.vehicle, relaxed: alt.relaxed, categories: alt.categories };
+      } catch { /* tiempo agotado: se sigue con la corrección de erratas */ }
+    }
+  }
+  if (res.rows.length === 0 && params.search && !opts.exact) {
+    // 2) ¿Errata? Probar con la consulta corregida por el vocabulario del catálogo.
     corrected = await correctSearch(params.search);
     if (corrected) {
       const retry = await listFamilies({ ...rawParams, search: corrected }, sort, page, perPage);
       if (retry.total > 0) return { ...retry, corrected };
     }
-    // 2) Búsqueda tolerante por similitud.
+    // 3) Búsqueda tolerante por similitud.
     res = await run(true);
     fuzzy = true;
   }
   const total = res.rows[0]?.total || 0;
   // Referencias (cada talla/color) además de modelos (tarjetas).
   const refs = res.rows[0]?.refs || 0;
-  return { rows: res.rows as (FamilyRow & { total: number })[], total, refs, fuzzy, corrected: null as string | null };
+  return { rows: res.rows as (FamilyRow & { total: number })[], total, refs, fuzzy, corrected: null as string | null, interpreted };
+}
+
+/** Qué se ha entendido de una búsqueda sin resultados (para decírselo al cliente). */
+export interface InterpretedInfo {
+  /** Moto reconocida («WOTTAN», «MITT 125 RT»). */
+  vehicle: string | null;
+  /** true: esa pieza no existe para la moto y se enseña lo compatible con ella. */
+  relaxed: boolean;
+  /** Categorías cuyo nombre coincide con alguna palabra. */
+  categories: string[];
+}
+
+/** Tope de la consulta interpretada (las de compatibilidades mal planteadas queman CPU: ver AGENTS.md). */
+const INTERPRET_TIMEOUT_MS = 8000;
+
+/**
+ * Búsqueda reinterpretada cuando la normal no da nada: primero «piezas + moto/categoría»; si la moto se reconoce pero esa
+ * pieza no existe para ella, lo compatible con la moto. Devuelve los parámetros efectivos (con resultados) o null.
+ */
+export async function interpretedSearch(params: CatalogParams): Promise<(InterpretedInfo & { params: CatalogParams }) | null> {
+  if (!params.search) return null;
+  const interp = await interpretSearch(searchTerms(params.search));
+  if (!interp) return null;
+  const label = interp.vehicle?.label ?? null;
+  const attempts: (InterpretedInfo & { params: CatalogParams })[] = [{
+    params: {
+      ...params,
+      search: interp.restTerms.join(' ') || undefined,
+      compat: interp.vehicle?.compat,
+      categoryTerms: interp.categoryTerms,
+    },
+    vehicle: label, relaxed: false, categories: interp.categoryNames,
+  }];
+  if (interp.vehicle && interp.restTerms.length) {
+    attempts.push({ params: { ...params, search: undefined, compat: interp.vehicle.compat }, vehicle: label, relaxed: true, categories: [] });
+  }
+  for (const a of attempts) {
+    try {
+      const c = await resolve(a.params, buildConditions(a.params));
+      const r = await q(`SELECT 1 FROM products p WHERE ${c.text} LIMIT 1`, c.values, false, INTERPRET_TIMEOUT_MS);
+      if (r.rows.length) return a;
+    } catch { /* tiempo agotado: se prueba lo siguiente */ }
+  }
+  return null;
 }
 
 /** Facetas: marcas, rango de precio y atributos, con recuento por modelo. */
@@ -464,12 +541,17 @@ export async function facets(rawParams: CatalogParams) {
     const r = await q(`SELECT 1 FROM products p WHERE ${c.text} LIMIT 1`, c.values);
     return r.rows.length > 0;
   };
-  // Mismo criterio que listFamilies: exacta → corregida → tolerante.
+  // Mismo criterio que listFamilies: exacta → moto/categoría → corregida → tolerante.
   let fuzzy = false;
   if (params.search && !(await hasExact(params))) {
-    const corrected = await correctSearch(params.search);
-    if (corrected && (await hasExact({ ...params, search: corrected }))) params = { ...params, search: corrected };
-    else fuzzy = true;
+    const alt = await interpretedSearch(params);
+    if (alt) {
+      params = alt.params;
+    } else {
+      const corrected = await correctSearch(params.search);
+      if (corrected && (await hasExact({ ...params, search: corrected }))) params = { ...params, search: corrected };
+      else fuzzy = true;
+    }
   }
 
   const brandsQ = await resolve(params, buildConditions(params, { fuzzy, exclude: 'brand' }));
