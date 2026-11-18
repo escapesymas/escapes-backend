@@ -1,8 +1,11 @@
 import { Router } from 'express';
 import { requireAdminRole } from '../lib/agent-auth.js';
-import { getRealtimeData, getAnalyticsStats, getSessionDetail } from '../lib/umami-db.js';
+import { pool } from '../db.js';
+import { getRealtimeData, getAnalyticsStats, getSessionDetail, getVisitorInsights, findSessionForCart, type StatsRange } from '../lib/umami-db.js';
 
 export const analyticsRouter = Router();
+
+const VALID_RANGES: StatsRange[] = ['today', '24h', '7d', '30d', 'all'];
 
 /**
  * GET /api/admin/analytics/realtime
@@ -57,14 +60,67 @@ analyticsRouter.get('/admin/analytics/stats', async (req: any, res: any) => {
     const range = (req.query.range as any) || 'today';
     const excludeInternal = req.query.excludeInternal !== 'false';
 
-    const validRanges = ['today', '24h', '7d', '30d', 'all'];
-    const safeRange = validRanges.includes(range) ? range : 'today';
+    const safeRange: StatsRange = VALID_RANGES.includes(range) ? range : 'today';
 
     const stats = await getAnalyticsStats(safeRange, excludeInternal);
     res.json(stats);
   } catch (err: any) {
     console.error('[ANALYTICS STATS ERROR]:', err);
     res.status(500).json({ error: err.message || 'Error consultando analítica web' });
+  }
+});
+
+/**
+ * GET /api/admin/analytics/visitors
+ * Visitantes del periodo por prioridad (carrito, pago, chat y después los de más páginas o visitas), embudo de
+ * conversión, eventos, búsquedas y motos más elegidas. Con caché en memoria de 30 s.
+ */
+analyticsRouter.get('/admin/analytics/visitors', async (req: any, res: any) => {
+  const admin = await requireAdminRole(req, res);
+  if (!admin) return;
+
+  try {
+    const range = (req.query.range as any) || 'today';
+    const excludeInternal = req.query.excludeInternal !== 'false';
+    const safeRange: StatsRange = VALID_RANGES.includes(range) ? range : 'today';
+    res.json(await getVisitorInsights(safeRange, excludeInternal));
+  } catch (err: any) {
+    console.error('[ANALYTICS VISITORS ERROR]:', err);
+    res.status(500).json({ error: err.message || 'Error consultando los visitantes' });
+  }
+});
+
+/**
+ * GET /api/admin/analytics/cart-session?cartId=964
+ * Busca la visita de Umami que creó un carrito, cruzando los productos del carrito con los «añadir al carrito» de las
+ * visitas (el carrito y Umami no comparten identificador). Devuelve `match: null` si no aparece (p. ej. el visitante
+ * lleva un bloqueador de anuncios y Umami no lo vio).
+ */
+analyticsRouter.get('/admin/analytics/cart-session', async (req: any, res: any) => {
+  const admin = await requireAdminRole(req, res);
+  if (!admin) return;
+
+  const cartId = parseInt(String(req.query.cartId), 10);
+  if (!Number.isInteger(cartId) || cartId <= 0) {
+    return res.status(400).json({ error: 'cartId no válido' });
+  }
+
+  try {
+    // La hora del carrito se guarda en UTC (zona del servidor); se pasa a ISO con «Z» para compararla con Umami.
+    const cart = await pool.query(
+      `SELECT items, to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_iso FROM carts WHERE id = $1`,
+      [cartId]);
+    if (!cart.rows.length) return res.status(404).json({ error: 'Carrito no encontrado' });
+
+    let items: any[] = [];
+    try { items = JSON.parse(cart.rows[0].items || '[]'); } catch { /* carrito con JSON dañado: sin productos */ }
+    const productIds = (Array.isArray(items) ? items : []).map((i) => Number(i?.id ?? i?.product_id)).filter((n) => n > 0);
+
+    const match = await findSessionForCart(productIds, cart.rows[0].updated_iso);
+    res.json({ cartId, match });
+  } catch (err: any) {
+    console.error('[ANALYTICS CART SESSION ERROR]:', err);
+    res.status(500).json({ error: err.message || 'Error buscando la visita del carrito' });
   }
 });
 
