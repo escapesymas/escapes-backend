@@ -4,7 +4,7 @@
  * cliente en el carrito), para que nunca enseñen importes distintos.
  */
 import { pool } from '../db.js';
-import { refreshLiveBihrStock } from './bihr-live-stock.js';
+import { refreshLiveStock } from './live-stock.js';
 import { resolveTax, toDestinationCents, taxInTotal } from './tax.js';
 import { floorPrice } from './pricing.js';
 
@@ -99,9 +99,9 @@ export async function quoteOrder(input: QuoteInput, opts: { redeemCoupon?: boole
   const postcode = String(input.postcode || '').replace(/\s+/g, '');
 
   const ids = input.cart.map((l) => l.id);
-  // Stock de Bihr de este momento (se guarda en la base de datos al consultarlo, así que la lectura de abajo ya lo trae):
-  // un pedido no puede aceptar lo que Bihr ya no tiene. Si Bihr no contesta, vale el stock guardado.
-  if (ids.length) await refreshLiveBihrStock(ids, { ttlSec: 60 });
+  // Stock de Bihr y de Andreani de este momento (se guarda en la base de datos al consultarlo, así que la lectura de abajo ya
+  // lo trae): un pedido no puede aceptar lo que el proveedor ya no tiene. Si no contesta, vale el stock guardado.
+  if (ids.length) await refreshLiveStock(ids, { ttlSec: 60 });
   const rows = ids.length
     ? (await pool.query('SELECT id, price, sale_price, promo_price, stock, cost FROM products WHERE id = ANY($1)', [ids])).rows
     : [];

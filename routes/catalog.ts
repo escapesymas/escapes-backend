@@ -10,6 +10,7 @@ import { processImage, detectImageType, ImageRejected, IMAGE_MIME } from '../lib
 import { cacheSet, cacheGet } from '../lib/cache.js';
 import { sanitizeLike, sanitizeString } from '../utils.js';
 import { refreshLiveBihrStock } from '../lib/bihr-live-stock.js';
+import { refreshLiveStock, liveStockView } from '../lib/live-stock.js';
 import { getCatalogData, compatibleSkus } from '../lib/moto-catalog.js';
 import {
   resolveBrandSlug,
@@ -1478,68 +1479,12 @@ catalogRouter.post('/catalog/product/:id/refresh-stock', refreshStockLimiter, as
     const product = result.rows[0] as any;
     const currentStock = typeof product.stock === 'string' ? parseInt(product.stock, 10) : (product.stock || 0);
 
-    const sku = String(product.sku || '');
-
-    // Productos de Bihr (todos los que no son de Andreani, sean o no dropshipping): stock en vivo por su referencia de
-    // Bihr (lib/bihr-live-stock.ts). Si Bihr no contesta, se devuelve el guardado.
-    if (!sku.startsWith('AND-')) {
-      const live = (await refreshLiveBihrStock([product.id], { ttlSec: 120 })).get(product.id);
-      const stock = live ? live.stock : currentStock;
-      const restockDate = live ? live.restockDate : restockDateOf(product.restock_date);
-      return res.json({ stock, inStock: stock > 0, restockDate, restocking: stock <= 0 && !!restockDate });
-    }
-
-    // Si no es dropshipping ni ondemand, retornamos el stock actual de inmediato
-    if (!product.dropshipping && !product.ondemand) {
-      return res.json({ stock: currentStock, inStock: currentStock > 0 });
-    }
-
-    const supplierCode = String(product.supplier_code || product.sku || '');
-    if (!supplierCode) {
-      return res.json({ stock: currentStock, inStock: currentStock > 0 });
-    }
-
-    // Si es producto de Andreani (SKU AND-*), consultar API de Andreani / ApproSearch (o mantener stock sincronizado)
-    if (sku.startsWith('AND-')) {
-      const quinceMinutos = 15 * 60 * 1000;
-      const necesitaActualizacion = !product.updated_at || (Date.now() - new Date(product.updated_at).getTime() > quinceMinutos);
-      if (!necesitaActualizacion) {
-        return res.json({ stock: currentStock, inStock: currentStock > 0 });
-      }
-
-      // La clave de ApproSearch va en APPROSEARCH_API_KEY, nunca en el código (el repositorio es público). Sin ella no se
-      // consulta a Andreani y se sirve el stock guardado.
-      const approKey = process.env.APPROSEARCH_API_KEY;
-      if (!approKey) {
-        console.warn('[ANDREANI LIVE STOCK REFRESH] Falta APPROSEARCH_API_KEY: se sirve el stock guardado');
-        return res.json({ stock: currentStock, inStock: currentStock > 0 });
-      }
-
-      try {
-        const cleanRef = (product.supplier_code || sku.replace(/^AND-/, '')).trim().toUpperCase();
-        const apiUrl = `https://api.approsearch.com/api/v1/search?api_key=${encodeURIComponent(approKey)}&q=${encodeURIComponent(cleanRef)}&limit=5`;
-        const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(4000) });
-        if (resp.ok) {
-          const data = (await resp.json()) as any;
-          const prods = data?.data?.products || [];
-          const match = prods.find((p: any) => String(p?.reference || '').trim().toUpperCase() === cleanRef);
-          if (match && match.stock !== undefined) {
-            const safeStock = Math.max(0, parseInt(match.stock, 10) || 0);
-            const inStock = safeStock > 0;
-            await db.execute(sql`
-              UPDATE products 
-              SET stock = ${safeStock}, updated_at = NOW() 
-              WHERE id = ${product.id}
-            `);
-            console.log(`[ANDREANI LIVE STOCK REFRESH] Updated stock for ${product.sku} to ${safeStock} (inStock: ${inStock})`);
-            return res.json({ stock: safeStock, inStock });
-          }
-        }
-      } catch (e: any) {
-        console.warn(`[ANDREANI LIVE STOCK REFRESH WARN] Error consultando stock para ${product.sku}:`, e.message);
-      }
-      return res.json({ stock: currentStock, inStock: currentStock > 0 });
-    }
+    // Stock en vivo del proveedor (Bihr por su referencia, Andreani por la suya; lib/live-stock.ts). Si no contesta, se devuelve
+    // el guardado. Los de Andreani ya no dependen de los marcadores dropshipping/ondemand.
+    const live = (await refreshLiveStock([product.id], { ttlSec: 120 })).get(product.id);
+    const stock = live ? live.stock : currentStock;
+    const restockDate = live ? live.restockDate : restockDateOf(product.restock_date);
+    return res.json({ stock, inStock: stock > 0, restockDate, restocking: stock <= 0 && !!restockDate });
   } catch (err: any) {
     console.error('[LIVE STOCK REFRESH ERROR]:', err);
     // En caso de error de la API (ej: 429), devolvemos el stock cacheado para no romper la UI
@@ -1626,6 +1571,36 @@ catalogRouter.get('/catalog/product-compatibility/:id', async (req, res) => {
   }
 });
 
+// POST /api/catalog/live-stock  { ids: number[] }
+// Stock en vivo de las tarjetas que el cliente tiene a la vista (búsqueda, filtro por moto, marcas...): la tienda lo pide
+// por lotes al ver cada tarjeta, para que nadie entre a una ficha pensando que hay algo que ya no hay. Llama a las APIs de
+// Bihr y de Andreani (con su caché y sus topes), así que lleva su propio límite por IP.
+const liveStockLimiter = rateLimit({
+  keyGenerator: (req: any) => ipKeyGenerator(req.clientIp || req.ip || 'unknown'),
+  windowMs: 60 * 1000,
+  max: 90,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas consultas de stock. Inténtalo en un minuto.' },
+});
+
+catalogRouter.post('/catalog/live-stock', liveStockLimiter, async (req, res) => {
+  try {
+    const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = [...new Set<number>(raw.map((n: any) => Number(n)).filter((n: number) => Number.isInteger(n) && n > 0))].slice(0, 48);
+    res.setHeader('Cache-Control', 'no-store');
+    if (!ids.length) return res.json({ live: {} });
+    const live = await refreshLiveStock(ids, { ttlSec: 600 });
+    const out: Record<string, ReturnType<typeof liveStockView>> = {};
+    for (const [id, lv] of live) out[String(id)] = liveStockView(lv);
+    return res.json({ live: out });
+  } catch (err: any) {
+    console.error('[LIVE STOCK ROUTE ERROR]:', err);
+    // El stock guardado vale: la tarjeta se queda como está.
+    return res.json({ live: {} });
+  }
+});
+
 // GET /api/catalog/stock-check
 catalogRouter.get('/catalog/stock-check', async (req, res) => {
   try {
@@ -1634,9 +1609,9 @@ catalogRouter.get('/catalog/stock-check', async (req, res) => {
     const idsList = ids.split(',').map((id: string) => parseInt(id, 10)).filter((id: number) => !isNaN(id) && id > 0);
     if (idsList.length === 0) return res.json({ checks: [] });
 
-    // Stock de Bihr de este momento: el carrito no puede dar por bueno lo que Bihr ya no tiene. Se guarda en la base de
-    // datos al consultarlo, así que la lectura de abajo ya lo trae.
-    await refreshLiveBihrStock(idsList, { ttlSec: 120 });
+    // Stock de Bihr y de Andreani de este momento: el carrito no puede dar por bueno lo que el proveedor ya no tiene. Se
+    // guarda en la base de datos al consultarlo, así que la lectura de abajo ya lo trae.
+    await refreshLiveStock(idsList, { ttlSec: 120 });
 
     const result = await db.execute(sql`
       SELECT id, sku, name, stock
