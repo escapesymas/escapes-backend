@@ -1590,7 +1590,8 @@ catalogRouter.post('/catalog/live-stock', liveStockLimiter, async (req, res) => 
     const ids = [...new Set<number>(raw.map((n: any) => Number(n)).filter((n: number) => Number.isInteger(n) && n > 0))].slice(0, 48);
     res.setHeader('Cache-Control', 'no-store');
     if (!ids.length) return res.json({ live: {} });
-    const live = await refreshLiveStock(ids, { ttlSec: 600 });
+    // No bloquea ninguna página: puede esperar su turno de Bihr (1 llamada por segundo para todos) en vez de quedarse sin dato.
+    const live = await refreshLiveStock(ids, { ttlSec: 600, waitGateMs: 1800 });
     const out: Record<string, ReturnType<typeof liveStockView>> = {};
     for (const [id, lv] of live) out[String(id)] = liveStockView(lv);
     return res.json({ live: out });

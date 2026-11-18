@@ -106,6 +106,18 @@ describe('refreshLiveBihrStock', () => {
     expect(out.size).toBe(0);
   });
 
+  it('si se le pide, espera su turno en vez de quedarse sin dato', async () => {
+    db.query.mockResolvedValue({ rows });
+    store.set('bihr:stk:gate', '1');
+    setTimeout(() => store.delete('bihr:stk:gate'), 250);
+    bihrReplies([{ partNumber: '1078960', value: 0 }, { partNumber: '1012827', value: 2 }]);
+
+    const out = await refreshLiveBihrStock([10, 11], { waitGateMs: 1500 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(out.get(10)).toEqual({ stock: 0, restockDate: null });
+  });
+
   it('respeta el presupuesto diario', async () => {
     db.query.mockResolvedValue({ rows });
     store.set(`bihr:stk:calls:${new Date().toISOString().slice(0, 10)}`, '999999');

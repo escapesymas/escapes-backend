@@ -39,6 +39,11 @@ const BUDGET_KEY = 'bihr:stk:calls:';
 export interface LiveStockOptions {
   /** Cuánto vale un dato en caché (segundos). Para el pedido, menos que para los listados. */
   ttlSec?: number;
+  /**
+   * Cuánto esperar el turno si otra petición acaba de llamar a Bihr (límite de 1 llamada por segundo). Por defecto 0: se
+   * usa lo guardado y la página no se retrasa. Quien no bloquea ninguna página (las tarjetas a la vista) puede esperar.
+   */
+  waitGateMs?: number;
 }
 
 export interface LiveStock {
@@ -94,8 +99,12 @@ export async function refreshLiveBihrStock(ids: number[], opts: LiveStockOptions
       if (!stale.length) return;
 
       if (await redis.get(BREAKER_KEY)) return;
-      // Una llamada por segundo: si otra petición acaba de preguntar, esta usa lo que haya.
-      if (!(await redis.set(GATE_KEY, '1', { NX: true, PX: 1100 }))) return;
+      // Una llamada por segundo: si otra petición acaba de preguntar, esta espera su turno (hasta waitGateMs) o usa lo que haya.
+      const turnFrom = Date.now();
+      while (!(await redis.set(GATE_KEY, '1', { NX: true, PX: 1100 }))) {
+        if (Date.now() - turnFrom >= (opts.waitGateMs ?? 0)) return;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
       const budgetKey = BUDGET_KEY + new Date().toISOString().slice(0, 10);
       const used = Number(await redis.incr(budgetKey));
       if (used === 1) await redis.expire(budgetKey, 3 * 86400);

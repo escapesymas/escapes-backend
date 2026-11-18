@@ -13,6 +13,8 @@ export type { LiveStock };
 export interface LiveStockOptions {
   /** Cuánto vale un dato en caché (segundos). Para el pedido, menos que para los listados. */
   ttlSec?: number;
+  /** Cuánto esperar el turno de Bihr si otra petición acaba de llamarle (ms). Por defecto 0. */
+  waitGateMs?: number;
 }
 
 export async function refreshLiveStock(ids: number[], opts: LiveStockOptions = {}): Promise<Map<number, LiveStock>> {
