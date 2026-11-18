@@ -6,7 +6,8 @@
  *    el endpoint B2B de compra rápida (/module/megaquickorder/actions).
  * 2. Gestión y almacenamiento seguro de la sesión (cookie PrestaShop + Cloudflare)
  *    en la tabla app_settings de la base de datos (clave 'andreani_session').
- * 3. Alertas automáticas:
+ * 3. Alertas de caducidad de la cookie (APAGADAS por defecto desde el 18/11/2026: la tienda ya no usa esa cookie, el stock de
+ *    Andreani va por ApproSearch, lib/andreani-live-stock.ts; se encienden con ANDREANI_COOKIE_REMINDERS=true):
  *    - Notificación Web Push a administradores cuando falten < 24h para que la cookie expire.
  *    - Correo electrónico a info@escapesymas.com con plantilla interna oficial.
  *    - Control de frecuencia (máximo 1 aviso cada 12h) para no saturar.
@@ -284,10 +285,16 @@ export async function checkAndNotifyCookieExpiry(force = false): Promise<{
 let cronHandle: NodeJS.Timeout | null = null;
 
 /**
- * Arranca el cron en segundo plano que revisa la expiración cada 30 minutos.
+ * Arranca el cron en segundo plano que revisa la expiración cada 30 minutos. Apagado por defecto: lo único que usaba la
+ * cookie del portal B2B era /api/andreani/stock/:ref, que la tienda no llama, y los avisos de renovación (push y correo cada
+ * 12 h) solo molestaban. Con ANDREANI_COOKIE_REMINDERS=true vuelve a avisar.
  */
 export function startAndreaniStockCron(): void {
   if (cronHandle) return;
+  if (process.env.ANDREANI_COOKIE_REMINDERS !== 'true') {
+    console.log('[ANDREANI CRON] Avisos de caducidad de la cookie apagados (ANDREANI_COOKIE_REMINDERS no es true)');
+    return;
+  }
 
   // Comprobación inicial a los 10 segundos de arrancar
   setTimeout(() => {
