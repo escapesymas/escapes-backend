@@ -2,6 +2,8 @@ import { pool } from '../db.js';
 import { listFamilies, normalizeText, searchTerms } from '../lib/catalog-query.js';
 import { getCatalogData, compatibleSkus } from '../lib/moto-catalog.js';
 import { formatOrderNumber, eur } from '../lib/email-templates.js';
+import { refreshLiveStock } from '../lib/live-stock.js';
+import { messageKind, situationNote, isPolicyQuestion, POLICY_NOTE, type MessageKind } from './intent.js';
 
 export interface CatalogHit {
   id: number;
@@ -19,6 +21,8 @@ export interface CatalogHit {
   category3: string | null;
   /** Posición del atributo «Posición» de la ficha (Delantero, Trasero…), si la tiene. */
   position: string | null;
+  /** Sin stock pero con fecha prevista de reaprovisionamiento (AAAA-MM-DD). */
+  restockDate?: string | null;
 }
 
 export interface CatalogContextResult {
@@ -26,6 +30,8 @@ export interface CatalogContextResult {
   text: string;
   /** No tenemos lo que pide (o no para su moto): se le ofrece hablar con un asesor. */
   noMatch?: boolean;
+  /** Tipo de mensaje (queja, gracias, saludo…): solo las consultas «other» buscan en el catálogo. */
+  kind?: MessageKind | 'policy';
 }
 
 interface GarageMotorcycle {
@@ -64,6 +70,7 @@ function mapHit(row: any): CatalogHit {
     category2: row.category2,
     category3: row.category3,
     position: row.position || null,
+    restockDate: row.restock_date || null,
   };
 }
 
@@ -72,7 +79,8 @@ function formatHitText(p: CatalogHit, tag = '', n = 0, askedPosition = false): s
   const priceStr = p.sale_price
     ? `${(p.sale_price / 100).toFixed(2)}€ (antes ${(p.price / 100).toFixed(2)}€)`
     : `${(p.price / 100).toFixed(2)}€`;
-  const stockStr = (p.stock || 0) > 0 ? `stock: ${p.stock}` : 'sin stock';
+  const stockStr = (p.stock || 0) > 0 ? `stock: ${p.stock}`
+    : p.restockDate ? `sin stock ahora, en reaprovisionamiento (previsto ${p.restockDate})` : 'sin stock';
   // Si el cliente pide una posición, se dice también cuándo la ficha no la indica (si no, el asistente la suponía).
   const pos = p.position ? ` | posición: ${p.position}` : askedPosition ? ' | posición: NO INDICADA' : '';
   return `- ${n ? `P${n} ` : ''}${tag ? `${tag} ` : ''}${p.brand || 'Genérico'} | "${p.name}" | ${priceStr} | ${stockStr}${pos}`;
@@ -241,6 +249,10 @@ const CHAT_FILLER = new Set([
   'este', 'esta', 'ese', 'esa', 'como', 'donde', 'pues', 'ok', 'tambien', 'o',
   'baratos', 'baratas', 'caro', 'cara', 'caros', 'caras', 'mas', 'menos', 'otro', 'otra', 'otros', 'otras',
   'ver', 'ensena', 'ensename', 'muestrame', 'dime', 'opciones', 'modelos', 'hay', 'diferencia', 'entre',
+  // «qué aceite LLEVA una SH 125»: el verbo no es parte del producto.
+  'lleva', 'llevan', 'llevar', 'usa', 'usan', 'usar', 'monta', 'montan', 'necesita', 'necesitan', 'recomendado', 'recomendada',
+  'recomendados', 'recomendadas', 'utiliza', 'utilizan', 'sirva', 'valga', 'encaja', 'encajan', 'queda', 'quedan', 'esto', 'eso',
+  'os', 'voy', 'vais', 'tienda', 'ahora', 'mismo', 'ya', 'solo', 'sola', 'ademas',
 ]);
 
 // Palabras de pedidos, envíos y cuenta: si el mensaje solo trae estas, no se
@@ -280,7 +292,8 @@ async function searchLikeWeb(search: string, perPage = 12, skus?: string[]): Pro
     const ids = res.rows.map((r) => r.rep_id);
     const { rows } = await pool.query(
       `SELECT id, sku, name, brand, price, sale_price, promo_price, stock, stock_status,
-              images, compatibility, category2, category3, attributes->>'Posición' AS position
+              images, compatibility, category2, category3, attributes->>'Posición' AS position,
+              restock_date::text AS restock_date
        FROM products WHERE id = ANY($1::int[])`,
       [ids]
     );
@@ -578,6 +591,45 @@ export function conversationProduct(userMessages: string[]): { search: string; p
   return { search: '', positions: lastPositions };
 }
 
+// Palabras de marca que no identifican un producto concreto (también son palabras corrientes).
+const GENERIC_BRAND_WORDS = new Set(['moto', 'motos', 'racing', 'sport', 'sports', 'super', 'kit', 'original', 'universal', 'parts', 'group',
+  'motor', 'motors', 'accessories', 'team', 'factory', 'performance', 'power', 'premium', 'brake', 'brakes', 'disc', 'plus', 'line',
+  'tech', 'race', 'speed', 'gear', 'light', 'lights', 'oil', 'filter', 'filters', 'bike', 'bikes', 'rider', 'riders', 'protection']);
+
+let brandWordCache: { at: number; words: Set<string> } | null = null;
+
+/** Palabras de las marcas de producto del catálogo («tecnigas», «tecnium», «malossi»): si el cliente nombra una, pregunta por algo concreto. */
+async function productBrandWords(): Promise<Set<string>> {
+  if (brandWordCache && Date.now() - brandWordCache.at < 3600_000) return brandWordCache.words;
+  try {
+    const { rows } = await pool.query(`SELECT DISTINCT lower(brand) AS b FROM products WHERE status = 'published' AND coalesce(brand, '') <> ''`);
+    const words = new Set<string>();
+    for (const r of rows) {
+      for (const w of normalizeText(String(r.b)).split(/[^a-z0-9]+/)) if (w.length >= 4 && !GENERIC_BRAND_WORDS.has(w)) words.add(w);
+    }
+    brandWordCache = { at: Date.now(), words };
+    return words;
+  } catch {
+    return new Set();
+  }
+}
+
+/** Stock de este momento de lo que se va a enseñar (Bihr y Andreani): el asistente no debe dar por bueno lo que el proveedor ya no tiene. */
+async function withLiveStock(hits: CatalogHit[]): Promise<void> {
+  if (!hits.length) return;
+  try {
+    const live = await refreshLiveStock(hits.map((h) => h.id), { ttlSec: 120, waitGateMs: 800 });
+    for (const h of hits) {
+      const lv = live.get(h.id);
+      if (!lv) continue;
+      h.stock = lv.stock;
+      h.restockDate = lv.stock > 0 ? null : lv.restockDate;
+    }
+  } catch (err) {
+    console.warn('[chatbot] stock en vivo no disponible:', (err as Error)?.message);
+  }
+}
+
 /**
  * Búsqueda del asistente. Con moto, las piezas salen de su compatibilidad (la misma que usa el selector de la
  * web: lib/moto-catalog.ts) y el texto solo dice qué pieza es; así no depende de cómo escriba el cliente la moto.
@@ -586,9 +638,17 @@ export async function getCatalogContext(
   userMessages: string[],
   garageEntries: string[] = []
 ): Promise<CatalogContextResult> {
+  // Una queja, un «gracias» o un saludo no son una búsqueda: no se consulta el catálogo.
+  const kind = messageKind(userMessages[userMessages.length - 1] || '');
+  if (kind !== 'other') return { hits: [], text: situationNote(kind), kind };
+
   const product = conversationProduct(userMessages);
   const positions = product.positions;
-  if (!product.search) return { hits: [], text: await catalogSummary() };
+  if (!product.search) {
+    return isPolicyQuestion(userMessages[userMessages.length - 1] || '')
+      ? { hits: [], text: POLICY_NOTE, kind: 'policy' }
+      : { hits: [], text: await catalogSummary(), kind };
+  }
   const moto = conversationMoto(userMessages, garageEntries);
   const notes: string[] = [];
   let found: { hit: CatalogHit; tag: string }[] = [];
@@ -596,6 +656,7 @@ export async function getCatalogContext(
   let noMatch = false;
   const ADVISOR = ' Ofrécele que un asesor lo revise (según ATENCIÓN HUMANA).';
   const keepPosition = (hits: CatalogHit[]) => hits.filter((h) => !contradictsPosition(h.position, positions));
+  const isDependent = (h: CatalogHit) => Array.isArray(h.compatibility) && h.compatibility.length > 0;
 
   if (moto) {
     const name = `${moto.brand} ${moto.model}`.toUpperCase();
@@ -606,15 +667,19 @@ export async function getCatalogContext(
       const years = compatibleYears(hit, moto);
       return years?.length ? `[COMPATIBLE CON ${name} DE ${yearRanges(years)}]` : `[COMPATIBLE CON ${name}]`;
     };
+    // Lo que pide existe pero no figura como compatible con su moto (antes se relajaba la búsqueda sin decirlo y el
+    // asistente acababa diciendo que no existía: «el TECNIGAS E-Box 2 no figura», cuando sí lo tenemos).
+    let existsButIncompatible: CatalogHit[] = [];
     if (skus.length) {
       let hits = keepPosition(await searchLikeWeb(product.search, 24, skus));
-      // ¿Pide algo concreto que no hay para su moto («pastillas brembo»)? Sin la palabra más rara, lo que haya.
       if (!hits.length) {
+        existsButIncompatible = keepPosition(await searchLikeWeb(product.search, 6)).filter(isDependent).slice(0, 2);
+        // ¿Pide algo concreto que no hay para su moto («pastillas brembo»)? Sin la palabra más rara, lo que haya.
         const terms = searchTerms(product.search);
         const rare = await rarestTerm(terms);
         if (rare && terms.length >= 2) {
           hits = keepPosition(await searchLikeWeb(terms.filter((w) => w !== rare).join(' '), 24, skus));
-          if (hits.length) missing = rare;
+          if (hits.length && !existsButIncompatible.length) missing = rare;
         }
       }
       found = hits.map((hit) => ({ hit, tag: tagFor(hit) }));
@@ -622,20 +687,29 @@ export async function getCatalogContext(
     if (!found.length) {
       // Nada compatible: solo se ofrece lo universal (sin compatibilidades: cascos, aceites…).
       const general = keepPosition(await searchLikeWeb(product.search, 12));
-      const universal = general.filter((h) => !Array.isArray(h.compatibility) || h.compatibility.length === 0);
+      const universal = general.filter((h) => !isDependent(h));
       found = universal.map((hit) => ({ hit, tag: '[UNIVERSAL: NO DEPENDE DE LA MOTO]' }));
       if (!skus.length) {
         noMatch = true;
         notes.push(`NO HAY NINGUNA PIEZA CON COMPATIBILIDAD REGISTRADA PARA SU ${fullName}. Si busca una pieza que depende de la moto, ` +
           `dile que no tenemos datos de compatibilidad para su moto. No digas nunca que algo es compatible.${ADVISOR}`);
       } else if (general.length > universal.length) {
-        noMatch = true;
-        notes.push(`Tenemos «${product.search}», pero NINGUNO figura como compatible con su ${fullName}: dile que ahora mismo no lo tenemos para su moto ` +
-          `(no ofrezcas piezas de otras motos)${moto.year ? '' : ' y pregúntale el año'}.${ADVISOR}`);
+        if (universal.length) {
+          // Aceites, cascos…: no dependen de la moto, así que sí se pueden ofrecer (antes se decía que no había nada para su moto).
+          notes.push(`Para su ${fullName} no tenemos «${product.search}» específico, pero los de abajo son universales (no dependen de la moto): ` +
+            `puedes ofrecerlos, recordándole que confirme la especificación que necesita su moto (viscosidad, medida…) en el manual.`);
+        } else {
+          noMatch = true;
+          notes.push(`Tenemos «${product.search}», pero NINGUNO figura como compatible con su ${fullName}: dile que ahora mismo no lo tenemos para su moto ` +
+            `(no ofrezcas piezas de otras motos)${moto.year ? '' : ' y pregúntale el año'}.${ADVISOR}`);
+        }
       } else if (!universal.length) {
         noMatch = true;
         notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos.${ADVISOR}`);
       }
+    } else if (existsButIncompatible.length) {
+      notes.push(`Lo que pregunta SÍ lo tenemos («${existsButIncompatible.map((h) => h.name).join('», «')}»), pero NO figura como compatible con su ${fullName}: ` +
+        `díselo claramente (no digas que no lo tenemos ni que no existe) y ofrécele estas alternativas que sí son compatibles.${ADVISOR}`);
     }
     // Si antes habló de otra moto, la respuesta es solo para esta (sin la lista de la otra decía que «no había»).
     notes.unshift(`MOTO DE ESTA RESPUESTA: ${fullName}. Los productos de abajo son solo para ella: responde solo sobre esta moto y no digas nada ` +
@@ -649,14 +723,26 @@ export async function getCatalogContext(
     }
   } else {
     // Sin moto solo se enseña lo que no depende de ella (cascos, ropa, aceites…): una pastilla o un kit de otra
-    // moto no le sirve, hay que preguntarle cuál tiene.
+    // moto no le sirve, hay que preguntarle cuál tiene. Salvo que nombre un producto concreto («escape Tecnigas E-Box 2»,
+    // «regulador Tecnium»): entonces se le da su precio y stock y se le pide la moto solo para confirmar que le vale.
     const general = keepPosition(await searchLikeWeb(product.search, 12));
-    const universal = general.filter((h) => !Array.isArray(h.compatibility) || h.compatibility.length === 0);
-    found = universal.map((hit) => ({ hit, tag: '' }));
-    if (general.length > universal.length) {
-      notes.push(`Tenemos «${product.search}» para muchas motos, pero NO SABEMOS LA SUYA: pregúntale marca, modelo y año (o que la guarde en ` +
-        `Mi garaje) antes de recomendar nada; no elijas productos para tarjetas hasta saberla${universal.length ? ', salvo los universales de abajo' : ''}.`);
-    } else if (!general.length) {
+    const universal = general.filter((h) => !isDependent(h));
+    const brands = await productBrandWords();
+    const named = searchTerms(product.search).some((t) => brands.has(t));
+    if (named && general.length) {
+      found = general.map((hit) => ({ hit, tag: isDependent(hit) ? '[DEPENDE DE LA MOTO: compatibilidad sin confirmar]' : '' }));
+      if (general.some(isDependent)) {
+        notes.push(`Pregunta por un producto concreto: dale su precio y su stock tal como figuran. Como la compatibilidad depende de la moto y NO SABEMOS LA SUYA, ` +
+          `dile que para confirmar que le vale necesitas su marca, modelo y año (o que la guarde en Mi garaje). No afirmes que es compatible.`);
+      }
+    } else {
+      found = universal.map((hit) => ({ hit, tag: '' }));
+      if (general.length > universal.length) {
+        notes.push(`Tenemos «${product.search}» para muchas motos, pero NO SABEMOS LA SUYA: pregúntale marca, modelo y año (o que la guarde en ` +
+          `Mi garaje) antes de recomendar nada; no elijas productos para tarjetas hasta saberla${universal.length ? ', salvo los universales de abajo' : ''}.`);
+      }
+    }
+    if (!general.length) {
       noMatch = true;
       notes.push(`NO SE ENCONTRARON PRODUCTOS PARA «${product.search}». Dile que ahora mismo no lo tenemos.${ADVISOR}`);
     }
@@ -672,6 +758,14 @@ export async function getCatalogContext(
     return true;
   }).slice(0, 6);
 
+  // Una pregunta de envíos, pagos, devoluciones… sin productos que enseñar no es «no encontré el producto»: no se ofrece un asesor ni se disculpa.
+  if (!shown.length && isPolicyQuestion(userMessages[userMessages.length - 1] || '')) {
+    return { hits: [], text: POLICY_NOTE, noMatch: false, kind: 'policy' };
+  }
+
+  // Stock de este momento (Bihr/Andreani) antes de dárselo al asistente.
+  await withLiveStock(shown.map((x) => x.hit));
+
   if (missing) {
     notes.push(`Ningún producto lleva «${missing}» en su nombre: estos son los más parecidos. Ofrécelos aclarando que «${missing}» no figura ` +
       `en su descripción (si es una marca, que ahora mismo no la tenemos; si es una variante, que lo compruebe en la ficha).`);
@@ -682,7 +776,7 @@ export async function getCatalogContext(
       `y di «la posición la puedes comprobar en la ficha».`);
   }
   const text = [...notes, ...shown.map(({ hit, tag }, i) => formatHitText(hit, tag, i + 1, positions.length > 0))].join('\n');
-  return { hits: shown.map((x) => x.hit), text, noMatch };
+  return { hits: shown.map((x) => x.hit), text, noMatch, kind };
 }
 
 /**
@@ -718,6 +812,7 @@ export function cardsFor(hits: CatalogHit[], chosen: string | null, answer = '')
       image: hit.image,
       slug: hit.slug,
       in_stock: (hit.stock || 0) > 0,
+      restock_date: (hit.stock || 0) > 0 ? null : hit.restockDate || null,
     }));
 }
 

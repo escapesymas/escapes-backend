@@ -13,7 +13,7 @@ vi.mock('../lib/moto-catalog.js', () => ({
   } }),
 }));
 
-const { splitPosition, contradictsPosition, cardsFor, catalogMoto, conversationMoto, conversationProduct } = await import('./catalog.js');
+const { splitPosition, contradictsPosition, cardsFor, catalogMoto, conversationMoto, conversationProduct, getCatalogContext } = await import('./catalog.js');
 
 const garage = ['CYCLONE RX2 2026', 'APRILIA AMICO 50 1998', 'HONDA PCX 125 (2022)'];
 
@@ -87,5 +87,34 @@ describe('tarjetas del chat', () => {
     expect(cardsFor(hits, ' ninguno')).toEqual([]);
     const named = [{ ...hit(1), name: 'Pastillas de freno Tecnium MA359 Orgánicas' }, { ...hit(2), name: 'Pastillas Brembo 07GR03CC' }, { ...hit(3), name: 'Zapatas BA208' }];
     expect(cardsFor(named, null, 'Te recomiendo las **Tecnium MA359** o las Brembo 07GR03CC.').map((c) => c.id)).toEqual([1, 2]);
+  });
+});
+
+describe('qué se busca según el tipo de mensaje', () => {
+  it('una queja no consulta el catálogo y pide empatía', async () => {
+    const r = await getCatalogContext(['esto es una estafa, os voy a denunciar'], []);
+    expect(r.kind).toBe('complaint');
+    expect(r.hits).toEqual([]);
+    expect(r.noMatch).toBeFalsy();
+    expect(r.text).toMatch(/ENFADADO/);
+  });
+
+  it('un saludo o un gracias tampoco', async () => {
+    expect((await getCatalogContext(['hola'], [])).kind).toBe('greeting');
+    expect((await getCatalogContext(['muchas gracias'], [])).kind).toBe('thanks');
+  });
+
+  it('una pregunta de envíos o devoluciones sin productos no es «no lo tenemos»: ni asesor ni disculpa', async () => {
+    for (const q of ['cuánto tarda en llegar un pedido a Canarias', 'puedo devolver un casco si no me gusta?', 'puedo pagar con paypal?']) {
+      const r = await getCatalogContext([q], []);
+      expect(r.kind, q).toBe('policy');
+      expect(r.noMatch, q).toBe(false);
+      expect(r.text, q).toMatch(/DATOS DE LA TIENDA/);
+    }
+  });
+
+  it('un producto que no existe sí es «no lo tenemos» (y se ofrece un asesor)', async () => {
+    const r = await getCatalogContext(['pastillas de freno brembo para una cyclone rx2'], garage);
+    expect(r.noMatch).toBe(true);
   });
 });
