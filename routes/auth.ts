@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { pickUsername } from '../lib/username.js';
 import { db } from '../db.js';
 import { sql } from 'drizzle-orm';
 import bcrypt from 'bcryptjs';
@@ -865,15 +866,26 @@ authRouter.post('/auth', async (req, res) => {
         return res.json({ verificationRequired: true, email, emailSent: true });
       }
 
-      const userNick = username || email.split('@')[0];
+      const userNick = await pickUsername(email, username, async (name) =>
+        (await db.execute(sql`SELECT 1 FROM users WHERE LOWER(username) = LOWER(${name})`)).rows.length > 0);
 
-      const inserted = await db.execute(sql`
-        INSERT INTO users (email, username, password_hash, first_name, last_name, role)
-        VALUES (${email}, ${userNick}, ${passHash}, ${firstName || ''}, ${lastName || ''}, 'customer')
-        RETURNING *
-      `);
-
-      const user = inserted.rows[0] as any;
+      let user: any;
+      try {
+        const inserted = await db.execute(sql`
+          INSERT INTO users (email, username, password_hash, first_name, last_name, role)
+          VALUES (${email}, ${userNick}, ${passHash}, ${firstName || ''}, ${lastName || ''}, 'customer')
+          RETURNING *
+        `);
+        user = inserted.rows[0] as any;
+      } catch (e: any) {
+        // Dos altas a la vez con el mismo correo (o un usuario escrito a mano que ya existe): respuestas normales, no un error de base de datos.
+        if (e?.code === '23505' && /email/.test(String(e?.constraint || e?.message))) {
+          notifyExistingAccountOnRegister(String(email)).catch((err) => console.error('[AUTH REGISTER EXISTING NOTICE ERROR]:', err.message));
+          return res.json({ verificationRequired: true, email, emailSent: true });
+        }
+        if (e?.code === '23505') return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso. Elige otro.' });
+        throw e;
+      }
       // Sin sesión hasta confirmar el email (ver action === 'verify-email'). El
       // envío va en segundo plano: con reintentos puede tardar más de un minuto.
       const emailSent = true;

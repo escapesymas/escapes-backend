@@ -69,7 +69,11 @@ export async function storePolicies(): Promise<string> {
 
 /** Qué hacer cuando el asistente no puede resolver la consulta. */
 export function humanSupportRules(status: SupportStatus, anonymous: boolean): string {
-  const login = anonymous ? ' Para pasar con un asesor el cliente debe iniciar sesión (la web se lo pedirá al pulsar el botón): no hace falta que se lo expliques con detalle.' : '';
+  // Un invitado no puede pasar con un asesor sin cuenta (el asesor le avisa por notificación y correo y ve sus pedidos): el asistente
+  // se lo dice claro y, al pulsar el botón, el propio chat le deja crear la cuenta (o entrar) sin salir de la conversación.
+  const login = anonymous
+    ? ' IMPORTANTE: este cliente NO tiene sesión iniciada. Para hablar con un asesor (o dejarle un mensaje) necesita una cuenta: díselo con claridad en una frase («para hablar con un asesor necesitas una cuenta, y puedes crearla aquí mismo en un minuto») y, si ya tiene una, que puede entrar con ella en el mismo chat. Con la marca el cliente verá un botón y, al pulsarlo, el chat le pedirá crear la cuenta o entrar sin salir de la conversación.'
+    : '';
   if (status.available) {
     return `ATENCIÓN HUMANA: ahora hay un asesor conectado (${status.agentName}). Si no puedes resolver la consulta con los datos que tienes (incidencia con un pedido, devolución o garantía concreta, duda técnica sin datos suficientes, queja, presupuesto especial) o el cliente pide hablar con una persona, díselo en una frase, ofrécele hablar con un asesor y termina tu respuesta con la marca [[ASESOR]] (el cliente verá un botón para hablar con él). No uses la marca si has resuelto la duda.${login}`;
   }

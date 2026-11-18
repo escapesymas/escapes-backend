@@ -18,7 +18,7 @@ vi.mock('./catalog.js', () => ({
 vi.mock('./webSearch.js', () => ({ isTechSpecQuery: vi.fn(() => false), searchMotorcycleTechSpecs: vi.fn(async () => '') }));
 vi.mock('../lib/order-pricing.js', () => ({ ORDER_TIERS: [], MAX_EXTRA_DISCOUNT_PERCENT: 10 }));
 
-const { generateReply, buildSystemPrompt } = await import('./index.js');
+const { generateReply, buildSystemPrompt, humanSupportRules } = await import('./index.js');
 
 const reply = (content: string, finish = 'stop') => ({ choices: [{ message: { content }, finish_reason: finish }], usage: { total_tokens: 10 } });
 const history = [{ role: 'user' as const, content: 'pastillas para mi moto' }];
@@ -78,5 +78,27 @@ describe('prompt del asistente', () => {
     expect(p).toContain('EL CLIENTE ESTÁ VIENDO ESTE PRODUCTO');
     expect(p).toContain('NUNCA digas que tenemos');
     expect(p).toContain('di «de los que te enseño»');
+  });
+});
+
+describe('atención humana para visitantes sin cuenta', () => {
+  const status: any = { available: true, agentName: 'Laura', mode: 'auto', hoursText: 'L-V 9-18', nextOpen: null };
+
+  it('un invitado oye que necesita una cuenta y que puede crearla en el propio chat', () => {
+    const t = humanSupportRules(status, true);
+    expect(t).toMatch(/NO tiene sesión/);
+    expect(t).toMatch(/necesitas una cuenta/);
+    expect(t).toMatch(/crearla aquí mismo/);
+    expect(t).toMatch(/\[\[ASESOR\]\]/);
+  });
+
+  it('también cuando no hay asesores conectados (dejar un mensaje)', () => {
+    const t = humanSupportRules({ ...status, available: false, mode: 'auto' }, true);
+    expect(t).toMatch(/\[\[MENSAJE\]\]/);
+    expect(t).toMatch(/necesitas una cuenta/);
+  });
+
+  it('con sesión no se menciona la cuenta', () => {
+    expect(humanSupportRules(status, false)).not.toMatch(/necesitas una cuenta/);
   });
 });
