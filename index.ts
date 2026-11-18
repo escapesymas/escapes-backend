@@ -58,6 +58,7 @@ import { chatToolsRouter, startChatJobs } from './routes/chatToolsRoutes.js';
 import { mfaRouter } from './routes/mfaRoutes.js';
 import { motoAlertRouter } from './routes/motoAlertRoutes.js';
 import { analyticsRouter } from './routes/analyticsRoutes.js';
+import { overviewRouter } from './routes/overviewRoutes.js';
 import { andreaniRouter } from './routes/andreani.js';
 import { startAndreaniStockCron } from './lib/andreani-service.js';
 import { ensureCompatModels } from './lib/compat.js';
@@ -747,6 +748,7 @@ app.use('/api', chatToolsRouter);
 app.use('/api', mfaRouter);
 app.use('/api', motoAlertRouter);
 app.use('/api', analyticsRouter);
+app.use('/api', overviewRouter);
 app.use('/api', andreaniRouter);
 
 // Subidas a disco con nombre aleatorio y extensión controlada por el servidor:

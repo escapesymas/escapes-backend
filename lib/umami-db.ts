@@ -222,7 +222,7 @@ function getRangeFilter(range: StatsRange): { clause: string; isHourly: boolean 
  * Columnas COUNT de lo que ha hecho un visitante (las que lee `signalsFromRow`) sobre las filas `alias` de website_event.
  * Se reutilizan en el tiempo real, en el listado de destacados y en el detalle.
  */
-function signalColumnsSql(alias: string): string {
+export function signalColumnsSql(alias: string): string {
   return `
       COUNT(*) FILTER (WHERE ${alias}.event_type = 1) AS pageviews,
       COUNT(*) FILTER (WHERE ${alias}.event_name = 'view_product_detail') AS product_views,
@@ -241,7 +241,7 @@ function signalColumnsSql(alias: string): string {
  * Valor en euros de los «añadir al carrito» (precio × cantidad) de cada visitante sobre las filas `alias`.
  * Devuelve `session_id, cart_value`; solo salen los que han añadido algo.
  */
-function cartValueSql(alias: string, where: string): string {
+export function cartValueSql(alias: string, where: string): string {
   return `
     SELECT ${alias}.session_id, SUM(v.number_value * COALESCE(q.number_value, 1)) AS cart_value
     FROM website_event ${alias}
@@ -275,7 +275,7 @@ async function loadInterests(sessionIds: string[], whereClause: string): Promise
 }
 
 /** Cláusula SQL para excluir tráfico interno de pruebas (Canarias) si excludeInternal es true */
-function getInternalFilterSql(excludeInternal: boolean, sessionAlias: string = 's'): string {
+export function getInternalFilterSql(excludeInternal: boolean, sessionAlias: string = 's'): string {
   if (!excludeInternal) return '';
   return `
     AND COALESCE(${sessionAlias}.region, '') != 'ES-CN'
@@ -288,7 +288,7 @@ function getInternalFilterSql(excludeInternal: boolean, sessionAlias: string = '
  * visita traen la página anterior de la propia web («Interno»). Para no perder el origen, cada vista hereda
  * el referrer de la primera página de su visita: usar `vs.referrer_domain` en lugar de `e.referrer_domain`.
  */
-function visitSourceJoin(eventAlias: string = 'e'): string {
+export function visitSourceJoin(eventAlias: string = 'e'): string {
   return `
     LEFT JOIN LATERAL (
       SELECT f.referrer_domain
