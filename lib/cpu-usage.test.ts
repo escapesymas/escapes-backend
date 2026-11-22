@@ -1,15 +1,48 @@
 import { describe, it, expect } from 'vitest';
-import { takeSnapshot, cpuPercentBetween, createCpuMonitor, type CpuSnapshot } from './cpu-usage.js';
+import { snapshotFromProcStat, snapshotFromOsCpus, takeSnapshot, cpuPercentBetween, createCpuMonitor, type CpuSnapshot } from './cpu-usage.js';
 
 const snap = (idle: number, total: number, at: number): CpuSnapshot => ({ idle, total, at });
 
-describe('takeSnapshot', () => {
+describe('snapshotFromProcStat', () => {
+  const text = 'cpu  100 10 50 700 80 5 15 40 0 0\ncpu0 50 5 25 350 40 2 7 20 0 0\nintr 123\n';
+  it('lee la línea global y cuenta el iowait como tiempo parado', () => {
+    const s = snapshotFromProcStat(text, 9)!;
+    expect(s.idle).toBe(700 + 80);
+    expect(s.total).toBe(100 + 10 + 50 + 700 + 80 + 5 + 15 + 40);
+    expect(s.at).toBe(9);
+  });
+  it('con iowait no infla el uso (el caso que medía 5 puntos de más con os.cpus)', () => {
+    // 35 de trabajo, 54 parado, 11 esperando disco -> 35 %, no 40 %.
+    const a = snapshotFromProcStat('cpu  0 0 0 0 0 0 0 0', 0)!;
+    const b = snapshotFromProcStat('cpu  25 0 8 54 11 0 2 0', 1)!;
+    expect(cpuPercentBetween(a, b)).toBe(35);
+  });
+  it('acepta kernels antiguos con pocas columnas', () => {
+    expect(snapshotFromProcStat('cpu  10 0 10 80', 0)).toEqual({ idle: 80, total: 100, at: 0 });
+  });
+  it('devuelve null si no es lo esperado', () => {
+    expect(snapshotFromProcStat('', 0)).toBeNull();
+    expect(snapshotFromProcStat('cpu0 1 2 3 4', 0)).toBeNull();
+    expect(snapshotFromProcStat('cpu  a b c d', 0)).toBeNull();
+  });
+});
+
+describe('snapshotFromOsCpus', () => {
   it('suma los tiempos de todos los núcleos', () => {
-    const s = takeSnapshot([
+    const s = snapshotFromOsCpus([
       { times: { user: 10, nice: 1, sys: 5, idle: 80, irq: 4 } },
       { times: { user: 20, nice: 0, sys: 10, idle: 70, irq: 0 } },
     ], 123);
     expect(s).toEqual({ idle: 150, total: 200, at: 123 });
+  });
+});
+
+describe('takeSnapshot', () => {
+  it('lee el estado real de esta máquina', () => {
+    const s = takeSnapshot(5);
+    expect(s.total).toBeGreaterThan(0);
+    expect(s.idle).toBeLessThanOrEqual(s.total);
+    expect(s.at).toBe(5);
   });
 });
 
