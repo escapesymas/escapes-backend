@@ -1,0 +1,138 @@
+# Entorno de pruebas de Escapes y Más (staging). Lo despliega deploy-staging.sh desde /root/staging en el VPS.
+#
+#  - Red PROPIA y SIN SALIDA A INTERNET (`internal: true`): aunque fallaran todos los bloqueos del código, desde aquí no se puede
+#    enviar un correo, llamar a Bihr/Andreani/Stripe/Meta/TikTok ni nada de fuera. Tampoco está en la red `coolify`, donde el
+#    backend de producción tiene los alias `backend` y `escapes-backend`: aquí `backend` es SOLO el de pruebas.
+#  - Solo la tienda y el panel se publican (Traefik, con contraseña). La API no tiene dominio: se llega a ella por dentro.
+#  - Base de datos y Redis propios, con límites de memoria. Nada de aquí se incluye en la copia de seguridad (es desechable).
+#  - Las fotos de producto se montan de solo lectura desde producción (solo la carpeta pública `optimized`).
+name: escapes-staging
+
+networks:
+  staging:
+    name: escapes-staging
+    internal: true
+
+volumes:
+  staging-db:
+    name: escapes-staging-db-data
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: escapes-staging-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: staging
+      POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD:?falta STAGING_DB_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - staging-db:/var/lib/postgresql/data
+    networks: [staging]
+    mem_limit: 768m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U staging -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  redis:
+    image: redis:7-alpine
+    container_name: escapes-staging-redis
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "96mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    networks: [staging]
+    mem_limit: 160m
+    cpus: 0.5
+
+  backend:
+    build:
+      context: ./src/backend
+    container_name: escapes-staging-backend
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_started }
+    environment:
+      APP_ENV: staging
+      NODE_ENV: production
+      PORT: "3001"
+      NODE_OPTIONS: "--max-old-space-size=384"
+      DATABASE_URL: postgres://staging:${STAGING_DB_PASSWORD}@db:5432/escapes_staging
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${STAGING_JWT_SECRET:?falta STAGING_JWT_SECRET}
+      SITE_URL: https://pruebas.escapesymas.com
+      ADMIN_PUBLIC_URL: https://admin.pruebas.escapesymas.com
+      ASESORES_URL: https://admin.pruebas.escapesymas.com
+      STAGING_ORIGINS: https://pruebas.escapesymas.com,https://admin.pruebas.escapesymas.com
+      # Passkeys con su propio dominio: lo que se registre aquí no se mezcla con las llaves del panel real.
+      WEBAUTHN_RP_ID: pruebas.escapesymas.com
+      WEBAUTHN_ORIGINS: https://admin.pruebas.escapesymas.com
+      # Sin salida a Internet, no tiene sentido intentar el stock en vivo de los proveedores (solo daría esperas).
+      BIHR_LIVE_STOCK_DISABLED: "true"
+      ANDREANI_LIVE_STOCK_DISABLED: "true"
+      # Correo: a nadie (STAGING_MAIL_ALLOW vacío). Trabajos programados: ninguno (STAGING_JOBS vacío).
+      STAGING_MAIL_ALLOW: ""
+      STAGING_JOBS: ""
+    volumes:
+      - /data/escapes-uploads/optimized:/app/server/uploads/optimized:ro
+    networks: [staging]
+    mem_limit: 640m
+    cpus: 1.5
+
+  frontend:
+    build:
+      context: ./src/frontend
+      dockerfile: Dockerfile.staging   # lo genera deploy-staging.sh a partir del Dockerfile de la tienda (solo añade ARG)
+      args:
+        NEXT_PUBLIC_APP_ENV: staging
+        NEXT_PUBLIC_API_URL: https://pruebas.escapesymas.com
+        NEXT_PUBLIC_SITE_URL: https://pruebas.escapesymas.com
+        API_URL: http://backend:3001
+    container_name: escapes-staging-frontend
+    restart: unless-stopped
+    depends_on: [backend]
+    environment:
+      API_URL: http://backend:3001
+      NEXT_PUBLIC_APP_ENV: staging
+      NODE_OPTIONS: "--max-old-space-size=512"
+    networks: [staging]
+    mem_limit: 768m
+    cpus: 1.5
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=escapes-staging"
+      - "traefik.http.middlewares.stg-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.stg-auth.basicauth.users=${STAGING_BASIC_AUTH:?falta STAGING_BASIC_AUTH}"
+      - "traefik.http.routers.stg-tienda-http.entrypoints=http"
+      - "traefik.http.routers.stg-tienda-http.rule=Host(`pruebas.escapesymas.com`)"
+      - "traefik.http.routers.stg-tienda-http.middlewares=stg-https@docker"
+      - "traefik.http.routers.stg-tienda.entrypoints=https"
+      - "traefik.http.routers.stg-tienda.rule=Host(`pruebas.escapesymas.com`)"
+      - "traefik.http.routers.stg-tienda.tls=true"
+      - "traefik.http.routers.stg-tienda.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.stg-tienda.middlewares=stg-auth@docker"
+      - "traefik.http.services.stg-tienda.loadbalancer.server.port=3000"
+
+  admin:
+    build:
+      context: ./src/admin
+    container_name: escapes-staging-admin
+    restart: unless-stopped
+    depends_on: [backend]
+    networks: [staging]
+    mem_limit: 128m
+    cpus: 0.5
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=escapes-staging"
+      - "traefik.http.routers.stg-panel-http.entrypoints=http"
+      - "traefik.http.routers.stg-panel-http.rule=Host(`admin.pruebas.escapesymas.com`)"
+      - "traefik.http.routers.stg-panel-http.middlewares=stg-https@docker"
+      - "traefik.http.routers.stg-panel.entrypoints=https"
+      - "traefik.http.routers.stg-panel.rule=Host(`admin.pruebas.escapesymas.com`)"
+      - "traefik.http.routers.stg-panel.tls=true"
+      - "traefik.http.routers.stg-panel.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.stg-panel.middlewares=stg-auth@docker"
+      - "traefik.http.services.stg-panel.loadbalancer.server.port=80"
