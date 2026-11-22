@@ -60,6 +60,7 @@ import { motoAlertRouter } from './routes/motoAlertRoutes.js';
 import { analyticsRouter } from './routes/analyticsRoutes.js';
 import { overviewRouter } from './routes/overviewRoutes.js';
 import { startOverviewEmailJob } from './lib/overview-email.js';
+import { cpuMonitor } from './lib/cpu-usage.js';
 import { andreaniRouter } from './routes/andreani.js';
 import { startAndreaniStockCron } from './lib/andreani-service.js';
 import { ensureCompatModels } from './lib/compat.js';
@@ -2603,10 +2604,11 @@ app.all('/api/admin', adminLimiter, async (req, res) => {
         const usedMem = totalMem - freeMem;
         const memPercent = Math.round((usedMem / totalMem) * 100);
         
-        // 1-minute load average
+        // CPU real (media del último minuto, lib/cpu-usage.ts). La carga media NO es uso de CPU: cuenta procesos en cola y esperando
+        // disco (marcaba 87 % con la CPU al 27 %). Si el muestreo aún no tiene dos muestras (recién arrancado), se usa la carga como aproximación.
         const cpuLoad = os.loadavg()[0];
         const cpuCores = os.cpus().length;
-        const cpuPercent = Math.min(Math.round((cpuLoad / cpuCores) * 100), 100);
+        const cpuPercent = cpuMonitor.current() ?? Math.min(Math.round((cpuLoad / cpuCores) * 100), 100);
 
         let diskStats = { total: "115G", used: "20.5G", free: "94.5G", percent: "18%" };
         try {
@@ -7367,6 +7369,8 @@ app.listen(PORT, () => {
   startChatJobs();
   // Informes de la Vista general por correo (diario, semanal y mensual según Ajustes › Informes).
   startOverviewEmailJob();
+  // Muestreo del uso real de CPU para Ajustes › Sistema (una muestra cada 5 s, media del último minuto).
+  cpuMonitor.start();
   resetInterruptedGenerations().catch((e) => console.error('[SOCIAL CONTENT] reset:', e.message));
   console.log(`
 ╔══════════════════════════════════════════════════════╗
