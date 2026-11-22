@@ -48,6 +48,7 @@ export function reportToPromptText(r: OverviewReport): string {
   const L: string[] = [];
   L.push(`PERIODO: ${r.period.label} (${r.period.from} a ${r.period.to}, ${r.period.days} día${r.period.days === 1 ? '' : 's'}).`);
   L.push(`COMPARADO CON: ${r.period.prevLabel} (${r.period.prevFrom} a ${r.period.prevTo}) — ${r.period.compare === 'yoy' ? 'el mismo periodo del año pasado' : 'el periodo anterior equivalente'}.`);
+  if (r.period.prevUntil) L.push(`NOTA: hoy aún no ha terminado. El periodo de comparación solo cuenta hasta las ${r.period.prevUntil.slice(0, 5)} para comparar tramos iguales: las variaciones son entre el mismo tramo horario. No trates las cifras de hoy como un día completo ni digas que «el día va mal» por ser un día incompleto.`);
   L.push(`Hay datos de la tienda desde ${r.dataSince.store ?? 'siempre'} y de las visitas desde ${r.dataSince.visits ?? 'nunca'}.`);
   L.push(`Tráfico propio de Canarias ${r.excludeInternal ? 'excluido' : 'incluido'} en las visitas.`);
   for (const g of GROUP_ORDER) {

@@ -26,6 +26,11 @@ export interface ResolvedPeriod {
   prevFrom: string;
   prevTo: string;
   prevLabel: string;
+  /**
+   * Solo en «Hoy»: hora de Madrid (HH:MM:SS) hasta la que se cuenta el periodo de comparación. Hoy aún no ha terminado, y compararlo con un
+   * día ENTERO daba «−81 %» a media jornada sin que pasara nada (22/11/2026). `null` = el periodo de comparación se cuenta entero.
+   */
+  prevUntil: string | null;
 }
 
 /** Máximo de días de un periodo personalizado (un año y poco: las estadísticas web empiezan en enero de 2026). */
@@ -38,6 +43,11 @@ const MONTHS = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 
 /** Fecha de hoy en Madrid como YYYY-MM-DD. */
 export function madridToday(now: Date = new Date()): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+}
+
+/** Hora de Madrid en este momento como HH:MM:SS (24 h). */
+export function madridClock(now: Date = new Date()): string {
+  return new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Madrid', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).format(now);
 }
 
 function toUtc(date: string): number {
@@ -198,7 +208,14 @@ export function resolvePeriod(input: { preset?: unknown; from?: unknown; to?: un
     prevLabel = from.slice(0, 4) === to.slice(0, 4) ? `Mismo periodo de ${Number(from.slice(0, 4)) - 1}` : 'Mismo periodo del año pasado';
   }
 
-  return { preset, compare, label, from, to, days: daysBetween(from, to), prevFrom, prevTo, prevLabel };
+  // «Hoy» es un día a medias: se compara con el mismo tramo del día de comparación (ayer, o esa fecha del año pasado) hasta esta misma hora.
+  let prevUntil: string | null = null;
+  if (preset === 'today') {
+    prevUntil = madridClock(now);
+    prevLabel = `${prevLabel} hasta las ${prevUntil.slice(0, 5)}`;
+  }
+
+  return { preset, compare, label, from, to, days: daysBetween(from, to), prevFrom, prevTo, prevLabel, prevUntil };
 }
 
 /** Lista de días (YYYY-MM-DD) de un periodo, para rellenar los huecos de las series. */

@@ -348,10 +348,13 @@ export function getOverviewReport(input: { preset?: unknown; from?: unknown; to?
 
 async function computeReport(period: ResolvedPeriod, excludeInternal: boolean): Promise<OverviewReport> {
   // Límites exactos (con el cambio horario de Madrid) de los dos periodos, calculados por Postgres.
+  // En «Hoy», el periodo de comparación termina a esta misma hora (`prevUntil`) en lugar de al acabar el día.
   const { rows: b } = await pool.query(
     `SELECT ($1::date)::timestamp AT TIME ZONE 'Europe/Madrid' AS f, (($2::date) + 1)::timestamp AT TIME ZONE 'Europe/Madrid' AS t,
-            ($3::date)::timestamp AT TIME ZONE 'Europe/Madrid' AS pf, (($4::date) + 1)::timestamp AT TIME ZONE 'Europe/Madrid' AS pt`,
-    [period.from, period.to, period.prevFrom, period.prevTo]);
+            ($3::date)::timestamp AT TIME ZONE 'Europe/Madrid' AS pf,
+            CASE WHEN $5::time IS NULL THEN (($4::date) + 1)::timestamp AT TIME ZONE 'Europe/Madrid'
+                 ELSE (($4::date) + $5::time)::timestamp AT TIME ZONE 'Europe/Madrid' END AS pt`,
+    [period.from, period.to, period.prevFrom, period.prevTo, period.prevUntil]);
   const iso = (v: Date) => new Date(v).toISOString();
   const [from, to, pFrom, pTo] = [iso(b[0].f), iso(b[0].t), iso(b[0].pf), iso(b[0].pt)];
   const warnings: string[] = [];

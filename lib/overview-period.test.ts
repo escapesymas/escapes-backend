@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { addDays, daysBetween, listDays, madridToday, minusOneYear, resolvePeriod } from './overview-period.js';
+import { addDays, daysBetween, listDays, madridClock, madridToday, minusOneYear, resolvePeriod } from './overview-period.js';
 
 // 18 de noviembre de 2026, mediodía en Madrid.
 const NOW = new Date('2026-11-18T11:00:00Z');
@@ -17,6 +17,37 @@ describe('días de Madrid', () => {
     expect(daysBetween('2026-11-01', '2026-11-18')).toBe(18);
     expect(daysBetween('2026-11-18', '2026-11-18')).toBe(1);
     expect(listDays('2026-02-27', '2026-03-02')).toEqual(['2026-02-27', '2026-02-28', '2026-03-01', '2026-03-02']);
+  });
+});
+
+describe('hora de Madrid', () => {
+  it('da HH:MM:SS en 24 h, con horario de invierno y de verano', () => {
+    expect(madridClock(new Date('2026-11-18T11:05:09Z'))).toBe('12:05:09');
+    expect(madridClock(new Date('2026-07-01T11:05:09Z'))).toBe('13:05:09');
+    expect(madridClock(new Date('2026-11-18T23:00:00Z'))).toBe('00:00:00');
+    expect(madridClock(new Date('2026-11-18T22:59:59Z'))).toBe('23:59:59');
+  });
+});
+
+describe('«Hoy» se compara con el mismo tramo horario del día de comparación', () => {
+  it('con ayer hasta esta misma hora', () => {
+    const t = resolvePeriod({ preset: 'today' }, NOW);
+    expect(t.prevUntil).toBe('12:00:00');
+    expect(t.prevLabel).toBe('Ayer hasta las 12:00');
+    expect([t.prevFrom, t.prevTo]).toEqual(['2026-11-17', '2026-11-17']);
+  });
+  it('con el mismo día del año pasado hasta esta misma hora', () => {
+    const t = resolvePeriod({ preset: 'today', compare: 'yoy' }, new Date('2026-11-22T13:24:10Z'));
+    expect(t.prevUntil).toBe('14:24:10');
+    expect(t.prevLabel).toBe('Mismo periodo de 2025 hasta las 14:24');
+    expect([t.prevFrom, t.prevTo]).toEqual(['2025-11-22', '2025-11-22']);
+  });
+  it('el resto de periodos se comparan enteros', () => {
+    for (const preset of ['yesterday', '7d', '30d', 'month', 'prev_month', 'year', 'custom']) {
+      const p = resolvePeriod({ preset, from: '2026-11-01', to: '2026-11-10' }, NOW);
+      expect(p.prevUntil).toBeNull();
+      expect(p.prevLabel).not.toContain('hasta las');
+    }
   });
 });
 
