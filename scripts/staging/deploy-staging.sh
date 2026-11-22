@@ -42,16 +42,24 @@ awk '{print} /^COPY \. \.$/ && !d {print "ARG NEXT_PUBLIC_APP_ENV\nARG NEXT_PUBL
 grep -q '^ARG NEXT_PUBLIC_APP_ENV' src/frontend/Dockerfile.staging || die "no pude añadir los ARG al Dockerfile de la tienda"
 
 # ── 2. Secretos del entorno de pruebas (una sola vez) ───────────────────────────────────────────────────────────
+gen() { openssl rand -base64 64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
+# Contraseña de acceso a las webs (Traefik): el hash va a .env y la contraseña, al fichero de credenciales (nunca se imprime).
+new_web_auth() {
+  local pw hash; pw="$(gen 16)"; hash="$(openssl passwd -apr1 "$pw")"
+  ( umask 177
+    { grep -v '^STAGING_BASIC_AUTH=' .env 2>/dev/null || true; echo "STAGING_BASIC_AUTH='pruebas:$hash'"; } > .env.new
+    { grep -v -E '^(web:|# Entorno de pruebas — acceso)' "$CRED" 2>/dev/null || true
+      echo "# Entorno de pruebas — acceso a las webs (usuario y contraseña de Traefik), creado el $(date -u +%F) UTC"
+      echo "web: pruebas / $pw"; } > "$CRED.new" )
+  mv .env.new .env; mv "$CRED.new" "$CRED"
+}
 if [[ ! -f .env ]]; then
-  gen() { openssl rand -base64 64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
-  BA_PW="$(gen 16)"; BA_HASH="$(openssl passwd -apr1 "$BA_PW")"
-  umask 177
-  { echo "STAGING_DB_PASSWORD=$(gen 28)"
-    echo "STAGING_JWT_SECRET=$(gen 64)"
-    echo "STAGING_BASIC_AUTH='pruebas:$BA_HASH'"; } > .env
-  { echo "# Entorno de pruebas — acceso a las webs (usuario y contraseña de Traefik), creado el $(date -u +%F) UTC"
-    echo "web: pruebas / $BA_PW"; } >> "$CRED"
+  ( umask 177; { echo "STAGING_DB_PASSWORD=$(gen 28)"; echo "STAGING_JWT_SECRET=$(gen 64)"; } > .env )
+  new_web_auth
   echo "· Secretos creados en $DIR/.env y credenciales en $CRED (solo root)."
+elif ! grep -q '^web:' "$CRED" 2>/dev/null; then
+  new_web_auth
+  echo "· Faltaba la contraseña de las webs en $CRED: se ha generado una nueva (solo root)."
 fi
 chmod 600 .env "$CRED" 2>/dev/null || true
 

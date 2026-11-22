@@ -88,10 +88,14 @@ stg_psql -c "ANALYZE" >/dev/null
 if [[ -n "$SEED_SQL" && -f "$SEED_SQL" ]]; then
   gen() { openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 18; }
   ADMIN_PW="$(gen)"; CLIENTE_PW="$(gen)"
-  umask 177
-  { echo "# Entorno de pruebas — cuentas creadas el $(date -u +%F\ %T) UTC (se renuevan cada vez que se rehace la base)"
-    echo "admin@pruebas.invalid   $ADMIN_PW"
-    echo "cliente@pruebas.invalid $CLIENTE_PW"; } > "$CRED_FILE"
+  # Se conservan las líneas de acceso a las webs (las escribe deploy-staging.sh); solo se renuevan las de las cuentas.
+  KEEP="$(grep -E '^(web:|# Entorno de pruebas — acceso)' "$CRED_FILE" 2>/dev/null || true)"
+  ( umask 177
+    { if [[ -n "$KEEP" ]]; then echo "$KEEP"; fi
+      echo "# Entorno de pruebas — cuentas creadas el $(date -u +%F\ %T) UTC (se renuevan cada vez que se rehace la base)"
+      echo "admin@pruebas.invalid   $ADMIN_PW"
+      echo "cliente@pruebas.invalid $CLIENTE_PW"; } > "$CRED_FILE.new" )
+  mv "$CRED_FILE.new" "$CRED_FILE"; chmod 600 "$CRED_FILE"
   { printf "\\\\set admin_pw '%s'\n\\\\set cliente_pw '%s'\n" "$ADMIN_PW" "$CLIENTE_PW"; cat "$SEED_SQL"; } | stg_psql -q -f - >/dev/null
   echo "Cuentas de pruebas creadas. Credenciales en $CRED_FILE (solo root)."
 else
