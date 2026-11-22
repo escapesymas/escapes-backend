@@ -162,3 +162,51 @@ describe('quoteOrder: cupón de bienvenida BIENVENIDA5', () => {
     expect(q.discountCents).toBe(500);
   });
 });
+
+describe('quoteOrder: política de envío (19,99 €, gratis desde 200 €) y tramos por importe', () => {
+  beforeEach(() => { db.products = []; db.coupon = null; db.orders = []; });
+
+  const quoteOf = (priceCents: number, extra: Partial<Parameters<typeof quoteOrder>[0]> = {}) => {
+    db.products = roomy(priceCents);
+    return quoteOrder({ cart: [{ id: 1, quantity: 1 }], ...extra });
+  };
+
+  it('por debajo de 200 € el envío cuesta 19,99 €', async () => {
+    expect((await quoteOf(5000)).shippingCents).toBe(1999);
+    expect((await quoteOf(19999)).shippingCents).toBe(1999);
+  });
+
+  it('desde 200 € el envío es gratis', async () => {
+    expect((await quoteOf(20000)).shippingCents).toBe(0);
+    expect((await quoteOf(25000)).shippingCents).toBe(0);
+  });
+
+  it('un destino sin zona configurada paga los 19,99 € por defecto, no 0', async () => {
+    expect((await quoteOf(5000, { country: 'FR' })).shippingCents).toBe(1999);
+  });
+
+  it('los tramos por importe: 5 % desde 150 €, 10 % y envío gratis desde 300 €', async () => {
+    const q100 = await quoteOf(10000);
+    expect([q100.discountPercent, q100.shippingCents]).toEqual([0, 1999]);
+    const q150 = await quoteOf(15000);
+    expect([q150.discountPercent, q150.shippingCents]).toEqual([5, 1999]);
+    const q250 = await quoteOf(25000);
+    expect([q250.discountPercent, q250.shippingCents]).toEqual([5, 0]);
+    const q300 = await quoteOf(30000);
+    expect([q300.discountPercent, q300.shippingCents]).toEqual([10, 0]);
+  });
+
+  it('el envío no se descuenta y el total cuadra: subtotal − descuento + envío', async () => {
+    for (const price of [5000, 15000, 25000, 30000]) {
+      const q = await quoteOf(price);
+      expect(q.subtotalCents).toBe(price);
+      expect(q.totalCents).toBe(q.subtotalCents - q.discountCents + q.shippingCents);
+    }
+  });
+
+  it('un carrito vacío no rompe el cálculo ni cobra nada de más', async () => {
+    const q = await quoteOrder({ cart: [] });
+    expect(q.subtotalCents).toBe(0);
+    expect(q.discountCents).toBe(0);
+  });
+});

@@ -86,17 +86,23 @@ describe('resolución canónica sobre moto_catalog.json real', () => {
       canonicalPath: '/escapes/yamaha/t-max-560',
       needsRedirect: true,
     });
+    // El catálogo trae «CB 650 R» y «CB650R» como dos modelos distintos: «cb650r» es una página real (sin redirección).
     expect(resolveModelSlug('honda', 'cb650r')).toMatchObject({
-      canonicalPath: '/escapes/honda/cb-650-r',
-      needsRedirect: true,
+      canonicalPath: '/escapes/honda/cb650r',
+      needsRedirect: false,
     });
     expect(resolveModelSlug('ktm', 'duke-125')).toMatchObject({
       canonicalPath: '/escapes/ktm/125-duke',
       needsRedirect: true,
     });
+    // Igual que la CB650R: el catálogo trae «696 Monster» y «Monster 696» como modelos separados.
     expect(resolveModelSlug('ducati', 'monster-696')).toMatchObject({
+      canonicalPath: '/escapes/ducati/monster-696',
+      needsRedirect: false,
+    });
+    expect(resolveModelSlug('ducati', '696-monster')).toMatchObject({
       canonicalPath: '/escapes/ducati/696-monster',
-      needsRedirect: true,
+      needsRedirect: false,
     });
     expect(resolveModelSlug('honda', 'cb-650-r-neo-sports-cafe')).toMatchObject({
       canonicalPath: '/escapes/honda/cb-650-r',
