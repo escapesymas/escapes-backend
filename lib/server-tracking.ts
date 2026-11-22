@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { sql } from 'drizzle-orm';
+import { isStaging } from './app-env.js';
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -38,7 +39,9 @@ interface GA4Config {
   apiSecret: string;
 }
 
+// Entorno de pruebas: nunca se envían eventos de conversión a Meta ni a Google Analytics (ensuciarían las estadísticas reales).
 const META = (() => {
+  if (isStaging()) return null;
   const pixelId = process.env.META_PIXEL_ID;
   const accessToken = process.env.META_ACCESS_TOKEN;
   if (!pixelId || !accessToken) return null;
@@ -46,6 +49,7 @@ const META = (() => {
 })();
 
 const GA4 = (() => {
+  if (isStaging()) return null;
   const measurementId = process.env.GA4_MEASUREMENT_ID;
   const apiSecret = process.env.GA4_API_SECRET;
   if (!measurementId || !apiSecret) return null;

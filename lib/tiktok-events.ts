@@ -10,13 +10,15 @@
  * Variables: TIKTOK_EVENTS_TOKEN (sin ella no se envía nada) y TIKTOK_PIXEL_ID.
  */
 import crypto from 'crypto';
+import { isStaging } from './app-env.js';
 
 const PIXEL_ID = process.env.TIKTOK_PIXEL_ID || 'DB4IV33C77U89E740R6G';
 const TOKEN = process.env.TIKTOK_EVENTS_TOKEN || '';
 const ENDPOINT = 'https://business-api.tiktok.com/open_api/v1.3/event/track/';
 const SITE = 'https://escapesymas.com';
 
-export const TIKTOK_EVENTS_ENABLED = Boolean(TOKEN);
+// Entorno de pruebas: nunca se envían compras a TikTok.
+export const TIKTOK_EVENTS_ENABLED = Boolean(TOKEN) && !isStaging();
 
 /** Pedidos ya enviados en este proceso (finalize puede llamarse varias veces). */
 const sent = new Set<string>();

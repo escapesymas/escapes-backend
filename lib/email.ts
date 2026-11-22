@@ -23,6 +23,7 @@ import { db } from '../db.js';
 import { sql } from 'drizzle-orm';
 import nodemailer, { Transporter } from 'nodemailer';
 import { renderEmail, type TemplateName } from './email-templates.js';
+import { isStaging, splitStagingRecipients } from './app-env.js';
 
 export interface EmailPayload {
   to: string;
@@ -120,6 +121,16 @@ function delay(ms: number): Promise<void> {
  * sends, prefer sendEmail (which routes to the queue on failure).
  */
 export async function sendEmail(payload: EmailPayload): Promise<SendResult> {
+  // Entorno de pruebas: solo salen correos a las direcciones exactas de STAGING_MAIL_ALLOW; el resto se descarta (y cuenta como enviado,
+  // para que nada lo reintente). No se registra a quién iba.
+  if (isStaging()) {
+    const { allowed, blocked } = splitStagingRecipients(payload.to);
+    if (!allowed.length) {
+      console.log(`[STAGING] correo NO enviado: «${payload.subject}» (${blocked.length} destinatario/s bloqueado/s)`);
+      return { status: 'sent', attempts: 0, messageId: 'staging-bloqueado' };
+    }
+    payload = { ...payload, to: allowed.join(', ') };
+  }
   await ensureVerified();
 
   const transporter = getTransporter();

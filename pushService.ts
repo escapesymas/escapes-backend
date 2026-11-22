@@ -11,6 +11,7 @@ import { db, pool } from './db.js';
 import { sql } from 'drizzle-orm';
 import { pushToUser, pushToAdmins } from './lib/agent-stream.js';
 import { createVisitorGuard, cleanText, cleanNumber, MAX_TRACKED_SESSIONS } from './lib/visitor-guard.js';
+import { isStaging } from './lib/app-env.js';
 
 // Claves VAPID. Las de respaldo son las que tiene ya registradas el iPhone del
 // administrador; si se configuran en el entorno, habrá que volver a activar
@@ -19,10 +20,12 @@ const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BLwPrhtaKSOg1opTzFI8er
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'GRBdcL4m7pQRvDkQbwkILTFalnVn8wTupTzNTxj3XL8';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:info@escapesymas.com';
 
-webPush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+// Entorno de pruebas: claves VAPID efímeras (nunca las reales, así ningún dispositivo registrado en producción puede recibir nada de aquí).
+const STAGING_VAPID = isStaging() ? webPush.generateVAPIDKeys() : null;
+webPush.setVapidDetails(VAPID_SUBJECT, STAGING_VAPID?.publicKey ?? VAPID_PUBLIC_KEY, STAGING_VAPID?.privateKey ?? VAPID_PRIVATE_KEY);
 
 export function getVapidPublicKey() {
-  return VAPID_PUBLIC_KEY;
+  return STAGING_VAPID?.publicKey ?? VAPID_PUBLIC_KEY;
 }
 
 /** Categorías de aviso, con su texto para la pantalla de preferencias. */
@@ -207,6 +210,7 @@ export async function sendNotificationToAll(payload: AdminNotification) {
 
     await Promise.all(res.rows.map(async (sub: any) => {
       if (sub.preferences && sub.preferences[category] === false) return;
+      if (isStaging()) return; // pruebas: el aviso queda en el historial del panel, pero no se envía a ningún dispositivo
       try {
         await webPush.sendNotification(
           { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
@@ -232,6 +236,7 @@ export async function sendNotificationToAll(payload: AdminNotification) {
  * el chat»). No pasa por el historial del panel. Nunca lanza.
  */
 export async function sendPushToUser(userId: number, payload: { title: string; body: string; url: string; tag?: string }) {
+  if (isStaging()) return 0; // pruebas: nunca se avisa a un dispositivo de cliente
   try {
     const res = await pool.query(`SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1`, [userId]);
     const body = JSON.stringify({ ...payload, icon: '/icon-192.png' });

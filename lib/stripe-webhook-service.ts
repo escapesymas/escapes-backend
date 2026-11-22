@@ -21,10 +21,12 @@ import { processStripeEvent } from './stripe-webhook.js';
 import { sendTemplatedEmail, sendEmail } from './email.js';
 import { orderEmailItems } from './order-emails.js';
 import { cacheBust } from './cache.js';
+import { isStaging } from './app-env.js';
 import fs from 'fs';
 
 // Initialize Stripe clients
-const stripeLiveKey = process.env.STRIPE_SECRET_KEY;
+// En el entorno de pruebas «la clave real» es siempre la de prueba (nunca se toca Stripe en vivo).
+const stripeLiveKey = isStaging() ? (process.env.STRIPE_TEST_SECRET_KEY || process.env.STRIPE_SECRET_KEY) : process.env.STRIPE_SECRET_KEY;
 const stripeLive = new Stripe(stripeLiveKey || 'sk_missing_set_env', {
   apiVersion: '2024-11-20.acacia' as any,
 });

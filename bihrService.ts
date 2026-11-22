@@ -7,6 +7,7 @@ import { repriceProducts, pricingAuto, refreshDto2, applyPromotions } from './li
 import { refreshCompatModels } from './lib/compat.js';
 import { enrichCatalog } from './lib/catalog-enrich.js';
 import { LATEST_CATALOG_JSON } from './lib/bihr-catalog-pictures.js';
+import { isStaging } from './lib/app-env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -228,6 +229,8 @@ export interface BihrOrderRequest {
  * Crea un pedido de dropshipping directamente en Bihr
  */
 export async function createBihrOrder(orderData: BihrOrderRequest) {
+  // Entorno de pruebas: jamás se crea un pedido real con el proveedor.
+  if (isStaging()) throw new Error('Entorno de pruebas: no se crean pedidos reales con Bihr');
   try {
     const token = await getBihrToken();
 

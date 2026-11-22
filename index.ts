@@ -1,4 +1,7 @@
 import 'dotenv/config';
+// Entorno de pruebas: debe ir antes que cualquier otro módulo (aborta si hay claves de producción y cierra la salida a Internet).
+import './lib/staging-guard.js';
+import { isStaging, jobEnabled, scheduleJob, deferJob } from './lib/app-env.js';
 import { taxInTotal } from './lib/tax.js';
 import express from 'express';
 import fs from 'fs';
@@ -75,7 +78,8 @@ initSentry();
 console.log(cdnBanner());
 console.log(meilisearchBanner());
 
-const stripeLiveKey = process.env.STRIPE_SECRET_KEY;
+// En el entorno de pruebas «la clave real» es siempre la de prueba de Stripe (nunca se cobra de verdad).
+const stripeLiveKey = isStaging() ? (process.env.STRIPE_TEST_SECRET_KEY || process.env.STRIPE_SECRET_KEY) : process.env.STRIPE_SECRET_KEY;
 if (!stripeLiveKey) {
   console.warn('[WARNING] STRIPE_SECRET_KEY not set — Stripe payments will fail. Set it in .env');
 }
@@ -539,6 +543,8 @@ const heavyPublicLimiter = rateLimit({
 });
 
 app.use((_req: any, res: any, next: any) => {
+  // El entorno de pruebas nunca debe indexarse.
+  if (isStaging()) res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
@@ -568,8 +574,11 @@ const allowedOrigins = isProduction
       'http://localhost:3002',
     ];
 
+// Entorno de pruebas: solo se aceptan SUS orígenes (STAGING_ORIGINS, https), no los de producción.
+const stagingOrigins = String(process.env.STAGING_ORIGINS || '').split(',').map((s) => s.trim()).filter((s) => /^https:\/\//.test(s));
+
 app.use(cors({
-  origin: allowedOrigins,
+  origin: isStaging() ? stagingOrigins : allowedOrigins,
   credentials: true,
   exposedHeaders: ['X-WP-Total', 'X-WP-TotalPages']
 }));
@@ -6216,11 +6225,11 @@ async function processAbandonedCartEmails() {
   }
 }
 
-setInterval(() => {
+scheduleJob('carritos-abandonados', () => {
   processAbandonedCartEmails().catch(e => console.error('[ABANDONED CART CRON INTERVAL ERROR]:', e));
 }, 10 * 60 * 1000);
 
-processAbandonedCartEmails().catch(e => console.error('[ABANDONED CART CRON INITIAL ERROR]:', e));
+if (jobEnabled('carritos-abandonados')) processAbandonedCartEmails().catch(e => console.error('[ABANDONED CART CRON INITIAL ERROR]:', e));
 
 // ================================================================
 // RESUMEN DIARIO AL MÓVIL (21:00 hora peninsular)
@@ -6260,7 +6269,7 @@ async function sendDailySummary(force = false) {
   await (await import('./lib/ai-chat-log.js')).pruneAiChats();
 }
 
-setInterval(() => {
+scheduleJob('resumen-diario', () => {
   sendDailySummary().catch((e) => console.error('[DAILY SUMMARY ERROR]:', e.message));
 }, 5 * 60_000);
 
@@ -6279,7 +6288,7 @@ async function dailyMotoAlerts() {
   await (await import('./lib/moto-alerts.js')).runMotoAlerts('diaria');
 }
 
-setInterval(() => {
+scheduleJob('avisos-moto', () => {
   dailyMotoAlerts().catch((e) => console.error('[MOTO ALERTS ERROR]:', e.message));
 }, 10 * 60_000);
 
@@ -6298,13 +6307,13 @@ async function dailyDiscontinued() {
   await (await import('./lib/bihr-discontinued.js')).syncDiscontinued();
 }
 
-setInterval(() => {
+scheduleJob('descatalogados', () => {
   dailyDiscontinued().catch((e) => console.error('[BIHR DESCATALOGADOS ERROR]:', e.message));
 }, 10 * 60_000);
 
 // Descripciones del proveedor en inglés: se traducen poco a poco (lib/description-translation.ts); después,
 // las de las fichas que el fabricante no describe se montan con sus datos (lib/attribute-descriptions.ts).
-setInterval(async () => {
+scheduleJob('traducciones', async () => {
   await import('./lib/description-translation.js')
     .then((m) => m.translatePendingDescriptions(90))
     .catch((e) => console.error('[TRADUCCIÓN DESCRIPCIONES ERROR]:', e.message));
@@ -6352,8 +6361,8 @@ async function dailyGoogleFeed() {
   await buildGoogleFeed();
 }
 
-setTimeout(() => dailyGoogleFeed().catch((e) => console.error('[GOOGLE FEED ERROR]:', e.message)), 2 * 60_000);
-setInterval(() => {
+deferJob('feed-google', () => dailyGoogleFeed().catch((e) => console.error('[GOOGLE FEED ERROR]:', e.message)), 2 * 60_000);
+scheduleJob('feed-google', () => {
   dailyGoogleFeed().catch((e) => console.error('[GOOGLE FEED ERROR]:', e.message));
 }, 10 * 60_000);
 
@@ -7123,7 +7132,7 @@ const stripeWebhookRetryHandler = async (ctx: { event: any; receivedAt: Date; at
   await handleStripeWebhookEvent(ctx.event);
 };
 
-setInterval(() => {
+scheduleJob('stripe-reintentos', () => {
   processStripeWebhookRetryQueue(stripeWebhookRetryHandler)
     .catch(e => console.error('[STRIPE WEBHOOK RETRY CRON]:', e));
 }, 5 * 60 * 1000);
@@ -7142,18 +7151,18 @@ app.get('/api/admin/stripe-webhook-stats', requireAdmin, async (req: any, res: a
 
 // Email retry queue (cada 1 minuto). Replays payloads that failed during
 // the live send. Backed by migrations/005_email_queue.sql.
-setInterval(() => {
+scheduleJob('correo-reintentos', () => {
   processEmailRetryQueue().catch(e => console.error('[EMAIL RETRY CRON]:', e));
 }, 60 * 1000);
 
 // Calendario de contenido TikTok (cada 5 minutos). Avisa al panel admin
 // cuando toca publicar y el contenido está listo, y una vez al día de lo que
 // queda por preparar. Backed by migrations/031_social_content_calendar.sql.
-setInterval(() => {
+scheduleJob('tiktok-calendario', () => {
   checkDueSlots().catch(e => console.error('[SOCIAL CONTENT CRON]:', e));
 }, 5 * 60 * 1000);
 // Vídeos de Veo en curso: se consulta su operación cada 20 s hasta que terminan.
-setInterval(() => {
+scheduleJob('tiktok-videos', () => {
   pollVideos().catch(e => console.error('[SOCIAL VIDEO CRON]:', e));
 }, 20 * 1000);
 
@@ -7366,9 +7375,9 @@ app.use(sentryErrorHandler());
 
 app.listen(PORT, () => {
   // Tareas del chat con asesor: cierre por inactividad y recordatorio de pedidos sin pagar.
-  startChatJobs();
+  if (jobEnabled('chat')) startChatJobs();
   // Informes de la Vista general por correo (diario, semanal y mensual según Ajustes › Informes).
-  startOverviewEmailJob();
+  if (jobEnabled('informes-correo')) startOverviewEmailJob();
   // Muestreo del uso real de CPU para Ajustes › Sistema (una muestra cada 5 s, media del último minuto).
   cpuMonitor.start();
   resetInterruptedGenerations().catch((e) => console.error('[SOCIAL CONTENT] reset:', e.message));
@@ -7385,14 +7394,16 @@ app.listen(PORT, () => {
   // Register the Bihr stock sync cron (no-op when BIHR_STOCK_SYNC_DISABLED=true).
   // Placed after listen() so the boot banner is printed first even if the
   // initial run takes a few seconds.
-  startBihrStockCron();
-  startAndreaniStockCron();
+  if (jobEnabled('stock-proveedores')) {
+    startBihrStockCron();
+    startAndreaniStockCron();
+  }
   // Promociones con fechas (DTO2): se activan y se retiran solas.
   const promoTick = () => applyPromotions()
     .then((r) => { if (r.applied || r.removed) { console.log(`[PROMOS] ${r.applied} aplicadas, ${r.removed} retiradas`); return cacheBust('cache:products'); } })
     .catch((e) => console.error('[PROMOS] Error aplicando promociones:', e.message));
-  setTimeout(promoTick, 60_000);
-  setInterval(promoTick, 5 * 60_000);
+  deferJob('promociones', promoTick, 60_000);
+  scheduleJob('promociones', promoTick, 5 * 60_000);
 });
 
 export default app;
