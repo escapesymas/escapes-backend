@@ -41,6 +41,7 @@ export const NOTIFICATION_CATEGORIES = [
   { key: 'visitor_activity', label: 'Avance de visitantes', description: 'Visitante explorando productos, navegando o avanzando en la tienda', urgent: false },
   { key: 'visitor_leave', label: 'Abandono de visitantes', description: 'Avisa cuando un visitante sale de la tienda o finaliza su sesión', urgent: false },
   { key: 'system', label: 'Sistema', description: 'Sincronizaciones con Bihr y correos que no se han podido enviar', urgent: false },
+  { key: 'email_sent', label: 'Correos enviados', description: 'Cada correo que la web envía a un cliente (confirmaciones, pedidos, avisos…)', urgent: false },
   { key: 'daily_summary', label: 'Resumen diario', description: 'Ventas, reembolsos y pendientes del día a las 21:00', urgent: false },
   { key: 'social_content', label: 'Contenido TikTok', description: 'Avisa cuando toca publicar y el contenido ya está preparado', urgent: true },
 ] as const;
@@ -538,6 +539,11 @@ export async function notifyReview(r: { productName: string; rating: number; tit
 
 export async function notifySystem(title: string, body: string, data: Record<string, unknown> = {}, tab = 'sync') {
   await sendNotificationToAll({ title, body, url: adminUrl(tab), category: 'system', data });
+}
+
+/** Aviso de un correo enviado a un cliente (lib/email-notify.ts decide cuándo y con qué freno). */
+export async function notifyEmailSent(title: string, body: string) {
+  await sendNotificationToAll({ title, body, url: adminUrl('notifications'), category: 'email_sent' });
 }
 
 export async function notifyDailySummary(s: {

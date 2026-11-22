@@ -140,6 +140,8 @@ export async function sendEmail(payload: EmailPayload): Promise<SendResult> {
     try {
       const info = await transporter.sendMail(mailOptions);
       console.log(`[EMAIL] Sent to ${payload.to} (subject: ${payload.subject}) on attempt ${attempt}; messageId=${info.messageId}`);
+      // Aviso «Correo enviado» al administrador (sin esperar y sin poder romper el envío).
+      import('./email-notify.js').then(({ emailSentNotifier }) => emailSentNotifier({ to: payload.to, subject: payload.subject, template: payload.template })).catch(() => {});
       return { status: 'sent', attempts: attempt, messageId: info.messageId };
     } catch (err: any) {
       lastErr = err;
