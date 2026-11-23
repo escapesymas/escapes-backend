@@ -163,6 +163,14 @@ esac
 "${SSH[@]}" "for i in \$(seq 1 24); do docker ps --format '{{.Image}}' | grep -q '^$PREFIX[a-z0-9]*:$FULL' && exit 0; sleep 5; done; exit 1" 2>/dev/null \
   && echo "  el contenedor nuevo ya corre" || echo "  ⚠ el contenedor nuevo no aparece aún; la prueba lo dirá"
 
+# el contenedor nuevo ya está «en marcha» pero el backend tarda unos segundos en atender (23/11/2026: la primera comprobación dio HTTP 000 y la repetida salió OK)
+if [[ "$WHAT" == backend ]]; then
+  for _ in $(seq 1 30); do
+    [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://api.escapesymas.com/api/health)" == 200 ]] && break
+    sleep 3
+  done
+fi
+
 # ---------- prueba en producción ----------
 if [[ "$SIN_PRUEBA" == 1 ]]; then
   echo; echo "RESULTADO: desplegado $SHA; prueba de producción OMITIDA (--sin-prueba)"; exit 0
