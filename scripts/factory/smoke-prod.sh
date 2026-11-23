@@ -147,6 +147,10 @@ echo "$ROBOTS" | grep -qi '^Sitemap:' && ok "robots.txt anuncia el sitemap" || b
 expect "el sitemap responde" 200 "$(code "$TIENDA/sitemap.xml")"
 expect "el listado de escapes responde" 200 "$(code "$TIENDA/escapes")"
 expect "el carrito/pago responde" 200 "$(code "$TIENDA/checkout")"
+expect "la página de contacto responde" 200 "$(code "$TIENDA/contacto")"
+R="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' --max-time 30 "$TIENDA/contact")"
+[[ "${R%% *}" == 308 && "$R" == *"/contacto" ]] && ok "/contact redirige a /contacto" || bad "/contact no redirige a /contacto ($R)"
+[[ "$HOME_HTML" == *"umamiBeforeSend"* ]] && ok "la portada lleva el filtro de páginas vistas de Umami" || bad "la portada no lleva el filtro de páginas vistas de Umami (los cambios de año vuelven a contar como página)"
 if [[ -n "${SLUG:-}" ]]; then
   FICHA="$(body "$TIENDA/producto/$SLUG")"
   [[ "$FICHA" == *"application/ld+json"* ]] && ok "la ficha de un producto responde con sus datos estructurados" || bad "la ficha /producto/$SLUG no responde o no lleva JSON-LD"
